@@ -1,0 +1,7 @@
+yfinance
+pandas
+psycopg2-binary
+python-dotenv
+anthropic
+requests
+schedule
