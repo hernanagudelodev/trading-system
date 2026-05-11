@@ -1,0 +1,10 @@
+# Variables de entorno — NUNCA subir al repo
+.env
+
+# Python
+__pycache__/
+*.pyc
+trading_env/
+
+# Logs
+backtest_errors.log
