@@ -472,7 +472,10 @@ def run_backtest(tickers, lookback_days=DEFAULT_LOOKBACK_DAYS, resume=False):
     print(f"  ETA:      ~{total_steps * 1.5 / 3600:.1f} hours estimated")
     print(f"{'═' * 65}\n")
 
-    input("  Press Enter to start (Ctrl+C to stop at any time)...")
+    if sys.stdin.isatty():
+        input("  Press Enter to start (Ctrl+C to stop at any time)...")
+    else:
+        print("  Running in non-interactive mode — starting automatically...")
     print()
 
     start_time   = time.time()
