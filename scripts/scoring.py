@@ -31,156 +31,170 @@ Orchestration:          main.py
 # ══════════════════════════════════════════════════════════════════════════════
 
 # ── Verdict thresholds (as % of SCORE_MAX) ───────────────────────────────────
-THRESHOLD_VIABLE      = 0.68   # >= 68% of max score → VIABLE
-THRESHOLD_CAUTION     = 0.35   # >= 35% of max score → CAUTION
-                                # <  35% of max score → DO_NOT_TRADE
+THRESHOLD_VIABLE      = 0.55   # bajado de 0.68 — sistema era muy conservador
+THRESHOLD_CAUTION     = 0.35   # sin cambio
 
 # ── Maximum possible score (sum of all max positive scores) ──────────────────
-SCORE_MAX = 28
+SCORE_MAX = 21  # reducido por eliminación y reducción de pesos
 
 # ── Trend 25d (max +1) ───────────────────────────────────────────────────────
 SCORE_TREND_BULLISH   =  1
 SCORE_TREND_BEARISH   = -1
 
-# ── Moving Averages — SMA50/200 position (max +2) ────────────────────────────
-SCORE_SMA_ABOVE_BOTH  =  2
+# ── Moving Averages — SMA50/200 position (max +1) ────────────────────────────
+# Reducido — baja predictividad (+2.2% diff bullish vs bearish)
+SCORE_SMA_ABOVE_BOTH  =  1    # antes +2
 SCORE_SMA_ABOVE_50    =  1
-SCORE_SMA_BELOW_BOTH  = -2
+SCORE_SMA_BELOW_BOTH  = -1    # antes -2
 
 # ── SMA50 Direction (max +1) ─────────────────────────────────────────────────
+# Baja predictividad (+4.1% diff) — mantenemos pero sin cambio
 SCORE_SMA50_RISING    =  1
 SCORE_SMA50_FLAT      =  0
 SCORE_SMA50_FALLING   = -1
 
-# ── RSI (max +2) ─────────────────────────────────────────────────────────────
-RSI_OVERBOUGHT        = 70     # RSI above this → overbought
-RSI_OVERSOLD          = 30     # RSI below this → oversold
-RSI_NEUTRAL_LOW       = 40     # neutral zone lower bound
-RSI_NEUTRAL_HIGH      = 60     # neutral zone upper bound
+# ── RSI (max +1) ─────────────────────────────────────────────────────────────
+# Sobrecomprado tiene 66% win rate — no penalizar
+# RSI neutral solo +1 (antes +2)
+RSI_OVERBOUGHT        = 70
+RSI_OVERSOLD          = 30
+RSI_NEUTRAL_LOW       = 40
+RSI_NEUTRAL_HIGH      = 60
 
-SCORE_RSI_NEUTRAL     =  2
-SCORE_RSI_CAUTION     =  1     # between neutral and overbought/oversold
-SCORE_RSI_EXTREME     = -1     # overbought or oversold
+SCORE_RSI_NEUTRAL     =  1    # antes +2
+SCORE_RSI_CAUTION     =  0    # antes +1
+SCORE_RSI_EXTREME     =  0    # antes -1 — sobrecomprado sigue subiendo
 
-# ── Historical Volatility (max +2) ───────────────────────────────────────────
-HV_LOW_THRESHOLD      = 20     # HV below this → low volatility
-HV_HIGH_THRESHOLD     = 35     # HV above this → high volatility
+# ── Historical Volatility (max +1) ───────────────────────────────────────────
+# Baja predictividad (-0.5% diff) — reducimos peso
+HV_LOW_THRESHOLD      = 20
+HV_HIGH_THRESHOLD     = 35
 
-SCORE_HV_LOW          =  2
+SCORE_HV_LOW          =  1    # antes +2
 SCORE_HV_NORMAL       =  1
-SCORE_HV_HIGH         = -1
+SCORE_HV_HIGH         =  0    # antes -1
 
 # ── IV vs HV (max +2) ────────────────────────────────────────────────────────
-IV_NORMAL_THRESHOLD   = 1.3    # IV/HV ratio above this → expensive
+# Sin cambio — siempre positivo, no hay bearish signals para comparar
+IV_NORMAL_THRESHOLD   = 1.3
 
-SCORE_IV_CHEAP        =  2     # IV < HV
-SCORE_IV_NORMAL       =  1     # IV < HV * 1.3
-SCORE_IV_EXPENSIVE    = -1     # IV >= HV * 1.3
+SCORE_IV_CHEAP        =  2
+SCORE_IV_NORMAL       =  1
+SCORE_IV_EXPENSIVE    = -1
 
 # ── IV Percentile (max +2) ───────────────────────────────────────────────────
-IV_PCT_CHEAP          = 25     # percentile below this → historically cheap
-IV_PCT_NORMAL_LOW     = 50     # percentile below this → normal-low
-IV_PCT_NORMAL_HIGH    = 75     # percentile below this → normal-high
-                                # percentile above 75  → historically expensive
+# Más predictivo (+10.1% diff) — mantenemos pesos
+IV_PCT_CHEAP          = 25
+IV_PCT_NORMAL_LOW     = 50
+IV_PCT_NORMAL_HIGH    = 75
 
 SCORE_IVP_CHEAP       =  2
 SCORE_IVP_NORMAL_LOW  =  1
 SCORE_IVP_NORMAL_HIGH =  0
 SCORE_IVP_EXPENSIVE   = -1
 
-# ── Beta (max +1) ────────────────────────────────────────────────────────────
-BETA_HIGH_THRESHOLD   = 1.5    # beta above this → high volatility stock
-BETA_LOW_THRESHOLD    = 0.8    # beta below this → very stable stock
+# ── Beta (max +0) ────────────────────────────────────────────────────────────
+# Beta alta tiene mejor win rate (66%) — no penalizar
+BETA_HIGH_THRESHOLD   = 1.5
+BETA_LOW_THRESHOLD    = 0.8
 
-SCORE_BETA_NORMAL     =  1
+SCORE_BETA_NORMAL     =  0    # antes +1
 SCORE_BETA_LOW        =  0
-SCORE_BETA_HIGH       = -1
+SCORE_BETA_HIGH       =  0    # antes -1
 
-# ── Put/Call Ratio (max +1) ──────────────────────────────────────────────────
-PCR_FEAR_THRESHOLD    = 1.3    # PCR above this → extreme fear → contrarian bullish
-PCR_NEUTRAL_LOW       = 0.7    # PCR above this → neutral zone
-PCR_OPTIMISM          = 0.5    # PCR above this → optimistic
-                                # PCR below 0.5  → euphoria → contrarian bearish
+# ── Put/Call Ratio (max +0) ──────────────────────────────────────────────────
+# Eliminado del score — no disponible históricamente, siempre 0
+PCR_FEAR_THRESHOLD    = 1.3
+PCR_NEUTRAL_LOW       = 0.7
+PCR_OPTIMISM          = 0.5
 
-SCORE_PCR_FEAR        =  1
-SCORE_PCR_NEUTRAL     =  1
+SCORE_PCR_FEAR        =  0    # antes +1
+SCORE_PCR_NEUTRAL     =  0    # antes +1
 SCORE_PCR_OPTIMISM    =  0
-SCORE_PCR_EUPHORIA    = -1
+SCORE_PCR_EUPHORIA    =  0    # antes -1
 
-# ── Open Interest (max +1) ───────────────────────────────────────────────────
-OI_HIGH_THRESHOLD     = 10000  # OI above this → excellent liquidity
-OI_LOW_THRESHOLD      = 1000   # OI below this → poor liquidity
+# ── Open Interest (max +0) ───────────────────────────────────────────────────
+# Eliminado del score — no disponible históricamente, siempre 0
+OI_HIGH_THRESHOLD     = 10000
+OI_LOW_THRESHOLD      = 1000
 
-SCORE_OI_HIGH         =  1
+SCORE_OI_HIGH         =  0    # antes +1
 SCORE_OI_NORMAL       =  0
-SCORE_OI_LOW          = -1
+SCORE_OI_LOW          =  0    # antes -1
 
 # ── 52-Week Position (max +1) ────────────────────────────────────────────────
-SCORE_52W_NEAR_LOW    =  1     # near annual low → potential support
-SCORE_52W_MID         =  1     # in middle range → room to move
-SCORE_52W_NEAR_HIGH   = -1     # near annual high → potential resistance
+# Cerca del máximo no penaliza — win rate similar en ambos casos
+SCORE_52W_NEAR_LOW    =  1
+SCORE_52W_MID         =  1
+SCORE_52W_NEAR_HIGH   =  0    # antes -1
 
 # ── Support / Resistance (max +2) ────────────────────────────────────────────
-SR_NEAR_THRESHOLD_PCT = 3.0    # within this % → "near" support or resistance
+# Cuando es bearish tiene 63.2% win rate — reducimos penalización
+SR_NEAR_THRESHOLD_PCT = 3.0
 
 SCORE_SR_NEAR_SUPPORT     =  2
 SCORE_SR_MIDDLE           =  1
-SCORE_SR_NEAR_RESISTANCE  = -1
+SCORE_SR_NEAR_RESISTANCE  =  0    # antes -1
 SCORE_SR_NO_DATA          =  0
 
-# ── Candlestick Pattern (max +2) ─────────────────────────────────────────────
-SCORE_CANDLE_STRONG_BULLISH =  2   # Morning Star, Engulfing Bullish, Marubozu Green
-SCORE_CANDLE_WEAK_BULLISH   =  1   # Hammer, Green Candle
-SCORE_CANDLE_NEUTRAL        =  0   # Doji
-SCORE_CANDLE_WEAK_BEARISH   = -1   # Shooting Star, Red Candle
-SCORE_CANDLE_STRONG_BEARISH = -2   # Evening Star, Engulfing Bearish, Marubozu Red
+# ── Candlestick Pattern (max +1) ─────────────────────────────────────────────
+# Baja predictividad (-2.5% diff) — reducimos pesos
+SCORE_CANDLE_STRONG_BULLISH =  1   # antes +2
+SCORE_CANDLE_WEAK_BULLISH   =  1
+SCORE_CANDLE_NEUTRAL        =  0
+SCORE_CANDLE_WEAK_BEARISH   =  0   # antes -1
+SCORE_CANDLE_STRONG_BEARISH = -1   # antes -2
 
 # ── Earnings (max +1) ────────────────────────────────────────────────────────
-EARNINGS_SAFE_DAYS    = 35     # more than this → safe
-EARNINGS_CAUTION_DAYS = 20     # between this and SAFE → caution
-                                # less than this → danger zone
+# Sin cambio — tiene lógica clara
+EARNINGS_SAFE_DAYS    = 35
+EARNINGS_CAUTION_DAYS = 20
 
 SCORE_EARNINGS_SAFE   =  1
 SCORE_EARNINGS_CAUTION=  0
 SCORE_EARNINGS_DANGER = -2
 
 # ── Volume (max +1) ──────────────────────────────────────────────────────────
-VOLUME_HIGH_PCT       = 150    # above this % of avg → unusually high
-VOLUME_LOW_PCT        = 80     # below this % of avg → low liquidity
+# Baja predictividad (+0.5% diff) — eliminamos penalización
+VOLUME_HIGH_PCT       = 150
+VOLUME_LOW_PCT        = 80
 
 SCORE_VOLUME_NORMAL   =  1
 SCORE_VOLUME_HIGH     =  0
-SCORE_VOLUME_LOW      = -1
+SCORE_VOLUME_LOW      =  0    # antes -1
 
-# ── P/E Ratio (max +2) ───────────────────────────────────────────────────────
+# ── P/E Ratio (max +1) ───────────────────────────────────────────────────────
+# Baja predictividad (+1.4% diff) — reducimos peso máximo
 PE_CHEAP_THRESHOLD    = 15
 PE_NORMAL_THRESHOLD   = 25
 PE_EXPENSIVE_THRESHOLD= 40
 
-SCORE_PE_CHEAP        =  2
+SCORE_PE_CHEAP        =  1    # antes +2
 SCORE_PE_NORMAL       =  1
 SCORE_PE_EXPENSIVE    =  0
-SCORE_PE_VERY_EXP     = -1
+SCORE_PE_VERY_EXP     =  0    # antes -1
 
 # ── EPS Growth (max +2) ──────────────────────────────────────────────────────
-EPS_STRONG_GROWTH     = 15     # % above this → strong growth
-EPS_MILD_DECLINE      = -10    # % above this → mild decline
-                                # below this  → deterioration
+# Sin cambio — siempre positivo, señal fuerte
+EPS_STRONG_GROWTH     = 15
+EPS_MILD_DECLINE      = -10
 
 SCORE_EPS_STRONG      =  2
 SCORE_EPS_STABLE      =  1
 SCORE_EPS_DECLINING   = -1
 SCORE_EPS_DETERIORATING= -2
 
-# ── Debt to Equity (max +1) ──────────────────────────────────────────────────
+# ── Debt to Equity (max +0) ──────────────────────────────────────────────────
+# Baja predictividad (+2.5% diff) — eliminamos del score
 DE_LOW_THRESHOLD      = 1.0
 DE_HIGH_THRESHOLD     = 2.0
 
-SCORE_DE_LOW          =  1
+SCORE_DE_LOW          =  0    # antes +1
 SCORE_DE_MODERATE     =  0
-SCORE_DE_HIGH         = -1
+SCORE_DE_HIGH         =  0    # antes -1
 
 # ── Profit Margin (max +2) ───────────────────────────────────────────────────
+# Sin cambio — siempre positivo, señal fuerte
 MARGIN_HIGH_THRESHOLD = 20
 MARGIN_LOW_THRESHOLD  = 10
 
@@ -188,7 +202,6 @@ SCORE_MARGIN_HIGH     =  2
 SCORE_MARGIN_NORMAL   =  1
 SCORE_MARGIN_LOW      =  0
 SCORE_MARGIN_NEGATIVE = -2
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # INDIVIDUAL CRITERION SCORERS

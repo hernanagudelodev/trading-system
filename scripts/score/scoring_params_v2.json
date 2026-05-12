@@ -1,0 +1,186 @@
+{
+    "_version": "v2",
+    "_description": "Ajustes post-auditoría — reducir criterios de baja predictividad",
+    "_date": "2026-05-11",
+    "_backtest_results": {
+        "viable_signals": null,
+        "viable_pct": null,
+        "viable_win_rate": null,
+        "avg_return_pct": null,
+        "notes": "Pendiente re-correr backtest para validar"
+    },
+    "_changes_from_v1": [
+        "THRESHOLD_VIABLE bajado de 0.68 a 0.62",
+        "moving_averages reducido — baja predictividad +2.2%",
+        "rsi: sobrecomprado ya no penaliza — win rate 66% cuando es extremo",
+        "hv: eliminada penalización — diff solo -0.5%",
+        "beta: eliminado del score — alta beta tiene mejor win rate",
+        "put_call_ratio: eliminado — siempre 0 en backtest",
+        "open_interest: eliminado — siempre 0 en backtest",
+        "week_52: eliminada penalización cerca de máximo — diff -3.2%",
+        "support_resistance: eliminada penalización near resistance",
+        "candlestick: reducidos pesos — diff -2.5%",
+        "volume: eliminada penalización por bajo volumen — diff +0.5%",
+        "pe: reducido peso — diff +1.4%",
+        "debt_equity: eliminado — diff +2.5%"
+    ],
+
+    "thresholds": {
+        "viable": 0.62,
+        "caution": 0.35
+    },
+
+    "score_max": 21,
+
+    "trend_25d": {
+        "bullish": 1,
+        "bearish": -1
+    },
+
+    "moving_averages": {
+        "above_both": 1,
+        "above_sma50": 1,
+        "below_both": -1
+    },
+
+    "sma50_direction": {
+        "rising": 1,
+        "flat": 0,
+        "falling": -1
+    },
+
+    "rsi": {
+        "overbought": 70,
+        "oversold": 30,
+        "neutral_low": 40,
+        "neutral_high": 60,
+        "score_neutral": 1,
+        "score_caution": 0,
+        "score_extreme": 0
+    },
+
+    "hv": {
+        "low_threshold": 20,
+        "high_threshold": 35,
+        "score_low": 1,
+        "score_normal": 1,
+        "score_high": 0
+    },
+
+    "iv_vs_hv": {
+        "normal_threshold": 1.3,
+        "score_cheap": 2,
+        "score_normal": 1,
+        "score_expensive": -1
+    },
+
+    "iv_percentile": {
+        "cheap": 25,
+        "normal_low": 50,
+        "normal_high": 75,
+        "score_cheap": 2,
+        "score_normal_low": 1,
+        "score_normal_high": 0,
+        "score_expensive": -1
+    },
+
+    "beta": {
+        "high_threshold": 1.5,
+        "low_threshold": 0.8,
+        "score_normal": 0,
+        "score_low": 0,
+        "score_high": 0
+    },
+
+    "put_call_ratio": {
+        "fear_threshold": 1.3,
+        "neutral_low": 0.7,
+        "optimism": 0.5,
+        "score_fear": 0,
+        "score_neutral": 0,
+        "score_optimism": 0,
+        "score_euphoria": 0
+    },
+
+    "open_interest": {
+        "high_threshold": 10000,
+        "low_threshold": 1000,
+        "score_high": 0,
+        "score_normal": 0,
+        "score_low": 0
+    },
+
+    "week_52": {
+        "score_near_low": 1,
+        "score_mid": 1,
+        "score_near_high": 0
+    },
+
+    "support_resistance": {
+        "near_threshold_pct": 3.0,
+        "score_near_support": 2,
+        "score_middle": 1,
+        "score_near_resistance": 0,
+        "score_no_data": 0
+    },
+
+    "candlestick": {
+        "score_strong_bullish": 1,
+        "score_weak_bullish": 1,
+        "score_neutral": 0,
+        "score_weak_bearish": 0,
+        "score_strong_bearish": -1
+    },
+
+    "earnings": {
+        "safe_days": 35,
+        "caution_days": 20,
+        "score_safe": 1,
+        "score_caution": 0,
+        "score_danger": -2
+    },
+
+    "volume": {
+        "high_pct": 150,
+        "low_pct": 80,
+        "score_normal": 1,
+        "score_high": 0,
+        "score_low": 0
+    },
+
+    "pe": {
+        "cheap_threshold": 15,
+        "normal_threshold": 25,
+        "expensive_threshold": 40,
+        "score_cheap": 1,
+        "score_normal": 1,
+        "score_expensive": 0,
+        "score_very_expensive": 0
+    },
+
+    "eps_growth": {
+        "strong_growth": 15,
+        "mild_decline": -10,
+        "score_strong": 2,
+        "score_stable": 1,
+        "score_declining": -1,
+        "score_deteriorating": -2
+    },
+
+    "debt_equity": {
+        "low_threshold": 1.0,
+        "high_threshold": 2.0,
+        "score_low": 0,
+        "score_moderate": 0,
+        "score_high": 0
+    },
+
+    "profit_margin": {
+        "high_threshold": 20,
+        "low_threshold": 10,
+        "score_high": 2,
+        "score_normal": 1,
+        "score_low": 0,
+        "score_negative": -2
+    }
+}
