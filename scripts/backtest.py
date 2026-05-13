@@ -174,9 +174,9 @@ def _get_beta_cached(ticker):
     return _beta_cache[ticker]
 
 def _get_earnings_near_date(ticker, ref_date):
-    from criteria import get_earnings_dates
+    from criteria import get_earnings_info
     if ticker not in _earnings_cache:
-        _earnings_cache[ticker] = get_earnings_dates(ticker)
+        _earnings_cache[ticker] = get_earnings_info(ticker)
     return _earnings_cache[ticker]
 
 
