@@ -132,6 +132,12 @@ def run_migrations():
             """
         ),
 
+        # ── Step 8: Add sector column to analysis ─────────────────────────────
+        (
+            "Add sector column to analysis",
+            "ALTER TABLE analysis ADD COLUMN IF NOT EXISTS sector VARCHAR(50);"
+        ),
+
     ]
 
     print("\n  Running migrations...\n")

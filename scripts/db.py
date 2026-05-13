@@ -627,7 +627,7 @@ def get_outcomes_for_audit(days=90, backtest_only=False):
 # BACKTESTING — READ / WRITE
 # ══════════════════════════════════════════════════════════════════════════════
 
-def save_backtest_analysis(scored_result, backtest_date):
+def save_backtest_analysis(scored_result, backtest_date, sector=None):
     """
     Save a backtest analysis result to the database.
     Same as save_analysis but marks is_backtest=True
@@ -644,6 +644,7 @@ def save_backtest_analysis(scored_result, backtest_date):
     Args:
         scored_result (dict) — output of scoring.score_criteria()
         backtest_date (date) — the date being simulated
+        sector        (str)  — GICS sector (e.g. 'Information Technology')
 
     Returns:
         int — the analysis id
@@ -655,9 +656,9 @@ def save_backtest_analysis(scored_result, backtest_date):
         INSERT INTO analysis (
             ticker, timestamp, price,
             score, score_max, score_pct, verdict,
-            is_backtest, backtest_date
+            is_backtest, backtest_date, sector
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, TRUE, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, TRUE, %s, %s)
         ON CONFLICT (ticker, backtest_date, is_backtest)
         WHERE is_backtest = TRUE
         DO UPDATE SET
@@ -666,7 +667,8 @@ def save_backtest_analysis(scored_result, backtest_date):
             score_max = EXCLUDED.score_max,
             score_pct = EXCLUDED.score_pct,
             verdict   = EXCLUDED.verdict,
-            timestamp = EXCLUDED.timestamp
+            timestamp = EXCLUDED.timestamp,
+            sector    = EXCLUDED.sector
         RETURNING id;
     """, (
         scored_result["ticker"],
@@ -677,6 +679,7 @@ def save_backtest_analysis(scored_result, backtest_date):
         scored_result["score_pct"],
         scored_result["verdict"],
         backtest_date,
+        sector,
     ))
 
     analysis_id = cur.fetchone()[0]
@@ -697,7 +700,6 @@ def save_backtest_analysis(scored_result, backtest_date):
     cur.close()
     conn.close()
     return analysis_id
-
 
 def get_backtest_progress(ticker):
     """
