@@ -89,17 +89,21 @@ TRADING_CONTEXT = {
 def is_market_open():
     """
     Check if US market is currently open.
+    Always uses ET timezone explicitly — works correctly regardless
+    of the server's local timezone (Railway runs on UTC).
     Simple check — does not account for holidays.
     """
-    now = datetime.now()
+    import pytz
+    et = pytz.timezone("America/New_York")
+    now = datetime.now(et)
 
     # Weekend check
     if now.weekday() >= 5:
         return False
 
-    # Hours check (assumes local time is ET — adjust if needed)
-    market_open  = now.replace(hour=MARKET_OPEN_HOUR,  minute=MARKET_OPEN_MIN,  second=0)
-    market_close = now.replace(hour=MARKET_CLOSE_HOUR, minute=MARKET_CLOSE_MIN, second=0)
+    # Hours check in ET
+    market_open  = now.replace(hour=MARKET_OPEN_HOUR,  minute=MARKET_OPEN_MIN,  second=0, microsecond=0)
+    market_close = now.replace(hour=MARKET_CLOSE_HOUR, minute=MARKET_CLOSE_MIN, second=0, microsecond=0)
 
     return market_open <= now <= market_close
 
