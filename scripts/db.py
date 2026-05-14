@@ -200,7 +200,8 @@ def save_analysis(scored_result):
             is_backtest, backtest_date
         )
         VALUES (%s, %s, %s, %s, %s, %s, %s, FALSE, NULL)
-        ON CONFLICT ON CONSTRAINT unique_real_analysis_per_day
+        ON CONFLICT (ticker, DATE(timestamp))
+        WHERE is_backtest = FALSE
         DO UPDATE SET
             price     = EXCLUDED.price,
             score     = EXCLUDED.score,

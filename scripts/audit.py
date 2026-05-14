@@ -283,6 +283,9 @@ def simulate_scoring_files(param_files):
 
     Does NOT re-run the backtest — uses stored criteria_scores from DB
     and re-applies different weights to project outcomes.
+
+    Usa labels (no scores numéricos) para mapear estados, con startswith
+    para manejar labels dinámicos como "NORMAL (0.9)" o "OVERBOUGHT (72.3)".
     """
     conn = get_connection()
     cur  = conn.cursor()
@@ -290,16 +293,15 @@ def simulate_scoring_files(param_files):
     cur.execute("""
         SELECT
             a.id,
-            a.verdict                           as old_verdict,
             o.would_have_profited,
             o.pct_change_30d,
-            json_object_agg(cs.criterion, cs.score) as scores
+            json_object_agg(cs.criterion, cs.label) as labels
         FROM analysis a
         JOIN criteria_scores cs ON cs.analysis_id = a.id
-        LEFT JOIN outcomes o ON o.analysis_id = a.id
+        LEFT JOIN outcomes o    ON o.analysis_id  = a.id
         WHERE a.is_backtest = TRUE
-        GROUP BY a.id, a.verdict,
-                 o.would_have_profited, o.pct_change_30d;
+          AND o.would_have_profited IS NOT NULL
+        GROUP BY a.id, o.would_have_profited, o.pct_change_30d;
     """)
 
     rows = cur.fetchall()
@@ -322,135 +324,216 @@ def simulate_scoring_files(param_files):
         viable_wins  = []
 
         for row in rows:
-            _, old_verdict, profited, pct_change, scores = row
-            scores = scores or {}
+            _, profited, pct_change, labels = row
+            labels = labels or {}
 
             new_score = 0
 
-            # trend_25d
-            s = scores.get("trend_25d", 0)
-            new_score += p["trend_25d"]["bullish"] if s > 0 else \
-                         p["trend_25d"]["bearish"] if s < 0 else 0
+            # Helper: label starts with any of the given prefixes
+            def lbl(criterion):
+                return (labels.get(criterion) or "").upper()
 
-            # moving_averages
-            s = scores.get("moving_averages", 0)
-            if s >= 2:   new_score += p["moving_averages"]["above_both"]
-            elif s == 1: new_score += p["moving_averages"]["above_sma50"]
-            elif s < 0:  new_score += p["moving_averages"]["below_both"]
+            # ── trend_25d ─────────────────────────────────────────────────────
+            l = lbl("trend_25d")
+            if l.startswith("BULLISH"):
+                new_score += p["trend_25d"]["bullish"]
+            elif l.startswith("BEARISH"):
+                new_score += p["trend_25d"]["bearish"]
 
-            # sma50_direction
-            s = scores.get("sma50_direction", 0)
-            if s > 0:   new_score += p["sma50_direction"]["rising"]
-            elif s < 0: new_score += p["sma50_direction"]["falling"]
-            else:       new_score += p["sma50_direction"]["flat"]
+            # ── moving_averages ───────────────────────────────────────────────
+            l = lbl("moving_averages")
+            if l.startswith("ABOVE BOTH"):
+                new_score += p["moving_averages"]["above_both"]
+            elif l.startswith("ABOVE SMA50"):
+                new_score += p["moving_averages"]["above_sma50"]
+            elif l.startswith("BELOW BOTH"):
+                new_score += p["moving_averages"]["below_both"]
 
-            # rsi
-            s = scores.get("rsi", 0)
-            if s == 2:    new_score += p["rsi"]["score_neutral"]
-            elif s == 1:  new_score += p["rsi"]["score_caution"]
-            elif s == -1: new_score += p["rsi"]["score_extreme"]
+            # ── sma50_direction ───────────────────────────────────────────────
+            l = lbl("sma50_direction")
+            if l.startswith("RISING"):
+                new_score += p["sma50_direction"]["rising"]
+            elif l.startswith("FALLING"):
+                new_score += p["sma50_direction"]["falling"]
+            else:
+                new_score += p["sma50_direction"]["flat"]
 
-            # hv
-            s = scores.get("hv", 0)
-            if s == 2:    new_score += p["hv"]["score_low"]
-            elif s == 1:  new_score += p["hv"]["score_normal"]
-            elif s == -1: new_score += p["hv"]["score_high"]
+            # ── rsi ───────────────────────────────────────────────────────────
+            l = lbl("rsi")
+            if l.startswith("OVERBOUGHT") or l.startswith("OVERSOLD"):
+                new_score += p["rsi"]["score_extreme"]
+            elif l.startswith("NEUTRAL"):
+                new_score += p["rsi"]["score_neutral"]
+            elif l.startswith("CAUTION"):
+                new_score += p["rsi"]["score_caution"]
 
-            # iv_vs_hv
-            s = scores.get("iv_vs_hv", 0)
-            if s == 2:    new_score += p["iv_vs_hv"]["score_cheap"]
-            elif s == 1:  new_score += p["iv_vs_hv"]["score_normal"]
-            elif s == -1: new_score += p["iv_vs_hv"]["score_expensive"]
+            # ── hv ────────────────────────────────────────────────────────────
+            l = lbl("hv")
+            if l.startswith("LOW"):
+                new_score += p["hv"]["score_low"]
+            elif l.startswith("NORMAL"):
+                new_score += p["hv"]["score_normal"]
+            elif l.startswith("HIGH"):
+                new_score += p["hv"]["score_high"]
 
-            # iv_percentile
-            s = scores.get("iv_percentile", 0)
-            if s == 2:    new_score += p["iv_percentile"]["score_cheap"]
-            elif s == 1:  new_score += p["iv_percentile"]["score_normal_low"]
-            elif s == 0:  new_score += p["iv_percentile"]["score_normal_high"]
-            elif s == -1: new_score += p["iv_percentile"]["score_expensive"]
+            # ── iv_vs_hv ──────────────────────────────────────────────────────
+            l = lbl("iv_vs_hv")
+            if l.startswith("CHEAP"):
+                new_score += p["iv_vs_hv"]["score_cheap"]
+            elif l.startswith("NORMAL"):
+                new_score += p["iv_vs_hv"]["score_normal"]
+            elif l.startswith("EXPENSIVE"):
+                new_score += p["iv_vs_hv"]["score_expensive"]
 
-            # beta
-            s = scores.get("beta", 0)
-            if s == 1:    new_score += p["beta"]["score_normal"]
-            elif s == -1: new_score += p["beta"]["score_high"]
-            else:         new_score += p["beta"]["score_low"]
+            # ── iv_percentile ─────────────────────────────────────────────────
+            l = lbl("iv_percentile")
+            if l.startswith("CHEAP"):
+                new_score += p["iv_percentile"]["score_cheap"]
+            elif l.startswith("NORMAL-LOW"):
+                new_score += p["iv_percentile"]["score_normal_low"]
+            elif l.startswith("NORMAL-HIGH"):
+                new_score += p["iv_percentile"]["score_normal_high"]
+            elif l.startswith("EXPENSIVE"):
+                new_score += p["iv_percentile"]["score_expensive"]
 
-            # put_call_ratio
-            s = scores.get("put_call_ratio", 0)
-            if s == 1:    new_score += p["put_call_ratio"]["score_fear"]
-            elif s == -1: new_score += p["put_call_ratio"]["score_euphoria"]
-            elif s == 0:  new_score += p["put_call_ratio"]["score_neutral"]
-            else:         new_score += p["put_call_ratio"]["score_optimism"]
+            # ── beta ──────────────────────────────────────────────────────────
+            l = lbl("beta")
+            if l.startswith("HIGH"):
+                new_score += p["beta"]["score_high"]
+            elif l.startswith("LOW"):
+                new_score += p["beta"]["score_low"]
+            elif l.startswith("NORMAL"):
+                new_score += p["beta"]["score_normal"]
 
-            # open_interest
-            s = scores.get("open_interest", 0)
-            if s == 1:    new_score += p["open_interest"]["score_high"]
-            elif s == -1: new_score += p["open_interest"]["score_low"]
-            else:         new_score += p["open_interest"]["score_normal"]
+            # ── put_call_ratio ────────────────────────────────────────────────
+            l = lbl("put_call_ratio")
+            if l.startswith("FEAR"):
+                new_score += p["put_call_ratio"]["score_fear"]
+            elif l.startswith("NEUTRAL"):
+                new_score += p["put_call_ratio"]["score_neutral"]
+            elif l.startswith("OPTIMIS"):
+                new_score += p["put_call_ratio"]["score_optimism"]
+            elif l.startswith("EUPHORIA"):
+                new_score += p["put_call_ratio"]["score_euphoria"]
 
-            # week_52
-            s = scores.get("week_52", 0)
-            if s == 1:    new_score += p["week_52"]["score_near_low"]
-            elif s == -1: new_score += p["week_52"]["score_near_high"]
-            else:         new_score += p["week_52"]["score_mid"]
+            # ── open_interest ─────────────────────────────────────────────────
+            l = lbl("open_interest")
+            if l.startswith("HIGH"):
+                new_score += p["open_interest"]["score_high"]
+            elif l.startswith("NORMAL"):
+                new_score += p["open_interest"]["score_normal"]
+            elif l.startswith("LOW"):
+                new_score += p["open_interest"]["score_low"]
 
-            # support_resistance
-            s = scores.get("support_resistance", 0)
-            if s == 2:    new_score += p["support_resistance"]["score_near_support"]
-            elif s == 1:  new_score += p["support_resistance"]["score_middle"]
-            elif s == -1: new_score += p["support_resistance"]["score_near_resistance"]
-            else:         new_score += p["support_resistance"]["score_no_data"]
+            # ── week_52 ───────────────────────────────────────────────────────
+            l = lbl("week_52")
+            if l.startswith("NEAR HIGH"):
+                new_score += p["week_52"]["score_near_high"]
+            elif l.startswith("NEAR LOW"):
+                new_score += p["week_52"]["score_near_low"]
+            else:
+                new_score += p["week_52"]["score_mid"]
 
-            # candlestick
-            s = scores.get("candlestick", 0)
-            if s == 2:    new_score += p["candlestick"]["score_strong_bullish"]
-            elif s == 1:  new_score += p["candlestick"]["score_weak_bullish"]
-            elif s == 0:  new_score += p["candlestick"]["score_neutral"]
-            elif s == -1: new_score += p["candlestick"]["score_weak_bearish"]
-            elif s == -2: new_score += p["candlestick"]["score_strong_bearish"]
+            # ── support_resistance ────────────────────────────────────────────
+            l = lbl("support_resistance")
+            if l.startswith("NEAR SUPPORT"):
+                new_score += p["support_resistance"]["score_near_support"]
+            elif l.startswith("NEAR RESISTANCE"):
+                new_score += p["support_resistance"]["score_near_resistance"]
+            elif l == "NO DATA":
+                new_score += p["support_resistance"]["score_no_data"]
+            else:
+                new_score += p["support_resistance"]["score_middle"]
 
-            # earnings
-            s = scores.get("earnings", 0)
-            if s == 1:    new_score += p["earnings"]["score_safe"]
-            elif s == 0:  new_score += p["earnings"]["score_caution"]
-            elif s == -2: new_score += p["earnings"]["score_danger"]
+            # ── candlestick ───────────────────────────────────────────────────
+            l = lbl("candlestick")
+            # Strong bullish patterns
+            if any(p_name in l for p_name in ["MORNING STAR", "BULLISH ENGULFING", "MARUBOZU GREEN"]):
+                new_score += p["candlestick"]["score_strong_bullish"]
+            # Strong bearish patterns
+            elif any(p_name in l for p_name in ["EVENING STAR", "BEARISH ENGULFING", "MARUBOZU RED"]):
+                new_score += p["candlestick"]["score_strong_bearish"]
+            # Weak bullish
+            elif any(p_name in l for p_name in ["HAMMER", "GREEN CANDLE"]):
+                new_score += p["candlestick"]["score_weak_bullish"]
+            # Weak bearish
+            elif any(p_name in l for p_name in ["SHOOTING STAR", "RED CANDLE"]):
+                new_score += p["candlestick"]["score_weak_bearish"]
+            else:
+                new_score += p["candlestick"]["score_neutral"]
 
-            # volume
-            s = scores.get("volume", 0)
-            if s == 1:    new_score += p["volume"]["score_normal"]
-            elif s == 0:  new_score += p["volume"]["score_high"]
-            elif s == -1: new_score += p["volume"]["score_low"]
+            # ── earnings ──────────────────────────────────────────────────────
+            l = lbl("earnings")
+            if l == "ETF" or l == "NO DATA":
+                pass  # 0 points
+            elif "CAUTION" in l:
+                new_score += p["earnings"]["score_caution"]
+            elif "DANGER" in l:
+                new_score += p["earnings"]["score_danger"]
+            else:
+                # label is just "Xd" — safe
+                new_score += p["earnings"]["score_safe"]
 
-            # pe
-            s = scores.get("pe", 0)
-            if s == 2:    new_score += p["pe"]["score_cheap"]
-            elif s == 1:  new_score += p["pe"]["score_normal"]
-            elif s == 0:  new_score += p["pe"]["score_expensive"]
-            elif s == -1: new_score += p["pe"]["score_very_expensive"]
+            # ── volume ────────────────────────────────────────────────────────
+            l = lbl("volume")
+            if l.startswith("NORMAL"):
+                new_score += p["volume"]["score_normal"]
+            elif l.startswith("HIGH"):
+                new_score += p["volume"]["score_high"]
+            elif l.startswith("LOW"):
+                new_score += p["volume"]["score_low"]
 
-            # eps_growth
-            s = scores.get("eps_growth", 0)
-            if s == 2:    new_score += p["eps_growth"]["score_strong"]
-            elif s == 1:  new_score += p["eps_growth"]["score_stable"]
-            elif s == -1: new_score += p["eps_growth"]["score_declining"]
-            elif s == -2: new_score += p["eps_growth"]["score_deteriorating"]
+            # ── pe ────────────────────────────────────────────────────────────
+            l = lbl("pe")
+            if l.startswith("CHEAP"):
+                new_score += p["pe"]["score_cheap"]
+            elif l.startswith("NORMAL"):
+                new_score += p["pe"]["score_normal"]
+            elif l.startswith("VERY EXPENSIVE"):
+                new_score += p["pe"]["score_very_expensive"]
+            elif l.startswith("EXPENSIVE"):
+                new_score += p["pe"]["score_expensive"]
 
-            # debt_equity
-            s = scores.get("debt_equity", 0)
-            if s == 1:    new_score += p["debt_equity"]["score_low"]
-            elif s == 0:  new_score += p["debt_equity"]["score_moderate"]
-            elif s == -1: new_score += p["debt_equity"]["score_high"]
+            # ── eps_growth ────────────────────────────────────────────────────
+            l = lbl("eps_growth")
+            if l.startswith("STRONG"):
+                new_score += p["eps_growth"]["score_strong"]
+            elif l.startswith("STABLE"):
+                new_score += p["eps_growth"]["score_stable"]
+            elif l.startswith("DETERIORATING"):
+                new_score += p["eps_growth"]["score_deteriorating"]
+            elif l.startswith("DECLINING"):
+                new_score += p["eps_growth"]["score_declining"]
 
-            # profit_margin
-            s = scores.get("profit_margin", 0)
-            if s == 2:    new_score += p["profit_margin"]["score_high"]
-            elif s == 1:  new_score += p["profit_margin"]["score_normal"]
-            elif s == 0:  new_score += p["profit_margin"]["score_low"]
-            elif s == -2: new_score += p["profit_margin"]["score_negative"]
+            # ── debt_equity ───────────────────────────────────────────────────
+            l = lbl("debt_equity")
+            if l.startswith("LOW"):
+                new_score += p["debt_equity"]["score_low"]
+            elif l.startswith("HIGH"):
+                new_score += p["debt_equity"]["score_high"]
+            else:
+                new_score += p["debt_equity"]["score_moderate"]
 
-            # Verdict
-            pct = new_score / score_max if score_max > 0 else 0
-            if pct >= threshold:
+            # ── profit_margin ─────────────────────────────────────────────────
+            l = lbl("profit_margin")
+            if l.startswith("HIGH"):
+                new_score += p["profit_margin"]["score_high"]
+            elif l.startswith("NORMAL"):
+                new_score += p["profit_margin"]["score_normal"]
+            elif l.startswith("NEGATIVE"):
+                new_score += p["profit_margin"]["score_negative"]
+            else:
+                new_score += p["profit_margin"]["score_low"]
+
+            # ── Verdict ───────────────────────────────────────────────────────
+            pct_score = new_score / score_max if score_max > 0 else 0
+
+            # DEBUG
+            if viable_total == 0 and len(viable_wins) == 0:
+                print(f"\nDEBUG {Path(param_file).name}: score={new_score}/{score_max} = {new_score/score_max:.2f} threshold={threshold}")
+                print(f"  labels muestra: trend={labels.get('trend_25d')} ma={labels.get('moving_averages')} rsi={labels.get('rsi')}")
+
+            if pct_score >= threshold:
                 viable_total += 1
                 if profited is not None:
                     viable_wins.append((profited, pct_change or 0))
@@ -466,7 +549,6 @@ def simulate_scoring_files(param_files):
               f"{win_rate:>8.1f}% {avg_ret:>+9.2f}%")
 
     print(f"\n{'═' * 70}\n")
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # REPORT PRINTING
