@@ -300,7 +300,10 @@ def simulate_scoring_files(param_files):
         JOIN criteria_scores cs ON cs.analysis_id = a.id
         LEFT JOIN outcomes o    ON o.analysis_id  = a.id
         WHERE a.is_backtest = TRUE
-          AND o.would_have_profited IS NOT NULL
+            AND o.would_have_profited IS NOT NULL
+            AND a.ticker IN ('AAPL','MSFT','GOOGL','META','AMZN','NVDA',
+                            'JPM','BAC','GS','V','MA','HD','WMT','COST',
+                            'MCD','NKE','JNJ','UNH','SPY','QQQ')
         GROUP BY a.id, o.would_have_profited, o.pct_change_30d;
     """)
 
@@ -527,11 +530,6 @@ def simulate_scoring_files(param_files):
 
             # ── Verdict ───────────────────────────────────────────────────────
             pct_score = new_score / score_max if score_max > 0 else 0
-
-            # DEBUG
-            if viable_total == 0 and len(viable_wins) == 0:
-                print(f"\nDEBUG {Path(param_file).name}: score={new_score}/{score_max} = {new_score/score_max:.2f} threshold={threshold}")
-                print(f"  labels muestra: trend={labels.get('trend_25d')} ma={labels.get('moving_averages')} rsi={labels.get('rsi')}")
 
             if pct_score >= threshold:
                 viable_total += 1

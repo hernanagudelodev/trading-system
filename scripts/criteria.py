@@ -7,9 +7,7 @@ This file is responsible ONLY for fetching and calculating raw market data.
 It does NOT score, rate, or make any trading decisions.
 
 Scoring logic lives in: scoring.py
-History management lives in: history.py
 Audit logic lives in: audit.py
-Orchestration lives in: main.py
 
 Data sources: yfinance (Yahoo Finance)
 """
