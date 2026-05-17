@@ -199,14 +199,17 @@ def get_snapshots_without_outcomes(limit=None):
     return rows
 
 
-def save_outcome(snapshot_id, exit_day, exit_price, pct_change,
+def save_outcome(snapshot_id, strategy, exit_day, exit_price, pct_change,
                  was_successful, exit_reason):
     """
-    Save the simulated outcome for a snapshot.
+    Save the simulated outcome for a snapshot + strategy combination.
     Used by simulate.py.
+
+    Multiple strategies can be saved for the same snapshot.
 
     Args:
         snapshot_id    (int)   — from v2_snapshots
+        strategy       (str)   — strategy name e.g. "BULL_CALL_SPREAD", "LONG_CALL"
         exit_day       (int)   — day number when exit condition was met
         exit_price     (float) — price on exit day
         pct_change     (float) — % price change from entry to exit
@@ -218,11 +221,11 @@ def save_outcome(snapshot_id, exit_day, exit_price, pct_change,
 
     cur.execute("""
         INSERT INTO v2_outcomes (
-            snapshot_id, exit_day, exit_price,
+            snapshot_id, strategy, exit_day, exit_price,
             pct_change, was_successful, exit_reason
         )
-        VALUES (%s, %s, %s, %s, %s, %s)
-        ON CONFLICT (snapshot_id)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (snapshot_id, strategy)
         DO UPDATE SET
             exit_day       = EXCLUDED.exit_day,
             exit_price     = EXCLUDED.exit_price,
@@ -230,33 +233,41 @@ def save_outcome(snapshot_id, exit_day, exit_price, pct_change,
             was_successful = EXCLUDED.was_successful,
             exit_reason    = EXCLUDED.exit_reason,
             recorded_at    = NOW();
-    """, (snapshot_id, exit_day, exit_price, pct_change, was_successful, exit_reason))
+    """, (snapshot_id, strategy, exit_day, exit_price, pct_change, was_successful, exit_reason))
 
     conn.commit()
     cur.close()
     conn.close()
 
 
-def get_all_snapshots_with_criteria():
+def get_all_snapshots_with_criteria(strategy=None):
     """
     Get all snapshots with their raw criteria pivoted into columns.
     Used by audit.py for scoring simulation.
 
+    Args:
+        strategy (str | None) — filter outcomes by strategy name
+                                e.g. "BULL_CALL_SPREAD", "LONG_CALL"
+                                None = include all outcomes (or no outcome)
+
     Returns:
         list of dicts: {snapshot_id, ticker, date, price, sector,
-                        criterion_1: value, criterion_2: value, ...}
+                        strategy, was_successful, pct_change, exit_reason,
+                        criteria: {criterion: value}}
     """
     conn = get_connection()
     cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
-    # Get all criteria as a JSON object per snapshot
-    cur.execute("""
+    strategy_filter = "AND o.strategy = %(strategy)s" if strategy else ""
+
+    cur.execute(f"""
         SELECT
             s.id            AS snapshot_id,
             s.ticker,
             s.backtest_date AS date,
             s.price,
             s.sector,
+            o.strategy,
             o.was_successful,
             o.pct_change,
             o.exit_reason,
@@ -264,17 +275,17 @@ def get_all_snapshots_with_criteria():
                 c.criterion,
                 CASE
                     WHEN c.raw_value IS NOT NULL THEN to_json(c.raw_value)
-                    WHEN c.raw_extra IS NOT NULL THEN c.raw_extra -> 'value'
+                    WHEN c.raw_extra IS NOT NULL THEN to_json(c.raw_extra -> 'value')
                     ELSE 'null'::json
                 END
             ) AS criteria
         FROM v2_snapshots s
         JOIN v2_criteria c ON c.snapshot_id = s.id
-        LEFT JOIN v2_outcomes o ON o.snapshot_id = s.id
+        LEFT JOIN v2_outcomes o ON o.snapshot_id = s.id {strategy_filter}
         GROUP BY s.id, s.ticker, s.backtest_date, s.price, s.sector,
-                 o.was_successful, o.pct_change, o.exit_reason
+                 o.strategy, o.was_successful, o.pct_change, o.exit_reason
         ORDER BY s.ticker, s.backtest_date;
-    """)
+    """, {"strategy": strategy} if strategy else {})
 
     rows = [dict(r) for r in cur.fetchall()]
     cur.close()

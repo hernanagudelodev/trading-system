@@ -1,0 +1,10 @@
+{
+    "name": "PRICE_TARGET",
+    "type": "PRICE_TARGET",
+    "_description": "Simple strategy: success if price rises target_pct% within max_days. No options modeling.",
+    "params": {
+        "target_pct":    3.0,
+        "stop_loss_pct": -5.0,
+        "max_days":      30
+    }
+}

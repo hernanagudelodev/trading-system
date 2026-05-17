@@ -1,0 +1,121 @@
+{
+    "_version": "v1",
+    "_description": "First scoring params — 9 reliable technical criteria only. No fundamentals, no IV, no PCR, no OI.",
+    "_date": "2026-05-15",
+    "_criteria_used": [
+        "trend_25d_pct",
+        "above_sma50",
+        "above_sma200",
+        "sma50_direction",
+        "rsi",
+        "week_52_position",
+        "nearest_support_pct",
+        "nearest_resistance_pct",
+        "candlestick_signal",
+        "hv_30d",
+        "volume_ratio"
+    ],
+    "_score_max_note": "Sum of all max positive scores = 14",
+
+    "thresholds": {
+        "viable":    0.65,
+        "caution":   0.35
+    },
+
+    "score_max": 14,
+
+    "trend_25d_pct": {
+        "_note": "% price change over last 25 days",
+        "strong_bullish_threshold":  5.0,
+        "bullish_threshold":         0.0,
+        "bearish_threshold":        -5.0,
+        "score_strong_bullish":      2,
+        "score_bullish":             1,
+        "score_neutral":             0,
+        "score_bearish":            -1,
+        "score_strong_bearish":     -2
+    },
+
+    "above_sma50": {
+        "_note": "1.0 = price above SMA50, 0.0 = below",
+        "score_above":    1,
+        "score_below":   -1
+    },
+
+    "above_sma200": {
+        "_note": "1.0 = price above SMA200, 0.0 = below, null = insufficient data",
+        "score_above":    1,
+        "score_below":   -1,
+        "score_no_data":  0
+    },
+
+    "sma50_direction": {
+        "_note": "RISING | FLAT | FALLING",
+        "score_rising":   1,
+        "score_flat":     0,
+        "score_falling": -1
+    },
+
+    "rsi": {
+        "_note": "RSI 14-day value (0-100). Neutral zone is best for entry.",
+        "overbought_threshold":  70,
+        "oversold_threshold":    30,
+        "caution_high":          65,
+        "caution_low":           35,
+        "score_neutral":          2,
+        "score_caution":          1,
+        "score_overbought":      -1,
+        "score_oversold":         0
+    },
+
+    "week_52_position": {
+        "_note": "0 = at annual low, 100 = at annual high. Mid-range is best.",
+        "near_high_threshold":  80,
+        "near_low_threshold":   20,
+        "score_near_low":        1,
+        "score_mid":             2,
+        "score_near_high":      -1
+    },
+
+    "nearest_support_pct": {
+        "_note": "% distance price is above nearest support. Closer = better entry.",
+        "very_close_threshold":  2.0,
+        "close_threshold":       5.0,
+        "score_very_close":       2,
+        "score_close":            1,
+        "score_far":              0,
+        "score_no_data":          0
+    },
+
+    "nearest_resistance_pct": {
+        "_note": "% distance price is below nearest resistance. Farther = more room to run.",
+        "tight_threshold":   3.0,
+        "score_tight":       -1,
+        "score_room":         0
+    },
+
+    "candlestick_signal": {
+        "_note": "BULLISH | NEUTRAL | BEARISH",
+        "score_bullish":   1,
+        "score_neutral":   0,
+        "score_bearish":  -1
+    },
+
+    "hv_30d": {
+        "_note": "Historical volatility 30-day annualized %. Lower is better for spreads.",
+        "low_threshold":    20,
+        "high_threshold":   40,
+        "score_low":         1,
+        "score_normal":      1,
+        "score_high":       -1
+    },
+
+    "volume_ratio": {
+        "_note": "Today's volume / 20-day avg * 100. 100 = average.",
+        "high_threshold":  150,
+        "low_threshold":    50,
+        "score_high":        0,
+        "score_normal":      1,
+        "score_low":        -1
+    }
+}

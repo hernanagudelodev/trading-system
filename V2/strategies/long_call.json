@@ -1,0 +1,11 @@
+{
+    "name": "LONG_CALL",
+    "type": "LONG_CALL",
+    "_description": "Long Call: success if price rises enough to cover premium + profit target within max_days.",
+    "params": {
+        "premium_pct":        3.0,
+        "profit_target_pct":  1.0,
+        "stop_loss_pct":     -3.0,
+        "max_days":           30
+    }
+}

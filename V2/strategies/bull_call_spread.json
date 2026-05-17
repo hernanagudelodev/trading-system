@@ -1,0 +1,12 @@
+{
+    "name": "BULL_CALL_SPREAD",
+    "type": "BULL_CALL_SPREAD",
+    "_description": "Bull Call Spread: long ATM call + short call at ATM + spread_width. Exit at 60% profit target or 50% stop loss.",
+    "params": {
+        "spread_width":          3.0,
+        "premium_pct_of_width":  0.40,
+        "profit_target_pct":     0.60,
+        "stop_loss_pct":         0.50,
+        "max_days":              30
+    }
+}
