@@ -1,0 +1,121 @@
+{
+    "_version": "v2",
+    "_description": "Recalibrated scoring based on winner/loser analysis of BULL_CALL_SPREAD outcomes. Key changes vs v1: hv_30d inverted (higher HV = better for spreads), sma200_pct weighted more heavily, volume_ratio rewarded, above_sma50 neutralized, rsi adjusted to favor lower values.",
+    "_date": "2026-05-18",
+    "_analysis": {
+        "hv_30d":               "Winners avg 32.6% vs losers 29.3% — higher HV means more movement potential. INVERTED vs v1.",
+        "sma200_pct":           "Winners avg +8.93% vs losers +5.37% — stronger uptrend = better outcome.",
+        "nearest_support_pct":  "Winners avg 4.91% vs losers 4.14% — slightly closer to support is better.",
+        "trend_25d_pct":        "Winners avg +2.88% vs losers +2.30% — momentum matters.",
+        "volume_ratio":         "Winners avg 104.5 vs losers 99.1 — higher volume confirms movement.",
+        "rsi":                  "Winners avg 52.16 vs losers 52.89 — slight inverse, lower RSI has more upside room.",
+        "above_sma50":          "Winners 0.592 vs losers 0.594 — essentially no predictive value. Neutralized.",
+        "above_sma200":         "Winners 0.648 vs losers 0.626 — small positive signal, kept but low weight.",
+        "sma50_pct":            "Winners +2.39% vs losers +1.79% — price above SMA50 by more = better.",
+        "nearest_resistance_pct": "Low predictive value. Kept as mild penalizer only.",
+        "week_52_position":     "Low predictive value. Neutralized."
+    },
+    "_score_max_note": "Sum of all max positive scores = 14",
+
+    "thresholds": {
+        "viable":  0.60,
+        "caution": 0.35
+    },
+
+    "score_max": 14,
+
+    "trend_25d_pct": {
+        "_note": "% price change over last 25 days. Momentum matters for spreads.",
+        "strong_bullish_threshold":  4.0,
+        "bullish_threshold":         1.0,
+        "bearish_threshold":        -2.0,
+        "score_strong_bullish":      2,
+        "score_bullish":             1,
+        "score_neutral":             0,
+        "score_bearish":            -1,
+        "score_strong_bearish":     -2
+    },
+
+    "above_sma50": {
+        "_note": "Neutralized — essentially no predictive value for BULL_CALL_SPREAD.",
+        "score_above":  0,
+        "score_below":  0
+    },
+
+    "above_sma200": {
+        "_note": "Small positive signal kept. Winners 0.648 vs losers 0.626.",
+        "score_above":    1,
+        "score_below":   -1,
+        "score_no_data":  0
+    },
+
+    "sma50_direction": {
+        "_note": "Direction still relevant as trend confirmation.",
+        "score_rising":   1,
+        "score_flat":     0,
+        "score_falling": -1
+    },
+
+    "rsi": {
+        "_note": "Lower RSI = more upside room. Winners avg 52.16 vs losers 52.89. Adjusted thresholds.",
+        "overbought_threshold":  68,
+        "oversold_threshold":    35,
+        "caution_high":          62,
+        "caution_low":           38,
+        "score_neutral":          2,
+        "score_caution":          1,
+        "score_overbought":      -2,
+        "score_oversold":         1
+    },
+
+    "week_52_position": {
+        "_note": "Low predictive value. Neutralized — no positive or negative scores.",
+        "near_high_threshold":  85,
+        "near_low_threshold":   15,
+        "score_near_low":        0,
+        "score_mid":             0,
+        "score_near_high":       0
+    },
+
+    "nearest_support_pct": {
+        "_note": "Winners slightly closer to support. Kept but modest weight.",
+        "very_close_threshold":  3.0,
+        "close_threshold":       6.0,
+        "score_very_close":       2,
+        "score_close":            1,
+        "score_far":              0,
+        "score_no_data":          0
+    },
+
+    "nearest_resistance_pct": {
+        "_note": "Low predictive value. Mild penalizer only for very tight resistance.",
+        "tight_threshold":   2.5,
+        "score_tight":       -1,
+        "score_room":         0
+    },
+
+    "candlestick_signal": {
+        "_note": "Very low predictive value (avg +0.03 in v1). Kept but minimal weight.",
+        "score_bullish":   1,
+        "score_neutral":   0,
+        "score_bearish":  -1
+    },
+
+    "hv_30d": {
+        "_note": "INVERTED vs v1. Winners avg 32.6% vs losers 29.3%. Higher HV = more movement potential for spreads.",
+        "low_threshold":    22,
+        "high_threshold":   45,
+        "score_low":        -1,
+        "score_normal":      1,
+        "score_high":        2
+    },
+
+    "volume_ratio": {
+        "_note": "Higher volume confirms momentum. Winners avg 104.5 vs losers 99.1.",
+        "high_threshold":  120,
+        "low_threshold":    60,
+        "score_high":        2,
+        "score_normal":      1,
+        "score_low":        -1
+    }
+}

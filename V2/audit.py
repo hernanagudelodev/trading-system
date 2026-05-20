@@ -33,6 +33,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from db import get_connection, get_all_snapshots_with_criteria
 from scoring import score_raw, load_params
 
+sys.stdout.reconfigure(encoding='utf-8')
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION
@@ -402,12 +403,6 @@ if __name__ == "__main__":
         strategy=args.strategy,
     )
     print(f"{len(rows):,} records loaded")
-
-    # DEBUG — ver qué llega para candlestick_signal y sma50_direction
-    sample = rows[0]["criteria"] if rows else {}
-    print(f"\nDEBUG criteria sample:")
-    for k in ["candlestick_signal", "sma50_direction", "rsi", "above_sma50"]:
-        print(f"  {k}: {repr(sample.get(k))}")
 
     if not rows:
         print("  No data found. Run backtest.py first.")

@@ -1,28 +1,27 @@
 """
 market_context.py
 =================
-Daily macro analysis for Bull Call Spread system.
-
-Answers ONE question before running the scanner:
-    Is it worth opening positions today?
+Daily macro analysis for the options trading system.
 
 Analyzes two levels:
     1. General market  — VIX level/trend, SPY position vs SMAs and momentum
     2. Sectors         — historical win rates from DB, which to prioritize today
 
 Output:
-    🟢 FAVORABLE   — good conditions, recommended sectors listed
-    🟡 CAUTION     — uncertain market, be very selective
-    🔴 DO NOT TRADE — adverse conditions, do not open new positions
+    - market_context_report.html  — visual dashboard, opens in browser automatically
+    - market_context.json         — structured raw data for scanner.py to consume
+
+NO AI in this script — raw data only.
+The scanner reads market_context.json and passes everything to its AI
+for a single coherent interpretation.
 
 Usage:
     python market_context.py
 
 Dependencies:
-    yfinance            → market data
-    db.py               → historical win rates by sector
-    sp500_tickers.json  → full S&P 500 ticker list with sectors
-    .env                → DATABASE_URL
+    yfinance    → market data
+    db.py       → historical win rates by sector
+    .env        → DATABASE_URL
 """
 
 import os
@@ -31,6 +30,7 @@ import json
 import warnings
 import datetime
 import io
+import webbrowser
 
 import yfinance as yf
 import pandas as pd
@@ -46,35 +46,30 @@ load_dotenv()
 # CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════════════
 
-# VIX thresholds
-VIX_CALM        = 18   # below → calm market, favorable for spreads
-VIX_ELEVATED    = 25   # between calm and elevated → caution
-VIX_FEAR        = 35   # above → extreme fear, do not trade
+VIX_CALM        = 18
+VIX_ELEVATED    = 25
+VIX_FEAR        = 35
 
-# Sector win rate thresholds
-SECTOR_WIN_RATE_PRIORITY = 58.0  # above → priority sector
-SECTOR_WIN_RATE_OK       = 54.0  # between ok and priority → acceptable
+SECTOR_WIN_RATE_PRIORITY = 58.0
+SECTOR_WIN_RATE_OK       = 54.0
+SECTOR_MIN_SIGNALS       = 5000
+MAX_TICKERS_PER_SECTOR   = 8
 
-# Minimum historical signals for a sector win rate to be reliable
-SECTOR_MIN_SIGNALS = 5000
-
-# Max tickers to recommend per sector
-MAX_TICKERS_PER_SECTOR = 8
-
-# Path to S&P 500 JSON
-SP500_JSON = os.path.join(os.path.dirname(__file__), "sp500_tickers.json")
+SP500_JSON  = os.path.join(os.path.dirname(__file__), "sp500_tickers.json")
+REPORT_PATH = os.path.join(os.path.dirname(__file__), "market_context_report.html")
+JSON_PATH   = os.path.join(os.path.dirname(__file__), "market_context.json")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _silence_stderr():
+def _silence():
     old = sys.stderr
     sys.stderr = io.StringIO()
     return old
 
-def _restore_stderr(old):
+def _restore(old):
     sys.stderr = old
 
 def _sma(series, n):
@@ -87,23 +82,15 @@ def _pct_change(series, n):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# LEVEL 1 — GENERAL MARKET
+# MARKET DATA
 # ══════════════════════════════════════════════════════════════════════════════
 
 def get_vix():
-    """
-    Fetch current VIX level and 5-day trend.
-
-    Returns:
-        dict with keys: current, avg_5d, avg_10d, trend, level, score
-        or None if data unavailable
-    """
-    old = _silence_stderr()
+    old = _silence()
     try:
         data = yf.download("^VIX", period="20d", interval="1d",
                            progress=False, auto_adjust=True)
-        _restore_stderr(old)
-
+        _restore(old)
         if data.empty:
             return None
 
@@ -112,388 +99,481 @@ def get_vix():
         avg_5d  = float(closes.iloc[-5:].mean())
         avg_10d = float(closes.iloc[-10:].mean())
 
-        if current < avg_5d * 0.95:
-            trend = "FALLING ↓"
-        elif current > avg_5d * 1.05:
-            trend = "RISING ↑"
-        else:
-            trend = "STABLE →"
+        trend = "FALLING" if current < avg_5d * 0.95 else \
+                "RISING"  if current > avg_5d * 1.05 else "STABLE"
 
         if current < VIX_CALM:
-            level = "CALM"
-            score = 2
+            level, score = "CALM", 2
         elif current < VIX_ELEVATED:
-            level = "ELEVATED"
-            score = 1
+            level, score = "ELEVATED", 1
         elif current < VIX_FEAR:
-            level = "HIGH"
-            score = -1
+            level, score = "HIGH", -1
         else:
-            level = "EXTREME"
-            score = -2
+            level, score = "EXTREME", -2
 
-        return {
-            "current": round(current, 2),
-            "avg_5d":  round(avg_5d, 2),
-            "avg_10d": round(avg_10d, 2),
-            "trend":   trend,
-            "level":   level,
-            "score":   score,
-        }
+        return {"current": round(current, 2), "avg_5d": round(avg_5d, 2),
+                "avg_10d": round(avg_10d, 2), "trend": trend,
+                "level": level, "score": score}
     except Exception:
-        _restore_stderr(old)
+        _restore(old)
         return None
 
 
 def get_spy_context():
-    """
-    Analyze SPY: trend, position vs SMAs, SMA50 direction.
-
-    Returns:
-        dict with keys: price, sma50, sma200, sma_status, sma50_dir,
-                        trend, pct_25d, score
-        or None if data unavailable
-    """
-    old = _silence_stderr()
+    old = _silence()
     try:
         data = yf.download("SPY", period="1y", interval="1d",
                            progress=False, auto_adjust=True)
-        _restore_stderr(old)
-
+        _restore(old)
         if data.empty or len(data) < 50:
             return None
 
-        closes = data["Close"].squeeze().dropna()
-        price  = float(closes.iloc[-1])
-
-        sma50  = float(_sma(closes, 50))
-        sma200 = float(_sma(closes, 200)) if len(closes) >= 200 else None
-
-        # 25-day price trend
+        closes  = data["Close"].squeeze().dropna()
+        price   = float(closes.iloc[-1])
+        sma50   = float(_sma(closes, 50))
+        sma200  = float(_sma(closes, 200)) if len(closes) >= 200 else None
         pct_25d = _pct_change(closes, 25)
 
-        # Position vs SMAs
         above_50  = price > sma50
-        above_200 = price > sma200 if sma200 is not None else None
+        above_200 = (price > sma200) if sma200 else None
 
         if above_50 and above_200:
-            sma_status = "ABOVE BOTH"
-            sma_score  = 2
+            sma_status, sma_score = "ABOVE BOTH", 2
         elif above_50:
-            sma_status = "ABOVE SMA50 ONLY"
-            sma_score  = 1
+            sma_status, sma_score = "ABOVE SMA50", 1
         elif above_200:
-            sma_status = "BELOW SMA50, ABOVE SMA200"
-            sma_score  = 0
+            sma_status, sma_score = "BELOW SMA50", 0
         else:
-            sma_status = "BELOW BOTH"
-            sma_score  = -2
+            sma_status, sma_score = "BELOW BOTH", -2
 
-        # SMA50 direction over last 5 days
         sma50_series = closes.rolling(50).mean()
+        sma50_dir, sma50_score = "FLAT", 0
         if len(sma50_series.dropna()) >= 5:
-            sma50_5d_ago = float(sma50_series.dropna().iloc[-5])
-            if sma50 > sma50_5d_ago * 1.001:
-                sma50_dir   = "RISING ↑"
-                sma50_score = 1
-            elif sma50 < sma50_5d_ago * 0.999:
-                sma50_dir   = "FALLING ↓"
-                sma50_score = -1
-            else:
-                sma50_dir   = "FLAT →"
-                sma50_score = 0
-        else:
-            sma50_dir   = "UNKNOWN"
-            sma50_score = 0
+            sma50_5d = float(sma50_series.dropna().iloc[-5])
+            if sma50 > sma50_5d * 1.001:
+                sma50_dir, sma50_score = "RISING", 1
+            elif sma50 < sma50_5d * 0.999:
+                sma50_dir, sma50_score = "FALLING", -1
 
-        # Overall trend
-        if pct_25d is not None:
-            if pct_25d > 2:
-                trend       = f"BULLISH ({pct_25d:+.1f}% 25d)"
-                trend_score = 1
-            elif pct_25d < -2:
-                trend       = f"BEARISH ({pct_25d:+.1f}% 25d)"
-                trend_score = -1
-            else:
-                trend       = f"SIDEWAYS ({pct_25d:+.1f}% 25d)"
-                trend_score = 0
+        if pct_25d and pct_25d > 2:
+            trend, trend_score = "BULLISH", 1
+        elif pct_25d and pct_25d < -2:
+            trend, trend_score = "BEARISH", -1
         else:
-            trend       = "UNKNOWN"
-            trend_score = 0
-
-        total_score = sma_score + sma50_score + trend_score
+            trend, trend_score = "SIDEWAYS", 0
 
         return {
             "price":      round(price, 2),
             "sma50":      round(sma50, 2),
-            "sma200":     round(sma200, 2) if sma200 is not None else None,
+            "sma200":     round(sma200, 2) if sma200 else None,
             "sma_status": sma_status,
             "sma50_dir":  sma50_dir,
             "trend":      trend,
-            "pct_25d":    round(pct_25d, 2) if pct_25d is not None else None,
-            "score":      total_score,
+            "pct_25d":    round(pct_25d, 2) if pct_25d else None,
+            "score":      sma_score + sma50_score + trend_score,
         }
     except Exception:
-        _restore_stderr(old)
+        _restore(old)
         return None
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# LEVEL 2 — SECTORS
-# ══════════════════════════════════════════════════════════════════════════════
-
 def get_sector_win_rates():
-    """
-    Read historical win rates by sector from DB.
-    Only includes sectors with enough signals to be statistically reliable.
-
-    Returns:
-        list of dicts with keys: sector, win_rate, avg_return, viable, total, priority
-    """
     conn = get_connection()
     cur  = conn.cursor()
-
     cur.execute("""
-        SELECT
-            a.sector,
-            COUNT(*)                                                          AS total,
-            ROUND(AVG(CASE WHEN o.would_have_profited
-                THEN 1.0 ELSE 0.0 END) * 100, 1)                             AS win_rate,
-            ROUND(AVG(o.pct_change_30d)::numeric, 2)                         AS avg_return,
-            SUM(CASE WHEN a.verdict = 'VIABLE' THEN 1 ELSE 0 END)            AS viable_signals
+        SELECT a.sector,
+               COUNT(*) AS total,
+               ROUND(AVG(CASE WHEN o.would_have_profited THEN 1.0 ELSE 0.0 END)*100,1) AS win_rate,
+               ROUND(AVG(o.pct_change_30d)::numeric,2) AS avg_return
         FROM analysis a
         JOIN outcomes o ON o.analysis_id = a.id
-        WHERE a.is_backtest = TRUE
-          AND a.sector IS NOT NULL
+        WHERE a.is_backtest = TRUE AND a.sector IS NOT NULL
           AND o.would_have_profited IS NOT NULL
         GROUP BY a.sector
         HAVING COUNT(*) >= %s
         ORDER BY win_rate DESC;
     """, (SECTOR_MIN_SIGNALS,))
-
     rows = cur.fetchall()
     cur.close()
     conn.close()
 
     sectors = []
-    for sector, total, win_rate, avg_return, viable in rows:
-        win_rate   = float(win_rate)
-        avg_return = float(avg_return)
-
-        if win_rate >= SECTOR_WIN_RATE_PRIORITY:
-            priority = "PRIORITY"
-        elif win_rate >= SECTOR_WIN_RATE_OK:
-            priority = "ACCEPTABLE"
-        else:
-            priority = "AVOID"
-
-        sectors.append({
-            "sector":     sector,
-            "win_rate":   win_rate,
-            "avg_return": avg_return,
-            "viable":     int(viable),
-            "total":      int(total),
-            "priority":   priority,
-        })
-
+    for sector, total, win_rate, avg_return in rows:
+        wr = float(win_rate)
+        priority = "PRIORITY"   if wr >= SECTOR_WIN_RATE_PRIORITY else \
+                   "ACCEPTABLE" if wr >= SECTOR_WIN_RATE_OK       else "AVOID"
+        sectors.append({"sector": sector, "win_rate": wr,
+                        "avg_return": float(avg_return), "priority": priority})
     return sectors
 
 
-def get_recommended_tickers(max_per_sector=MAX_TICKERS_PER_SECTOR):
-    """
-    Build a recommended ticker list based on priority sectors.
-
-    Reads sp500_tickers.json to get the full sector → ticker mapping,
-    then queries the DB to rank tickers within each priority sector
-    by their historical VIABLE accuracy.
-
-    Only includes tickers with at least 3 VIABLE signals historically
-    so the accuracy metric is meaningful.
-
-    Args:
-        max_per_sector (int) — max tickers to include per sector
-
-    Returns:
-        list of ticker strings ordered by sector priority then accuracy,
-        or None if data unavailable
-    """
+def get_recommended_tickers(sectors, max_per_sector=MAX_TICKERS_PER_SECTOR):
     if not os.path.exists(SP500_JSON):
-        return None
+        return []
 
-    with open(SP500_JSON, "r") as f:
-        sp500 = json.load(f)
-
-    # Get priority sectors from DB
-    sectors = get_sector_win_rates()
     priority_sectors = [s["sector"] for s in sectors if s["priority"] == "PRIORITY"]
-
     if not priority_sectors:
-        return None
+        return []
 
-    # Query DB for tickers in priority sectors ranked by VIABLE accuracy
     conn = get_connection()
     cur  = conn.cursor()
-
     cur.execute("""
-        SELECT
-            a.ticker,
-            a.sector,
-            SUM(CASE WHEN a.verdict = 'VIABLE' THEN 1 ELSE 0 END)             AS viable_count,
-            ROUND(AVG(CASE WHEN a.verdict = 'VIABLE'
-                          AND o.would_have_profited IS NOT NULL
-                THEN CASE WHEN o.would_have_profited THEN 1.0 ELSE 0.0 END
-                END) * 100, 1)                                                 AS viable_accuracy
+        SELECT a.ticker, a.sector,
+               SUM(CASE WHEN a.verdict='VIABLE' THEN 1 ELSE 0 END) AS viable_count,
+               ROUND(AVG(CASE WHEN a.verdict='VIABLE' AND o.would_have_profited IS NOT NULL
+                   THEN CASE WHEN o.would_have_profited THEN 1.0 ELSE 0.0 END END)*100,1) AS accuracy
         FROM analysis a
         LEFT JOIN outcomes o ON o.analysis_id = a.id
-        WHERE a.is_backtest = TRUE
-          AND a.sector = ANY(%s)
+        WHERE a.is_backtest = TRUE AND a.sector = ANY(%s)
         GROUP BY a.ticker, a.sector
-        HAVING SUM(CASE WHEN a.verdict = 'VIABLE' THEN 1 ELSE 0 END) >= 3
-        ORDER BY viable_accuracy DESC NULLS LAST, viable_count DESC;
+        HAVING SUM(CASE WHEN a.verdict='VIABLE' THEN 1 ELSE 0 END) >= 3
+        ORDER BY accuracy DESC NULLS LAST, viable_count DESC;
     """, (priority_sectors,))
-
     rows = cur.fetchall()
     cur.close()
     conn.close()
 
-    # Pick top N per sector preserving priority order
-    tickers_by_sector = {s: [] for s in priority_sectors}
-    for ticker, sector, viable_count, viable_accuracy in rows:
-        if sector in tickers_by_sector:
-            if len(tickers_by_sector[sector]) < max_per_sector:
-                tickers_by_sector[sector].append(ticker)
+    by_sector = {s: [] for s in priority_sectors}
+    for ticker, sector, viable, accuracy in rows:
+        if sector in by_sector and len(by_sector[sector]) < max_per_sector:
+            by_sector[sector].append(ticker)
 
-    # Flatten in sector priority order, deduplicate
     recommended = []
     seen = set()
     for sector in priority_sectors:
-        for ticker in tickers_by_sector.get(sector, []):
-            if ticker not in seen:
-                seen.add(ticker)
-                recommended.append(ticker)
+        for t in by_sector.get(sector, []):
+            if t not in seen:
+                seen.add(t)
+                recommended.append(t)
+    return recommended
 
-    return recommended if recommended else None
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# FINAL VERDICT
-# ══════════════════════════════════════════════════════════════════════════════
 
 def get_verdict(vix, spy):
-    """
-    Combine VIX and SPY scores into a final trading verdict.
-
-    Hard veto conditions override score:
-        - VIX >= VIX_FEAR → DO NOT TRADE
-        - SPY below both SMAs + VIX elevated → DO NOT TRADE
-
-    Returns:
-        (verdict_str, detail_str)
-    """
     if vix is None or spy is None:
-        return "⚠️  INSUFFICIENT DATA", "Could not retrieve market data."
-
-    # Hard veto conditions
+        return "INSUFFICIENT_DATA", "Could not retrieve market data."
     if vix["current"] >= VIX_FEAR:
-        return "🔴 DO NOT TRADE", f"Extreme VIX ({vix['current']:.1f}) — market in panic mode."
-
+        return "DO_NOT_TRADE", f"Extreme VIX ({vix['current']:.1f}) — market in panic."
     if spy["sma_status"] == "BELOW BOTH" and vix["current"] > VIX_ELEVATED:
-        return "🔴 DO NOT TRADE", "SPY below SMA50 and SMA200 with elevated VIX — confirmed downtrend."
+        return "DO_NOT_TRADE", "SPY below SMA50 and SMA200 with elevated VIX."
 
-    # Score-based verdict
-    total_score = vix["score"] + spy["score"]
-
-    if total_score >= 3:
-        return "🟢 FAVORABLE", "Strong macro conditions for Bull Call Spreads."
-    elif total_score >= 1:
-        return "🟡 CAUTION", "Mixed market — be selective, stick to priority sectors only."
-    elif total_score >= -1:
-        return "🟡 CAUTION", "Uncertain conditions — reduce position size."
-    else:
-        return "🔴 DO NOT TRADE", "Adverse macro conditions — wait for better setup."
+    total = vix["score"] + spy["score"]
+    if total >= 3:    return "FAVORABLE",   "Strong macro conditions for options trading."
+    elif total >= 1:  return "CAUTION",     "Mixed market — be selective."
+    elif total >= -1: return "CAUTION",     "Uncertain conditions — reduce position size."
+    else:             return "DO_NOT_TRADE", "Adverse macro conditions — wait."
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# REPORT
+# JSON OUTPUT
 # ══════════════════════════════════════════════════════════════════════════════
 
-def print_report():
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+def save_json(vix, spy, sectors, verdict, detail, recommended):
+    priority   = [s["sector"] for s in sectors if s["priority"] == "PRIORITY"]
+    acceptable = [s["sector"] for s in sectors if s["priority"] == "ACCEPTABLE"]
+    avoid      = [s["sector"] for s in sectors if s["priority"] == "AVOID"]
 
-    print(f"\n{'═' * 62}")
-    print(f"  MARKET CONTEXT — {timestamp}")
-    print(f"{'═' * 62}")
+    data = {
+        "timestamp":           datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "verdict":             verdict,
+        "verdict_detail":      detail,
+        "vix": {
+            "current":  vix["current"]  if vix else None,
+            "level":    vix["level"]    if vix else None,
+            "trend":    vix["trend"]    if vix else None,
+            "avg_5d":   vix["avg_5d"]   if vix else None,
+            "avg_10d":  vix["avg_10d"]  if vix else None,
+        },
+        "spy": {
+            "price":      spy["price"]      if spy else None,
+            "trend":      spy["trend"]      if spy else None,
+            "pct_25d":    spy["pct_25d"]    if spy else None,
+            "sma_status": spy["sma_status"] if spy else None,
+            "sma50_dir":  spy["sma50_dir"]  if spy else None,
+            "sma50":      spy["sma50"]      if spy else None,
+            "sma200":     spy["sma200"]     if spy else None,
+        },
+        "sectors": [
+            {"sector": s["sector"], "win_rate": s["win_rate"],
+             "avg_return": s["avg_return"], "priority": s["priority"]}
+            for s in sectors
+        ],
+        "priority_sectors":    priority,
+        "acceptable_sectors":  acceptable,
+        "avoid_sectors":       avoid,
+        "recommended_tickers": recommended,
+    }
 
-    # ── VIX ──────────────────────────────────────────────────────────────────
-    print(f"\n  VIX")
-    print(f"  {'─' * 42}")
+    with open(JSON_PATH, "w") as f:
+        json.dump(data, f, indent=2)
 
-    vix = get_vix()
-    if vix:
-        icon = "✅" if vix["score"] > 0 else "⚠️ " if vix["score"] == 0 else "❌"
-        print(f"  {icon} Level:  {vix['current']:.1f} — {vix['level']}")
-        print(f"     Trend:  {vix['trend']}  (5d avg: {vix['avg_5d']:.1f}  |  10d avg: {vix['avg_10d']:.1f})")
-    else:
-        print("  ⚠️  Could not retrieve VIX data")
+    return data
 
-    # ── SPY ───────────────────────────────────────────────────────────────────
-    print(f"\n  SPY")
-    print(f"  {'─' * 42}")
 
-    spy = get_spy_context()
-    if spy:
-        icon = "✅" if spy["score"] > 0 else "⚠️ " if spy["score"] == 0 else "❌"
-        sma200_str = f"${spy['sma200']:.2f}" if spy["sma200"] else "N/A"
-        print(f"  {icon} Price:    ${spy['price']:.2f}")
-        print(f"     Trend:    {spy['trend']}")
-        print(f"     SMAs:     {spy['sma_status']}")
-        print(f"     SMA50:    ${spy['sma50']:.2f} ({spy['sma50_dir']})  |  SMA200: {sma200_str}")
-    else:
-        print("  ⚠️  Could not retrieve SPY data")
+# ══════════════════════════════════════════════════════════════════════════════
+# HTML REPORT
+# ══════════════════════════════════════════════════════════════════════════════
 
-    # ── SECTORS ──────────────────────────────────────────────────────────────
-    print(f"\n  SECTORS  (historical win rate from backtest DB)")
-    print(f"  {'─' * 42}")
-    print(f"  {'SECTOR':<35} {'WIN RATE':>9}  {'AVG RET':>8}  PRIORITY")
-    print(f"  {'─' * 42}")
+def generate_html(data):
+    verdict     = data["verdict"]
+    vix         = data["vix"]
+    spy         = data["spy"]
+    sectors     = data["sectors"]
+    recommended = data["recommended_tickers"]
+    timestamp   = data["timestamp"]
 
-    sectors = get_sector_win_rates()
+    v_color = "#22c55e" if verdict == "FAVORABLE" else \
+              "#f59e0b" if verdict == "CAUTION"   else "#ef4444"
+    v_emoji = "🟢" if verdict == "FAVORABLE" else \
+              "🟡" if verdict == "CAUTION"   else "🔴"
+    v_bg    = "#052e16" if verdict == "FAVORABLE" else \
+              "#451a03" if verdict == "CAUTION"   else "#450a0a"
 
-    if sectors:
-        for s in sectors:
-            icon = "✅" if s["priority"] == "PRIORITY" else \
-                   "⚠️ " if s["priority"] == "ACCEPTABLE" else "❌"
-            print(f"  {icon} {s['sector']:<33} {s['win_rate']:>8.1f}%  {s['avg_return']:>+7.2f}%  {s['priority']}")
-    else:
-        print("  No sector data found in DB.")
+    vix_color = "#22c55e" if vix["level"] == "CALM"     else \
+                "#f59e0b" if vix["level"] == "ELEVATED" else "#ef4444"
+    vix_arrow = "↓" if vix["trend"] == "FALLING" else \
+                "↑" if vix["trend"] == "RISING"  else "→"
 
-    # ── VERDICT ───────────────────────────────────────────────────────────────
-    verdict, detail = get_verdict(vix, spy)
+    spy_color = "#22c55e" if spy["trend"] == "BULLISH" else \
+                "#ef4444" if spy["trend"] == "BEARISH" else "#f59e0b"
+    spy_pct   = f"{spy['pct_25d']:+.1f}%" if spy["pct_25d"] else "N/A"
+    sma200_str = f"${spy['sma200']:.0f}" if spy["sma200"] else "N/A"
 
-    print(f"\n{'═' * 62}")
-    print(f"  VERDICT:  {verdict}")
-    print(f"  {detail}")
+    # Sector rows
+    sector_rows = ""
+    for s in sectors:
+        c    = "#22c55e" if s["priority"] == "PRIORITY"   else \
+               "#f59e0b" if s["priority"] == "ACCEPTABLE" else "#6b7280"
+        icon = "✅" if s["priority"] == "PRIORITY"   else \
+               "⚠️" if s["priority"] == "ACCEPTABLE" else "❌"
+        bar  = min(100, int(s["win_rate"]))
+        sector_rows += f"""
+            <tr style="border-bottom:1px solid #1a1a1a;">
+                <td style="padding:10px 16px;color:#f9fafb;font-size:13px;">
+                    {icon}&nbsp;&nbsp;{s['sector']}
+                </td>
+                <td style="padding:10px 16px;">
+                    <div style="display:flex;align-items:center;gap:8px;">
+                        <div style="background:#1e1e1e;border-radius:4px;
+                                    height:6px;width:80px;flex-shrink:0;">
+                            <div style="background:{c};width:{bar}%;
+                                        height:6px;border-radius:4px;"></div>
+                        </div>
+                        <span style="color:{c};font-weight:700;font-size:13px;">
+                            {s['win_rate']:.1f}%
+                        </span>
+                    </div>
+                </td>
+                <td style="padding:10px 16px;color:#9ca3af;font-size:13px;">
+                    {s['avg_return']:+.2f}%
+                </td>
+                <td style="padding:10px 16px;">
+                    <span style="background:{c}22;color:{c};border-radius:4px;
+                                 padding:2px 8px;font-size:11px;font-weight:700;">
+                        {s['priority']}
+                    </span>
+                </td>
+            </tr>"""
 
-    if "DO NOT TRADE" not in verdict:
-        recommended = get_recommended_tickers()
+    # Ticker chips
+    chips = "".join(f"""
+        <span style="background:#1e2d1e;border:1px solid #22c55e44;color:#22c55e;
+                     border-radius:6px;padding:4px 10px;font-size:12px;
+                     font-weight:700;font-family:monospace;">{t}</span>"""
+        for t in recommended) or '<span style="color:#6b7280;">No tickers available</span>'
 
-        if recommended:
-            print(f"\n  Recommended tickers for scanner ({len(recommended)} total):")
-            for i in range(0, len(recommended), 8):
-                chunk = recommended[i:i + 8]
-                print(f"    {' '.join(chunk)}")
-            print(f"\n  Run scanner with:")
-            print(f"    python scanner.py --context")
-            print(f"    python scanner.py --tickers {' '.join(recommended)}")
-        else:
-            print(f"\n  ⚠️  Could not build ticker list from DB — run scanner manually")
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1.0">
+    <title>Market Context — {timestamp}</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;700;900&display=swap" rel="stylesheet">
+    <style>
+        *{{box-sizing:border-box;margin:0;padding:0}}
+        body{{background:#0a0a0a;color:#f9fafb;font-family:'DM Sans',sans-serif;
+              min-height:100vh;padding:32px 24px}}
+        .wrap{{max-width:960px;margin:0 auto}}
+        .card{{background:#111;border:1px solid #1e1e1e;border-radius:12px;
+               padding:24px;margin-bottom:20px}}
+        .label{{font-size:10px;font-weight:700;letter-spacing:3px;color:#6b7280;
+                text-transform:uppercase;margin-bottom:14px;padding-bottom:10px;
+                border-bottom:1px solid #1e1e1e}}
+        .big{{font-size:40px;font-weight:900;letter-spacing:-2px;line-height:1}}
+        table{{width:100%;border-collapse:collapse}}
+        th{{padding:8px 16px;text-align:left;color:#6b7280;font-size:10px;
+            letter-spacing:2px;border-bottom:1px solid #1e1e1e}}
+    </style>
+</head>
+<body>
+<div class="wrap">
 
-    print(f"\n{'═' * 62}\n")
+    <!-- Header -->
+    <div style="display:flex;justify-content:space-between;align-items:center;
+                margin-bottom:28px;padding-bottom:20px;border-bottom:1px solid #1e1e1e;
+                flex-wrap:wrap;gap:16px;">
+        <div>
+            <div style="font-size:11px;color:#6b7280;letter-spacing:3px;
+                        text-transform:uppercase;margin-bottom:6px;">
+                Options Trading System
+            </div>
+            <h1 style="font-size:32px;font-weight:900;letter-spacing:-1.5px;">
+                Market Context
+            </h1>
+            <p style="color:#4b5563;font-size:13px;margin-top:4px;
+                      font-family:'DM Mono',monospace;">
+                {timestamp}
+            </p>
+        </div>
+        <div style="background:{v_bg};border:2px solid {v_color};
+                    border-radius:12px;padding:16px 28px;text-align:center;
+                    min-width:180px;">
+            <div style="font-size:28px;margin-bottom:4px;">{v_emoji}</div>
+            <div style="color:{v_color};font-weight:900;font-size:16px;
+                        letter-spacing:2px;">{verdict}</div>
+            <div style="color:{v_color}88;font-size:11px;margin-top:4px;
+                        max-width:160px;line-height:1.4;">
+                {data['verdict_detail']}
+            </div>
+        </div>
+    </div>
+
+    <!-- VIX + SPY -->
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-bottom:20px;">
+
+        <div class="card" style="border-color:{vix_color}44;">
+            <div class="label">VIX — Volatility Index</div>
+            <div style="display:flex;align-items:flex-end;gap:16px;margin-bottom:16px;">
+                <div class="big" style="color:{vix_color};">{vix['current']:.1f}</div>
+                <div style="margin-bottom:4px;">
+                    <div style="color:{vix_color};font-weight:700;font-size:15px;">
+                        {vix['level']} {vix_arrow}
+                    </div>
+                    <div style="color:#6b7280;font-size:12px;margin-top:2px;
+                                font-family:'DM Mono',monospace;">
+                        5d: {vix['avg_5d']:.1f} &nbsp;|&nbsp; 10d: {vix['avg_10d']:.1f}
+                    </div>
+                </div>
+            </div>
+            <div style="background:#1a1a1a;border-radius:8px;padding:10px 14px;
+                        display:flex;justify-content:space-between;font-size:11px;
+                        font-family:'DM Mono',monospace;">
+                <span style="color:#22c55e;">CALM &lt;{VIX_CALM}</span>
+                <span style="color:#f59e0b;">ELEVATED &lt;{VIX_ELEVATED}</span>
+                <span style="color:#ef4444;">EXTREME &gt;{VIX_FEAR}</span>
+            </div>
+        </div>
+
+        <div class="card" style="border-color:{spy_color}44;">
+            <div class="label">SPY — Market Trend</div>
+            <div style="display:flex;align-items:flex-end;gap:16px;margin-bottom:16px;">
+                <div class="big" style="color:{spy_color};">{spy_pct}</div>
+                <div style="margin-bottom:4px;">
+                    <div style="color:{spy_color};font-weight:700;font-size:15px;">
+                        {spy['trend']} (25d)
+                    </div>
+                    <div style="color:#6b7280;font-size:12px;margin-top:2px;
+                                font-family:'DM Mono',monospace;">
+                        ${spy['price']:.2f}
+                    </div>
+                </div>
+            </div>
+            <div style="background:#1a1a1a;border-radius:8px;padding:10px 14px;
+                        display:flex;justify-content:space-between;font-size:11px;
+                        font-family:'DM Mono',monospace;color:#9ca3af;">
+                <span>SMA50: ${spy['sma50']:.0f} ({spy['sma50_dir']})</span>
+                <span>SMA200: {sma200_str}</span>
+                <span style="color:#f9fafb;font-weight:700;">{spy['sma_status']}</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- Sectors -->
+    <div class="card" style="margin-bottom:20px;">
+        <div class="label">Sectors — Historical Win Rate (backtest DB)</div>
+        <table>
+            <thead>
+                <tr>
+                    <th>SECTOR</th>
+                    <th>WIN RATE</th>
+                    <th>AVG RETURN</th>
+                    <th>PRIORITY</th>
+                </tr>
+            </thead>
+            <tbody>{sector_rows}</tbody>
+        </table>
+    </div>
+
+    <!-- Recommended tickers -->
+    <div class="card">
+        <div class="label">
+            Recommended Tickers — {len(recommended)} from priority sectors
+        </div>
+        <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:20px;">
+            {chips}
+        </div>
+        <div style="background:#1a1a1a;border-radius:8px;padding:14px 16px;">
+            <div style="color:#4b5563;font-size:10px;letter-spacing:2px;
+                        text-transform:uppercase;margin-bottom:8px;">
+                Run scanner
+            </div>
+            <code style="color:#22c55e;font-size:13px;font-family:'DM Mono',monospace;">
+                python scanner.py --context
+            </code>
+        </div>
+    </div>
+
+    <div style="text-align:center;color:#374151;font-size:11px;
+                padding:24px 0;border-top:1px solid #1e1e1e;margin-top:8px;
+                font-family:'DM Mono',monospace;">
+        {timestamp} &nbsp;·&nbsp; Raw data only &nbsp;·&nbsp;
+        AI interpretation runs in scanner.py
+    </div>
+
+</div>
+</body>
+</html>"""
+
+    with open(REPORT_PATH, "w", encoding="utf-8") as f:
+        f.write(html)
+
+    return REPORT_PATH
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
 
+def run():
+    vix     = get_vix()
+    spy     = get_spy_context()
+    sectors = get_sector_win_rates()
+
+    verdict, detail = get_verdict(vix, spy)
+    recommended = get_recommended_tickers(sectors) if "DO_NOT_TRADE" not in verdict else []
+
+    data        = save_json(vix, spy, sectors, verdict, detail, recommended)
+    report_path = generate_html(data)
+
+    # Terminal summary
+    print(f"\n{'=' * 50}")
+    print(f"  MARKET CONTEXT — {data['timestamp']}")
+    print(f"{'=' * 50}")
+    print(f"  Verdict:  {verdict}")
+    if vix:
+        print(f"  VIX:      {vix['current']:.1f} ({vix['level']})")
+    if spy:
+        print(f"  SPY:      {spy['trend']} ({spy['pct_25d']:+.1f}% 25d)")
+    print(f"  Priority: {', '.join(data['priority_sectors']) or 'None'}")
+    print(f"  Tickers:  {len(recommended)} recommended")
+    print(f"  Report:   {report_path}")
+    print(f"  JSON:     {JSON_PATH}")
+    print(f"{'=' * 50}\n")
+
+    webbrowser.open(f"file:///{report_path.replace(os.sep, '/')}")
+
+    return data
+
+
 if __name__ == "__main__":
-    print_report()
+    run()

@@ -1,163 +1,77 @@
 """
 trade.py
 ========
-Position management script for Bull Call Spread analysis system.
+Registro de posiciones de opciones.
 
-Handles recording of paper and live trading positions.
+Usa los nombres exactos que muestra Thinkorswim para que
+no tengas que traducir nada.
 
-Modes:
-    --open   → Register a new position interactively
-    --close  → Close an existing open position
-    --list   → Display all open positions
+Comandos:
+    python trade.py --open    → registrar nueva posición
+    python trade.py --close   → cerrar posición existente
+    python trade.py --list    → ver posiciones abiertas
 
-Usage:
-    python trade.py --open
-    python trade.py --close
-    python trade.py --list
-
-Dependencies:
-    db.py   → PostgreSQL read/write
-    .env    → DATABASE_URL
+Al abrir, solo necesitas tener Thinkorswim abierto con la
+orden lista para ver los valores.
 """
 
 import argparse
 from datetime import datetime, date
-from decimal import Decimal
 
-from db import (
-    open_position,
-    close_position,
-    get_open_positions,
-    get_analysis_history
-)
+from db import open_position, close_position, get_open_positions
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # INPUT HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def ask(prompt, required=True, default=None, cast=str):
-    """
-    Prompt user for input with optional default and type casting.
-
-    Args:
-        prompt   (str)      — question to display
-        required (bool)     — if True, keeps asking until answer given
-        default  (any)      — value to use if user presses Enter
-        cast     (callable) — type to cast the input to
-
-    Returns:
-        cast value or default
-    """
-    display = prompt
+def ask(label, hint=None, default=None, cast=str, required=True):
+    """Prompt with optional hint and default."""
+    line = f"  {label}"
+    if hint:
+        line += f"\n    → {hint}"
     if default is not None:
-        display += f" [{default}]"
-    display += ": "
+        line += f" [{default}]"
+    line += ": "
 
     while True:
-        raw = input(display).strip()
+        raw = input(line).strip()
 
         if not raw:
             if default is not None:
                 return default
             if not required:
                 return None
-            print("  ⚠️  Este campo es requerido.")
+            print("    ⚠️  Requerido.\n")
             continue
 
         try:
             return cast(raw)
         except (ValueError, TypeError):
-            print(f"  ⚠️  Valor inválido. Se esperaba {cast.__name__}.")
+            print(f"    ⚠️  Valor inválido — se esperaba {cast.__name__}\n")
 
 
-def ask_date(prompt, required=True, default=None):
-    """
-    Prompt user for a date in YYYY-MM-DD format.
-    """
-    display = prompt
-    if default:
-        display += f" [{default}]"
-    display += " (YYYY-MM-DD): "
+def ask_date(label, hint=None):
+    """Prompt for a date in YYYY-MM-DD format."""
+    line = f"  {label}"
+    if hint:
+        line += f"\n    → {hint}"
+    line += " (YYYY-MM-DD): "
 
     while True:
-        raw = input(display).strip()
-
-        if not raw and default:
-            return default
-        if not raw and not required:
-            return None
-
+        raw = input(line).strip()
         try:
             return datetime.strptime(raw, "%Y-%m-%d").date()
         except ValueError:
-            print("  ⚠️  Formato inválido. Use YYYY-MM-DD (ej: 2026-06-05)")
+            print("    ⚠️  Formato inválido. Ejemplo: 2026-06-18\n")
 
 
-def ask_bool(prompt, default=True):
-    """
-    Prompt user for yes/no answer.
-    """
-    options = "S/n" if default else "s/N"
-    raw = input(f"{prompt} ({options}): ").strip().lower()
-
-    if not raw:
-        return default
-    return raw in ("s", "si", "sí", "yes", "y")
+def confirm(msg):
+    return input(f"\n  {msg} (s/n): ").strip().lower() in ("s", "si", "sí")
 
 
-def confirm(message):
-    """Ask for final confirmation before saving."""
-    raw = input(f"\n{message} (s/n): ").strip().lower()
-    return raw in ("s", "si", "sí", "yes", "y")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# DISPLAY HELPERS
-# ══════════════════════════════════════════════════════════════════════════════
-
-def print_positions_table(positions, title="POSICIONES ABIERTAS"):
-    """Print a formatted table of positions."""
-    if not positions:
-        print("\n  No hay posiciones abiertas.\n")
-        return
-
-    print(f"\n{'═' * 80}")
-    print(f"  {title}")
-    print(f"{'═' * 80}")
-    print(f"{'ID':<4} {'TICKER':<8} {'ESTRATEGIA':<20} {'STRIKES':<12} "
-          f"{'EXP':<12} {'COSTO':>8} {'ESTADO':<8} {'PAPER'}")
-    print(f"{'─' * 80}")
-
-    for p in positions:
-        strikes = f"{p['strike_low']}/{p['strike_high']}" if p['strike_low'] else "—"
-        exp = str(p['expiration']) if p['expiration'] else "—"
-        cost = f"${p['total_cost']:.2f}" if p['total_cost'] else "—"
-        paper = "📝 Sí" if p['is_paper'] else "💵 No"
-
-        print(f"{p['id']:<4} {p['ticker']:<8} {p['strategy']:<20} "
-              f"{strikes:<12} {exp:<12} {cost:>8} {p['status']:<8} {paper}")
-
-    print(f"{'═' * 80}\n")
-
-
-def print_position_detail(p):
-    """Print full detail of a single position."""
-    print(f"\n{'─' * 50}")
-    print(f"  ID: {p['id']} | {p['ticker']} | {p['strategy']}")
-    print(f"{'─' * 50}")
-    print(f"  Strikes:      {p['strike_low']} / {p['strike_high']}")
-    print(f"  Contratos:    {p['contracts']}")
-    print(f"  Expiración:   {p['expiration']}")
-    print(f"  Premium:      ${p['premium_paid']:.2f}/acción")
-    print(f"  Costo total:  ${p['total_cost']:.2f}")
-    print(f"  Comisión:     ${p['commission_open']:.2f}")
-    print(f"  Precio acción al abrir: ${p['price_at_open']:.2f}")
-    print(f"  Abierta:      {p['opened_at']}")
-    print(f"  Paper trade:  {'Sí' if p['is_paper'] else 'No'}")
-    if p['notes']:
-        print(f"  Notas:        {p['notes']}")
-    print(f"{'─' * 50}\n")
+def sep(char="─", width=52):
+    print(f"  {char * width}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -165,121 +79,166 @@ def print_position_detail(p):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def cmd_open():
-    """
-    Interactively collect position data and save to DB.
-    """
-    print(f"\n{'═' * 50}")
-    print("  REGISTRAR NUEVA POSICIÓN")
-    print(f"{'═' * 50}\n")
-
-    # ── Basic info ────────────────────────────────────────────────────────────
-    ticker    = ask("Ticker (ej: MSFT)", cast=str).upper()
-    strategy  = ask("Estrategia", default="BULL_CALL_SPREAD")
-    broker    = ask("Broker", default="Thinkorswim")
-    is_paper  = ask_bool("¿Es paper trade?", default=True)
-
+    print()
+    print("  ╔══════════════════════════════════════════════════╗")
+    print("  ║          REGISTRAR NUEVA POSICIÓN               ║")
+    print("  ╚══════════════════════════════════════════════════╝")
+    print()
+    print("  Ten Thinkorswim abierto con la orden lista.")
+    print("  Los campos usan los mismos nombres que ves en pantalla.")
     print()
 
-    # ── Spread structure ──────────────────────────────────────────────────────
-    strike_low  = ask("Strike comprado ($)", cast=float)
-    strike_high = ask("Strike vendido ($)", cast=float)
-    contracts   = ask("Número de contratos", default=1, cast=int)
-    expiration  = ask_date("Fecha de expiración", default=None)
+    # ── Ticker ───────────────────────────────────────────────────────────────
+    sep()
+    ticker = ask(
+        "Ticker",
+        hint="Ej: HAL, XOM, CAT"
+    ).upper()
 
+    # ── Tipo de operación ────────────────────────────────────────────────────
+    print()
+    print("  Estrategia:")
+    strategies = {
+        "1": "Bull Call Spread",
+        "2": "Bear Put Spread",
+        "3": "Long Call",
+        "4": "Long Put",
+        "5": "Cash Secured Put",
+        "6": "Covered Call",
+    }
+    for k, v in strategies.items():
+        print(f"    {k}. {v}")
+    strategy_key = ask("  Número", cast=str, default="1")
+    strategy = strategies.get(strategy_key, "Bull Call Spread")
+
+    # ── Paper o real ─────────────────────────────────────────────────────────
+    print()
+    is_paper_input = ask(
+        "¿Es paper trading?",
+        hint="paperMoney en Thinkorswim = s | dinero real = n",
+        default="s"
+    ).lower()
+    is_paper = is_paper_input in ("s", "si", "sí", "y", "yes")
+    broker = "Thinkorswim (paperMoney)" if is_paper else "Schwab / Thinkorswim"
+
+    # ── Datos de la orden (lo que ves en Thinkorswim) ────────────────────────
+    sep()
+    print()
+    print(f"  Datos de la orden en Thinkorswim")
+    print(f"  (lo que aparece en la barra inferior: BUY +N VERTICAL...)")
     print()
 
-    # ── Entry details ─────────────────────────────────────────────────────────
-    premium_paid    = ask("Premium pagado ($ por acción)", cast=float)
-    commission_open = ask("Comisión al abrir ($)", default=0.0, cast=float)
-    price_at_open   = ask("Precio de la acción al abrir ($)", cast=float)
+    contracts = ask(
+        "Contratos",
+        hint="El número que ves: 'Buy 2 Vertical' → escribe 2",
+        cast=int
+    )
+
+    strike_low = ask(
+        "Strike bajo (long strike)",
+        hint="El primer número del spread: '41/44' → escribe 41",
+        cast=float
+    )
+
+    strike_high = ask(
+        "Strike alto (short strike)",
+        hint="El segundo número del spread: '41/44' → escribe 44",
+        cast=float
+    )
+
+    expiration = ask_date(
+        "Fecha de vencimiento",
+        hint="'Jun 18 (30d)' → escribe 2026-06-18"
+    )
 
     print()
+    precio_spread = ask(
+        "Precio del spread pagado",
+        hint="El valor @X.XX en la orden: 'Buy 2 Vertical @1.13 LIMIT' → escribe 1.13\n"
+             "    Este es el COSTO TOTAL POR ACCIÓN del spread (ya descontado el sold)",
+        cast=float
+    )
 
-    # ── Score context — buscar en DB o ingresar manual ────────────────────────
-    print("  Buscando análisis reciente en DB...", end=" ")
-    recent = get_analysis_history(ticker=ticker, days=1)
+    price_at_open = ask(
+        "Precio de la acción ahora",
+        hint="El precio grande en la esquina superior: ej 42.98",
+        cast=float
+    )
 
-    score_at_open     = None
-    score_pct_at_open = None
-    verdict_at_open   = None
-
-    if recent:
-        latest = recent[0]
-        score_at_open     = latest["score"]
-        score_pct_at_open = float(latest["score_pct"])
-        verdict_at_open   = latest["verdict"]
-        print(f"✅ Encontrado: Score {score_at_open} ({score_pct_at_open}%) — {verdict_at_open}")
-    else:
-        print("No encontrado.")
-        use_manual = ask_bool("¿Ingresar score manualmente?", default=False)
-        if use_manual:
-            score_at_open     = ask("Score al abrir", cast=int, required=False)
-            score_pct_at_open = ask("Score % al abrir", cast=float, required=False)
-            verdict_at_open   = ask("Veredicto al abrir", required=False)
+    # ── Cálculos automáticos ─────────────────────────────────────────────────
+    total_cost  = round(precio_spread * contracts * 100, 2)
+    max_profit  = round((strike_high - strike_low - precio_spread) * contracts * 100, 2)
+    breakeven   = round(strike_low + precio_spread, 2)
+    max_loss    = total_cost
 
     print()
-
-    # ── Notes ─────────────────────────────────────────────────────────────────
-    notes = ask("Notas (opcional)", required=False)
-
-    # ── Calculate totals ──────────────────────────────────────────────────────
-    total_cost = premium_paid * contracts * 100
-    breakeven  = strike_low + premium_paid
-    max_profit = (strike_high - strike_low - premium_paid) * contracts * 100
-    max_loss   = total_cost + commission_open
-
-    # ── Summary before saving ─────────────────────────────────────────────────
-    print(f"\n{'─' * 50}")
+    sep("═")
     print(f"  RESUMEN DE LA POSICIÓN")
-    print(f"{'─' * 50}")
-    print(f"  Ticker:         {ticker}")
-    print(f"  Estrategia:     {strategy}")
-    print(f"  Strikes:        ${strike_low} / ${strike_high}")
-    print(f"  Contratos:      {contracts}")
-    print(f"  Expiración:     {expiration}")
-    print(f"  Premium:        ${premium_paid:.2f}/acción")
-    print(f"  Costo total:    ${total_cost:.2f}")
-    print(f"  Comisión:       ${commission_open:.2f}")
-    print(f"  Pérdida máx:    ${max_loss:.2f}")
-    print(f"  Breakeven:      ${breakeven:.2f}")
-    print(f"  Ganancia máx:   ${max_profit:.2f}")
-    print(f"  Paper trade:    {'Sí' if is_paper else 'No'}")
-    if score_at_open:
-        print(f"  Score entrada:  {score_at_open} ({score_pct_at_open}%) — {verdict_at_open}")
-    if notes:
-        print(f"  Notas:          {notes}")
-    print(f"{'─' * 50}")
+    sep("═")
+    print(f"  Ticker:          {ticker}")
+    print(f"  Estrategia:      {strategy}")
+    print(f"  Spread:          ${strike_low} / ${strike_high}")
+    print(f"  Contratos:       {contracts}")
+    print(f"  Vencimiento:     {expiration}")
+    print(f"  Precio acción:   ${price_at_open}")
+    print()
+    print(f"  ── Calculado automáticamente ──")
+    print(f"  Costo total:     ${total_cost:.2f}  ({contracts} contratos × {precio_spread} × 100)")
+    print(f"  Ganancia máx:    ${max_profit:.2f}  (si acción ≥ ${strike_high} al vencimiento)")
+    print(f"  Pérdida máx:     ${max_loss:.2f}  (si acción ≤ ${strike_low} al vencimiento)")
+    print(f"  Breakeven:       ${breakeven:.2f}  (precio mínimo para no perder)")
+    print()
 
-    if not confirm("¿Confirmar y guardar esta posición?"):
-        print("\n  ❌ Posición cancelada.\n")
+    # Targets
+    target_50 = round(total_cost + max_profit * 0.50, 2)
+    target_70 = round(total_cost + max_profit * 0.70, 2)
+    stop_loss = round(total_cost * 0.50, 2)
+    print(f"  ── Reglas de salida ──")
+    print(f"  Cerrar si el spread vale:  ${target_50:.2f} (50%) → ${target_70:.2f} (70%)")
+    print(f"  Stop loss si costo cae a:  ${stop_loss:.2f} (50% del costo)")
+    print(f"  Cerrar si DTE ≤ 7:         {(expiration - date.today()).days - 7} días desde hoy")
+    print()
+    sep("═")
+
+    notas = ask(
+        "Notas (opcional)",
+        hint="Ej: 'Entrada cerca de soporte, RSI 52, sector Energy PRIORITY'",
+        required=False
+    )
+
+    if not confirm("¿Confirmar registro de posición?"):
+        print("\n  ❌ Cancelado.\n")
         return
 
-    # ── Save to DB ────────────────────────────────────────────────────────────
+    # ── Guardar en DB ─────────────────────────────────────────────────────────
     position_data = {
-        "ticker":           ticker,
-        "strategy":         strategy,
-        "broker":           broker,
-        "is_paper":         is_paper,
-        "strike_low":       strike_low,
-        "strike_high":      strike_high,
-        "contracts":        contracts,
-        "expiration":       expiration,
-        "premium_paid":     premium_paid,
-        "total_cost":       total_cost,
-        "commission_open":  commission_open,
-        "opened_at":        datetime.now(),
-        "price_at_open":    price_at_open,
-        "score_at_open":    score_at_open,
-        "score_pct_at_open":score_pct_at_open,
-        "verdict_at_open":  verdict_at_open,
-        "notes":            notes,
-        "analysis_id":      recent[0]["id"] if recent else None,
+        "ticker":            ticker,
+        "strategy":          strategy,
+        "broker":            broker,
+        "is_paper":          is_paper,
+        "strike_low":        strike_low,
+        "strike_high":       strike_high,
+        "contracts":         contracts,
+        "expiration":        expiration,
+        "premium_paid":      precio_spread,
+        "total_cost":        total_cost,
+        "commission_open":   0.0,
+        "opened_at":         datetime.now(),
+        "price_at_open":     price_at_open,
+        "score_at_open":     None,
+        "score_pct_at_open": None,
+        "verdict_at_open":   None,
+        "notes":             notas or "",
+        "analysis_id":       None,
     }
 
     position_id = open_position(position_data)
 
-    print(f"\n  ✅ Posición guardada con ID: {position_id}")
-    print(f"  Recuerda cerrarla con: python trade.py --close\n")
+    print()
+    print(f"  ✅ Posición #{position_id} registrada.")
+    print(f"  El monitor en Railway la vigilará automáticamente.")
+    print(f"  Para ver el estado: python trade.py --list")
+    print()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -287,26 +246,35 @@ def cmd_open():
 # ══════════════════════════════════════════════════════════════════════════════
 
 def cmd_close():
-    """
-    Select an open position and record its closing details.
-    """
-    print(f"\n{'═' * 50}")
-    print("  CERRAR POSICIÓN")
-    print(f"{'═' * 50}")
+    print()
+    print("  ╔══════════════════════════════════════════════════╗")
+    print("  ║             CERRAR POSICIÓN                     ║")
+    print("  ╚══════════════════════════════════════════════════╝")
+    print()
 
-    # ── Show open positions ───────────────────────────────────────────────────
     positions = get_open_positions()
 
     if not positions:
-        print("\n  No hay posiciones abiertas para cerrar.\n")
+        print("  No hay posiciones abiertas.\n")
         return
 
-    print_positions_table(positions)
+    # Mostrar tabla simple
+    sep("═")
+    print(f"  {'ID':<4} {'TICKER':<6} {'SPREAD':<10} {'EXP':<12} {'COSTO':>8} {'PAPER'}")
+    sep()
+    for p in positions:
+        spread = f"{p['strike_low']}/{p['strike_high']}"
+        exp    = str(p['expiration'])
+        cost   = f"${float(p['total_cost'] or 0):.2f}"
+        paper  = "📝" if p['is_paper'] else "💵"
+        print(f"  {p['id']:<4} {p['ticker']:<6} {spread:<10} {exp:<12} {cost:>8} {paper}")
+    sep("═")
+    print()
 
-    # ── Select position ───────────────────────────────────────────────────────
     valid_ids = [p["id"] for p in positions]
     position_id = ask(
-        f"ID de la posición a cerrar {valid_ids}",
+        f"ID de la posición a cerrar",
+        hint=f"Opciones disponibles: {valid_ids}",
         cast=int
     )
 
@@ -314,69 +282,88 @@ def cmd_close():
         print(f"\n  ❌ ID {position_id} no válido.\n")
         return
 
-    # Show selected position detail
     selected = next(p for p in positions if p["id"] == position_id)
-    print_position_detail(selected)
+    contracts  = selected["contracts"]
+    total_cost = float(selected["total_cost"] or 0)
 
-    # ── Closing details ───────────────────────────────────────────────────────
-    print("  Datos de cierre:\n")
+    print()
+    print(f"  Cerrando: {selected['ticker']} "
+          f"${selected['strike_low']}/{selected['strike_high']} "
+          f"exp {selected['expiration']}")
+    print(f"  Costo original: ${total_cost:.2f}")
+    print()
+    print("  En Thinkorswim, cuando ejecutas el cierre verás:")
+    print("  'Sell 2 Vertical @X.XX' — ese X.XX es lo que recibes")
+    print()
 
-    premium_received  = ask("Premium recibido al cerrar ($ por acción)", cast=float)
-    commission_close  = ask("Comisión al cerrar ($)", default=0.0, cast=float)
-    price_at_close    = ask("Precio de la acción al cerrar ($)", cast=float)
+    precio_cierre = ask(
+        "Precio del spread al cerrar",
+        hint="El valor @X.XX de la orden de cierre en Thinkorswim",
+        cast=float
+    )
 
-    close_reason_options = [
-        "TARGET_REACHED",
-        "STOP_LOSS",
-        "EXPIRY",
-        "MANUAL"
-    ]
-    print(f"\n  Razones de cierre: {', '.join(close_reason_options)}")
-    close_reason = ask("Razón de cierre", default="MANUAL").upper()
+    price_at_close = ask(
+        "Precio de la acción al cerrar",
+        hint="El precio de la acción en ese momento",
+        cast=float
+    )
 
-    notes = ask("Notas (opcional)", required=False)
+    print()
+    print("  Razón de cierre:")
+    reasons = {
+        "1": "TARGET_REACHED",
+        "2": "STOP_LOSS",
+        "3": "MANUAL",
+        "4": "EXPIRY",
+    }
+    print("    1. TARGET_REACHED — alcanzaste el 50-70% de ganancia máxima")
+    print("    2. STOP_LOSS — perdiste el 50% del costo")
+    print("    3. MANUAL — decidiste cerrar por otra razón")
+    print("    4. EXPIRY — expiró")
+    reason_key = ask("  Número", default="1")
+    close_reason = reasons.get(reason_key, "MANUAL")
 
-    # ── Calculate P&L preview ─────────────────────────────────────────────────
-    contracts        = selected["contracts"]
-    total_received   = premium_received * contracts * 100
-    total_cost       = float(selected["total_cost"] or 0)
-    commission_open  = float(selected["commission_open"] or 0)
-    total_commission = commission_open + commission_close
-    gross_pnl        = total_received - total_cost
-    net_pnl          = gross_pnl - total_commission
-    pnl_pct          = (net_pnl / total_cost * 100) if total_cost != 0 else 0
+    notas = ask("Notas (opcional)", required=False)
 
-    print(f"\n{'─' * 50}")
+    # ── Calcular P&L ──────────────────────────────────────────────────────────
+    total_received = round(precio_cierre * contracts * 100, 2)
+    gross_pnl      = round(total_received - total_cost, 2)
+    pnl_pct        = round(gross_pnl / total_cost * 100, 1) if total_cost else 0
+    max_profit     = (selected["strike_high"] - selected["strike_low"]) * contracts * 100 - total_cost
+    pct_of_max     = round(gross_pnl / max_profit * 100, 1) if max_profit else 0
+
+    result_icon = "✅" if gross_pnl >= 0 else "❌"
+    print()
+    sep("═")
     print(f"  RESULTADO")
-    print(f"{'─' * 50}")
-    print(f"  Costo total:       ${total_cost:.2f}")
-    print(f"  Recibido:          ${total_received:.2f}")
-    print(f"  Ganancia bruta:    ${gross_pnl:.2f}")
-    print(f"  Comisiones totales:${total_commission:.2f}")
-    print(f"  Ganancia neta:     ${net_pnl:.2f} ({pnl_pct:.1f}%)")
-    print(f"  Razón de cierre:   {close_reason}")
-    result_icon = "✅" if net_pnl >= 0 else "❌"
-    print(f"  {result_icon} {'GANANCIA' if net_pnl >= 0 else 'PÉRDIDA'}")
-    print(f"{'─' * 50}")
+    sep("═")
+    print(f"  Costo original:   ${total_cost:.2f}")
+    print(f"  Recibido:         ${total_received:.2f}")
+    print(f"  Ganancia/Pérdida: {result_icon} ${gross_pnl:+.2f} ({pnl_pct:+.1f}%)")
+    print(f"  % del máximo:     {pct_of_max:.1f}%")
+    print(f"  Razón:            {close_reason}")
+    sep("═")
+    print()
 
-    if not confirm("¿Confirmar cierre de posición?"):
-        print("\n  ❌ Cierre cancelado.\n")
+    if not confirm("¿Confirmar cierre?"):
+        print("\n  ❌ Cancelado.\n")
         return
 
-    # ── Save to DB ────────────────────────────────────────────────────────────
     close_data = {
-        "premium_received":  premium_received,
-        "commission_close":  commission_close,
-        "closed_at":         datetime.now(),
-        "price_at_close":    price_at_close,
-        "close_reason":      close_reason,
-        "notes":             notes or "",
+        "premium_received": precio_cierre,
+        "commission_close": 0.0,
+        "closed_at":        datetime.now(),
+        "price_at_close":   price_at_close,
+        "close_reason":     close_reason,
+        "notes":            notas or "",
     }
 
     updated = close_position(position_id, close_data)
 
-    print(f"\n  ✅ Posición #{position_id} cerrada.")
-    print(f"  Ganancia neta: ${updated['net_pnl']:.2f} ({updated['pnl_pct']:.1f}%)\n")
+    print()
+    print(f"  ✅ Posición #{position_id} cerrada.")
+    print(f"  Resultado: ${updated['net_pnl']:.2f} ({updated['pnl_pct']:.1f}%)")
+    print()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -384,13 +371,39 @@ def cmd_close():
 # ══════════════════════════════════════════════════════════════════════════════
 
 def cmd_list():
-    """Display all open positions."""
+    print()
     positions = get_open_positions()
-    print_positions_table(positions, title="POSICIONES ABIERTAS")
 
-    if positions:
-        total_cost = sum(float(p["total_cost"] or 0) for p in positions)
-        print(f"  Total invertido: ${total_cost:.2f}\n")
+    if not positions:
+        print("  No hay posiciones abiertas.\n")
+        return
+
+    sep("═")
+    print(f"  POSICIONES ABIERTAS ({len(positions)})")
+    sep("═")
+
+    for p in positions:
+        spread     = f"${p['strike_low']}/{p['strike_high']}"
+        exp        = str(p['expiration'])
+        cost       = float(p['total_cost'] or 0)
+        dte        = (p['expiration'] - date.today()).days if p['expiration'] else "?"
+        paper_icon = "📝 paper" if p['is_paper'] else "💵 real"
+
+        max_profit = (float(p['strike_high']) - float(p['strike_low'])) * p['contracts'] * 100 - cost
+        target_50  = round(cost + max_profit * 0.50, 2)
+        target_70  = round(cost + max_profit * 0.70, 2)
+        stop_loss  = round(cost * 0.50, 2)
+
+        print(f"  #{p['id']} {p['ticker']} {spread} | {p['strategy']}")
+        print(f"     Vence: {exp} ({dte} días) | Costo: ${cost:.2f} | {paper_icon}")
+        print(f"     Cerrar si spread vale: ${target_50:.2f}-${target_70:.2f}")
+        print(f"     Stop loss si spread vale menos de: ${stop_loss:.2f}")
+        if p.get("notes"):
+            print(f"     Notas: {p['notes']}")
+        sep()
+
+    total = sum(float(p['total_cost'] or 0) for p in positions)
+    print(f"  Total invertido: ${total:.2f}\n")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -398,15 +411,11 @@ def cmd_list():
 # ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Gestión de posiciones Bull Call Spread"
-    )
-
-    group = parser.add_mutually_exclusive_group(required=True)
+    parser = argparse.ArgumentParser(description="Registro de posiciones de opciones")
+    group  = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--open",  action="store_true", help="Registrar nueva posición")
     group.add_argument("--close", action="store_true", help="Cerrar posición existente")
     group.add_argument("--list",  action="store_true", help="Ver posiciones abiertas")
-
     args = parser.parse_args()
 
     if args.open:
