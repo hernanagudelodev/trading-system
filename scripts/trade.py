@@ -329,7 +329,7 @@ def cmd_close():
     total_received = round(precio_cierre * contracts * 100, 2)
     gross_pnl      = round(total_received - total_cost, 2)
     pnl_pct        = round(gross_pnl / total_cost * 100, 1) if total_cost else 0
-    max_profit     = (selected["strike_high"] - selected["strike_low"]) * contracts * 100 - total_cost
+    max_profit = (float(selected["strike_high"]) - float(selected["strike_low"])) * contracts * 100 - total_cost
     pct_of_max     = round(gross_pnl / max_profit * 100, 1) if max_profit else 0
 
     result_icon = "✅" if gross_pnl >= 0 else "❌"

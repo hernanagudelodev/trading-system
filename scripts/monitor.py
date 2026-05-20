@@ -68,6 +68,13 @@ INTERVAL_MARKET_CLOSED  = 30  # minutes — outside market hours
 NTFY_TOPIC    = os.getenv("NTFY_TOPIC", "")
 NTFY_BASE_URL = "https://ntfy.sh"
 
+# Heartbeat — ntfy status every 60 min during market hours
+HEARTBEAT_INTERVAL_MIN = 60
+
+# Internal state (module-level, persists across scheduled_run calls)
+_last_heartbeat_time = None
+_market_close_sent   = False
+
 # Report path
 REPORT_PATH = os.path.join(os.path.dirname(__file__), "monitor_report.html")
 
@@ -555,6 +562,104 @@ def run_monitor(ask_ai=False):
     print(f"{'═' * 60}")
     print(f"✅ Monitor completado — {timestamp}\n")
 
+    # Heartbeat — hourly status during market hours
+    if should_send_heartbeat():
+        send_heartbeat(positions_data, timestamp)
+
+    # Market close summary — once per day when market closes
+    global _market_close_sent
+    if get_market_status() == "closed" and not _market_close_sent:
+        send_market_close_summary(positions_data, timestamp)
+    elif get_market_status() == "open":
+        _market_close_sent = False  # reset flag for next trading day
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HEARTBEAT & MARKET CLOSE NOTIFICATIONS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def should_send_heartbeat():
+    """Return True if it's time to send an hourly status notification."""
+    global _last_heartbeat_time
+    if not is_market_open():
+        return False
+    now = datetime.now()
+    if _last_heartbeat_time is None:
+        return True
+    elapsed = (now - _last_heartbeat_time).total_seconds() / 60
+    return elapsed >= HEARTBEAT_INTERVAL_MIN
+
+
+def send_heartbeat(positions_data, timestamp):
+    """Send hourly status notification — all clear or summary of positions."""
+    global _last_heartbeat_time
+    _last_heartbeat_time = datetime.now()
+
+    if not positions_data:
+        send_ntfy(
+            title="📊 Monitor OK — Sin posiciones",
+            message=f"Todo en orden. Sin posiciones abiertas.\n{timestamp}",
+            priority="low",
+            tags=["white_check_mark"],
+        )
+        return
+
+    lines = []
+    for pd in positions_data:
+        pos   = pd["position"]
+        pnl   = pd["pnl_data"]
+        level = pd["alert_level"]
+        icon  = level_icon(level)
+        pct   = pnl["profit_pct_of_max"] * 100
+        lines.append(
+            f"{icon} {pos['ticker']} | P&L: ${pnl['gross_pnl']:+.0f} "
+            f"({pct:.0f}% máx) | {pnl['dte']}d"
+        )
+
+    send_ntfy(
+        title=f"📊 Monitor OK — {len(positions_data)} posición(es)",
+        message="\n".join(lines) + f"\n{timestamp}",
+        priority="low",
+        tags=["white_check_mark", "chart_increasing"],
+    )
+
+
+def send_market_close_summary(positions_data, timestamp):
+    """Send one notification when market closes with end-of-day summary."""
+    global _market_close_sent
+    if _market_close_sent:
+        return
+
+    _market_close_sent = True
+
+    if not positions_data:
+        send_ntfy(
+            title="🔔 Mercado cerrado — Sin posiciones",
+            message=f"Mercado cerrado. Sin posiciones abiertas.\n{timestamp}",
+            priority="low",
+            tags=["bell"],
+        )
+        return
+
+    lines = []
+    for pd in positions_data:
+        pos   = pd["position"]
+        pnl   = pd["pnl_data"]
+        level = pd["alert_level"]
+        icon  = level_icon(level)
+        pct   = pnl["profit_pct_of_max"] * 100
+        lines.append(
+            f"{icon} {pos['ticker']} ${pnl['gross_pnl']:+.0f} "
+            f"({pct:.0f}% máx) | {pnl['dte']}d al venc."
+        )
+
+    send_ntfy(
+        title=f"🔔 Cierre de mercado — {len(positions_data)} posición(es)",
+        message="\n".join(lines) + f"\n{timestamp}",
+        priority="default",
+        tags=["bell", "chart_increasing"],
+    )
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SCHEDULED RUN (Railway)
