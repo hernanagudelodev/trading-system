@@ -8,6 +8,10 @@ Uses adaptive frequency:
     - Pre-market (8:30-9:30 ET):    every 10 minutes
     - Market closed:                every 30 minutes
 
+Heartbeat (inside monitor.py):
+    - Every 60 min during market hours → ntfy status notification
+    - At market close → one summary notification
+
 Never exits — Railway keeps this worker alive indefinitely.
 
 Start command in Railway:
@@ -16,7 +20,7 @@ Start command in Railway:
 Environment variables required:
     DATABASE_URL
     ANTHROPIC_API_KEY
-    NTFY_TOPIC          ← set this for push notifications
+    NTFY_TOPIC
 """
 
 import sys
@@ -33,8 +37,10 @@ from monitor import (
     INTERVAL_MARKET_OPEN,
     INTERVAL_PRE_MARKET,
     INTERVAL_MARKET_CLOSED,
-    MARKET_OPEN_HOUR, MARKET_OPEN_MIN,
-    MARKET_CLOSE_HOUR, MARKET_CLOSE_MIN,
+    MARKET_OPEN_HOUR,
+    MARKET_OPEN_MIN,
+    MARKET_CLOSE_HOUR,
+    MARKET_CLOSE_MIN,
 )
 
 print(f"\n{'═' * 55}")
@@ -45,15 +51,15 @@ print(f"  Pre-market:    every {INTERVAL_PRE_MARKET}min")
 print(f"  Market closed: every {INTERVAL_MARKET_CLOSED}min")
 print(f"  Hours: {MARKET_OPEN_HOUR}:{MARKET_OPEN_MIN:02d} - "
       f"{MARKET_CLOSE_HOUR}:{MARKET_CLOSE_MIN:02d} ET")
+print(f"  Heartbeat: every 60min during market hours (ntfy)")
 print(f"{'═' * 55}\n")
 
 # Run immediately on start
 scheduled_run()
 
-# Set initial schedule
+# Set initial schedule based on current market status
 current_interval = get_interval()
 schedule.every(current_interval).minutes.do(scheduled_run)
-
 print(f"  ⏱  Initial interval: {current_interval}min\n")
 
 # Keep alive — check every minute if interval needs updating
