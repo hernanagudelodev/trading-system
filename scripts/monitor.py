@@ -773,16 +773,17 @@ def send_heartbeat(positions_data, timestamp):
     global _last_heartbeat_time
     _last_heartbeat_time = datetime.now()
 
-    if not positions_data:
-        send_ntfy(
-            title="Monitor OK - Sin posiciones",
-            message=f"Todo en orden. Sin posiciones abiertas.\n{timestamp}",
-            priority="low",
-        )
-        return
+    # Solo notificar si hay posiciones que requieren atencion
+    positions_with_alerts = [
+        pd for pd in positions_data
+        if pd["alert_level"] in ("WATCH", "ACTION", "URGENT")
+    ]
+
+    if not positions_with_alerts:
+        return  # Todo OK — silencio total
 
     lines = []
-    for pd in positions_data:
+    for pd in positions_with_alerts:
         pos   = pd["position"]
         pnl   = pd["pnl_data"]
         level = pd["alert_level"]
@@ -795,9 +796,9 @@ def send_heartbeat(positions_data, timestamp):
         )
 
     send_ntfy(
-        title=f"Monitor OK — {len(positions_data)} posicion(es)",
+        title=f"Monitor — {len(positions_with_alerts)} posicion(es) requieren atencion",
         message="\n".join(lines) + f"\n{timestamp}",
-        priority="low",
+        priority="default",
     )
 
 
