@@ -1,18 +1,22 @@
 """
 monitor.py
 ==========
-Position monitoring script for Bull Call Spread analysis system.
+Position monitoring script — multi-strategy support.
 
-Improvements vs previous version:
-    - ntfy.sh push notifications (replaces broken email)
-    - Adaptive frequency: 5min during market, 30min outside
-    - Generates monitor_report.html for mobile viewing
+Strategies supported:
+    Bull Call Spread    → spread width P&L
+    Bear Put Spread     → spread width P&L
+    Long Call           → delta-based P&L with yfinance live delta
+    Long Put            → delta-based P&L with yfinance live delta
+    Cash Secured Put    → premium decay P&L
+    Covered Call        → premium decay P&L
+    Long Straddle       → combined call+put P&L
 
 Alert levels:
-    🟢 NORMAL  → within expected ranges       → console + HTML
-    🟡 WATCH   → approaching targets          → console + HTML + ntfy
-    🟠 ACTION  → take profit reached          → console + HTML + ntfy
-    🔴 URGENT  → stop loss / max profit       → console + HTML + ntfy
+    NORMAL  → within expected ranges       → console + HTML
+    WATCH   → approaching targets          → console + HTML + ntfy
+    ACTION  → take profit reached          → console + HTML + ntfy
+    URGENT  → stop loss / max profit       → console + HTML + ntfy
 
 Usage:
     python monitor.py              → run once
@@ -30,6 +34,7 @@ import time
 import argparse
 import schedule
 import requests
+import yfinance as yf
 from datetime import datetime, date
 
 import anthropic
@@ -45,48 +50,41 @@ load_dotenv()
 # CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════════════
 
-TAKE_PROFIT_MIN_PCT  = 0.50
-TAKE_PROFIT_MAX_PCT  = 0.70
-STOP_LOSS_PCT        = 0.50
-STOP_LOSS_WATCH_PCT  = 0.25
-WATCH_PROFIT_PCT     = 0.30
-MIN_DTE              = 7
-WATCH_DTE            = 10
+TAKE_PROFIT_MIN_PCT  = 0.50   # 50% of max profit → ACTION
+TAKE_PROFIT_MAX_PCT  = 0.70   # 70% of max profit → URGENT
+STOP_LOSS_PCT        = 0.50   # 50% loss on premium paid → URGENT
+STOP_LOSS_WATCH_PCT  = 0.25   # 25% loss → WATCH
+WATCH_PROFIT_PCT     = 0.30   # 30% of max → WATCH
+MIN_DTE              = 7      # days → ACTION
+WATCH_DTE            = 10     # days → WATCH
 
 MARKET_OPEN_HOUR     = 9
 MARKET_OPEN_MIN      = 30
 MARKET_CLOSE_HOUR    = 16
 MARKET_CLOSE_MIN     = 0
 
-# Intervals
-INTERVAL_MARKET_OPEN    = 5   # minutes — during market hours
-INTERVAL_PRE_MARKET     = 10  # minutes — 9:00-9:30 ET
-INTERVAL_MARKET_CLOSED  = 30  # minutes — outside market hours
+INTERVAL_MARKET_OPEN    = 5
+INTERVAL_PRE_MARKET     = 10
+INTERVAL_MARKET_CLOSED  = 30
 
-# ntfy.sh configuration — set NTFY_TOPIC in .env
-# Example: NTFY_TOPIC=mi-monitor-secreto-hal123
 NTFY_TOPIC    = os.getenv("NTFY_TOPIC", "")
 NTFY_BASE_URL = "https://ntfy.sh"
 
-# Heartbeat — ntfy status every 60 min during market hours
 HEARTBEAT_INTERVAL_MIN = 60
 
-# Internal state (module-level, persists across scheduled_run calls)
 _last_heartbeat_time = None
 _market_close_sent   = False
 
-# Report path
 REPORT_PATH = os.path.join(os.path.dirname(__file__), "monitor_report.html")
 
-# AI config
-AI_MODEL      = "claude-opus-4-5"
+AI_MODEL      = "claude-sonnet-4-20250514"
 AI_MAX_TOKENS = 1000
 
-TRADING_CONTEXT = {
-    "strategy": "Bull Call Spread",
-    "capital":  15000,
-    "language": "Spanish",
-}
+# Strategy type classification
+DEBIT_SPREADS   = {"Bull Call Spread", "Bear Put Spread"}
+LONG_OPTIONS    = {"Long Call", "Long Put"}
+CREDIT_OPTIONS  = {"Cash Secured Put", "Covered Call"}
+STRADDLES       = {"Long Straddle"}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -94,155 +92,343 @@ TRADING_CONTEXT = {
 # ══════════════════════════════════════════════════════════════════════════════
 
 def get_market_status():
-    """
-    Returns: "open" | "pre" | "closed"
-    Uses ET timezone explicitly — works on Railway (UTC).
-    """
-    from datetime import timezone, timedelta
-    et_offset = timedelta(hours=-4)  # EDT (summer), use -5 for EST
-    et_now    = datetime.now(timezone.utc) + et_offset
+    """Returns: 'open' | 'pre' | 'closed'. Uses ET timezone."""
+    try:
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo("America/New_York"))
+    except ImportError:
+        import pytz
+        now = datetime.now(pytz.timezone("America/New_York"))
 
-    hour    = et_now.hour
-    minute  = et_now.minute
-    weekday = et_now.weekday()
-
-    if weekday >= 5:
+    if now.weekday() >= 5:
         return "closed"
 
-    market_open_mins  = MARKET_OPEN_HOUR  * 60 + MARKET_OPEN_MIN
-    market_close_mins = MARKET_CLOSE_HOUR * 60 + MARKET_CLOSE_MIN
-    current_mins      = hour * 60 + minute
-    pre_market_mins   = (MARKET_OPEN_HOUR - 1) * 60  # 1 hour before open
+    t = now.hour * 60 + now.minute
+    open_t  = MARKET_OPEN_HOUR  * 60 + MARKET_OPEN_MIN
+    close_t = MARKET_CLOSE_HOUR * 60 + MARKET_CLOSE_MIN
+    pre_t   = (MARKET_OPEN_HOUR - 1) * 60 + MARKET_OPEN_MIN
 
-    if current_mins >= market_open_mins and current_mins < market_close_mins:
+    if open_t <= t < close_t:
         return "open"
-    elif current_mins >= pre_market_mins and current_mins < market_open_mins:
+    elif pre_t <= t < open_t:
         return "pre"
     return "closed"
+
 
 def is_market_open():
     return get_market_status() == "open"
 
+
 def get_interval():
-    """Return appropriate polling interval based on market status."""
     status = get_market_status()
-    return {
-        "open":   INTERVAL_MARKET_OPEN,
-        "pre":    INTERVAL_PRE_MARKET,
-        "closed": INTERVAL_MARKET_CLOSED,
-    }.get(status, INTERVAL_MARKET_CLOSED)
+    if status == "open":
+        return INTERVAL_MARKET_OPEN
+    elif status == "pre":
+        return INTERVAL_PRE_MARKET
+    return INTERVAL_MARKET_CLOSED
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# NTFY NOTIFICATIONS
+# OPTION DELTA — live from yfinance
 # ══════════════════════════════════════════════════════════════════════════════
 
-def send_ntfy(title, message, priority="default", tags=None):
+def get_live_delta(ticker, strike, expiration, option_type="call"):
     """
-    Send push notification via ntfy.sh.
-    Free, no account needed — install ntfy app on Android/iOS.
+    Fetch live delta for a specific option from yfinance.
+    Returns delta as float, or fallback value if unavailable.
 
-    Priority: max | urgent | high | default | low | min
-    Tags: list of emoji names e.g. ["warning", "chart_increasing"]
+    Args:
+        ticker      (str)  — e.g. "OKE"
+        strike      (float)
+        expiration  (date) — position expiration date
+        option_type (str)  — "call" or "put"
+
+    Returns:
+        float — delta value (positive for calls, negative for puts)
     """
-    if not NTFY_TOPIC:
-        print("  ⚠️  NTFY_TOPIC no configurado — agrega NTFY_TOPIC al .env")
-        return False
-
-    headers = {
-        "Title":    title,
-        "Priority": priority,
-    }
-    if tags:
-        headers["Tags"] = ",".join(tags)
-
+    fallback = 0.45 if option_type == "call" else -0.45
     try:
-        resp = requests.post(
-            f"{NTFY_BASE_URL}/{NTFY_TOPIC}",
-            data=message.encode("utf-8"),
-            headers=headers,
-            timeout=10,
+        tk = yf.Ticker(ticker)
+        exp_str = expiration.strftime("%Y-%m-%d")
+
+        # Find closest available expiration
+        available = tk.options
+        if not available:
+            return fallback
+
+        # Pick closest expiration to our target
+        target = expiration
+        closest = min(
+            available,
+            key=lambda e: abs((datetime.strptime(e, "%Y-%m-%d").date() - target).days)
         )
-        if resp.status_code == 200:
-            print(f"  📲 Notificación enviada → ntfy/{NTFY_TOPIC}")
-            return True
+
+        chain = tk.option_chain(closest)
+        if option_type == "call":
+            df = chain.calls
         else:
-            print(f"  ⚠️  ntfy error: {resp.status_code}")
-            return False
-    except Exception as e:
-        print(f"  ⚠️  ntfy error: {e}")
-        return False
+            df = chain.puts
+
+        if df is None or df.empty:
+            return fallback
+
+        # Find closest strike
+        df = df.copy()
+        df["strike_diff"] = (df["strike"] - strike).abs()
+        row = df.sort_values("strike_diff").iloc[0]
+
+        delta = row.get("delta", None)
+        if delta is None or (hasattr(delta, "__class__") and delta != delta):
+            return fallback
+
+        return float(delta)
+
+    except Exception:
+        return fallback
 
 
-def send_alert_notification(position, pnl_data, alert_level, reasons):
-    """Send formatted ntfy notification for ACTION/URGENT/WATCH alerts."""
-    ticker = position["ticker"]
-    pnl    = pnl_data["gross_pnl"]
-    pct    = pnl_data["profit_pct_of_max"] * 100
-    dte    = pnl_data["dte"]
+def get_live_option_price(ticker, strike, expiration, option_type="call"):
+    """
+    Fetch live mid price for a specific option from yfinance.
+    Returns mid price as float, or None if unavailable.
+    """
+    try:
+        tk = yf.Ticker(ticker)
+        exp_str = expiration.strftime("%Y-%m-%d")
 
-    if alert_level == "URGENT":
-        title    = f"🔴 URGENTE — {ticker}"
-        priority = "urgent"
-        tags     = ["rotating_light", "chart_increasing"]
-    elif alert_level == "ACTION":
-        title    = f"🟠 ACCIÓN — {ticker}"
-        priority = "high"
-        tags     = ["warning", "moneybag"]
-    else:  # WATCH
-        title    = f"🟡 WATCH — {ticker}"
-        priority = "default"
-        tags     = ["eyes"]
+        available = tk.options
+        if not available:
+            return None
 
-    reason_text = "\n".join(f"• {r}" for r in reasons)
-    message = (
-        f"${ticker} | P&L: ${pnl:+.0f} ({pct:.0f}% del máx) | {dte}d\n"
-        f"{reason_text}"
-    )
+        closest = min(
+            available,
+            key=lambda e: abs((datetime.strptime(e, "%Y-%m-%d").date() - expiration).days)
+        )
 
-    send_ntfy(title, message, priority=priority, tags=tags)
+        chain = tk.option_chain(closest)
+        df = chain.calls if option_type == "call" else chain.puts
+
+        if df is None or df.empty:
+            return None
+
+        df = df.copy()
+        df["strike_diff"] = (df["strike"] - strike).abs()
+        row = df.sort_values("strike_diff").iloc[0]
+
+        bid = row.get("bid", 0) or 0
+        ask = row.get("ask", 0) or 0
+        if bid > 0 and ask > 0:
+            return (bid + ask) / 2
+        last = row.get("lastPrice", None)
+        return float(last) if last else None
+
+    except Exception:
+        return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# P&L CALCULATION
+# P&L CALCULATION — strategy-aware
 # ══════════════════════════════════════════════════════════════════════════════
 
 def calculate_current_pnl(position, current_price):
+    """
+    Calculate P&L for any supported strategy.
+
+    Strategy logic:
+        Bull Call Spread / Bear Put Spread
+            → spread value based on subyacente movement
+        Long Call / Long Put
+            → live option price from yfinance (fallback: delta approximation)
+        Cash Secured Put / Covered Call
+            → premium decay: profit = premium - current option value
+        Long Straddle
+            → combined call + put value
+
+    Returns dict with: current_price, current_value, gross_pnl, pnl_pct,
+                       profit_pct_of_max, max_profit, dte, spread_value,
+                       strategy_type, delta (for long options)
+    """
+    strategy    = position.get("strategy", "Bull Call Spread")
     strike_low  = float(position["strike_low"])
     strike_high = float(position["strike_high"])
     contracts   = int(position["contracts"])
     total_cost  = float(position.get("total_cost") or 0)
     expiration  = position["expiration"]
+    ticker      = position["ticker"]
+    price_at_open = float(position.get("price_at_open") or strike_low)
 
-    spread_width = strike_high - strike_low
-    premium_per_share = total_cost / (contracts * 100) if contracts > 0 else 0
-    max_profit = (spread_width - premium_per_share) * contracts * 100
-
-    if current_price >= strike_high:
-        spread_value = spread_width
-    elif current_price <= strike_low:
-        spread_value = 0
+    # Parse expiration
+    if isinstance(expiration, date):
+        exp_date = expiration
     else:
-        spread_value = current_price - strike_low
+        exp_date = datetime.strptime(str(expiration), "%Y-%m-%d").date()
 
-    current_value = spread_value * contracts * 100
-    gross_pnl     = current_value - total_cost
-    pnl_pct       = (gross_pnl / total_cost * 100) if total_cost > 0 else 0
-    profit_pct_of_max = (gross_pnl / max_profit) if max_profit > 0 else 0
+    dte = (exp_date - date.today()).days
 
-    exp_date = datetime.strptime(str(expiration), "%Y-%m-%d").date()
-    dte      = (exp_date - date.today()).days
+    # ── DEBIT SPREADS (Bull Call Spread, Bear Put Spread) ────────────────────
+    if strategy in DEBIT_SPREADS:
+        spread_width      = strike_high - strike_low
+        premium_per_share = total_cost / (contracts * 100) if contracts > 0 else 0
+        max_profit        = (spread_width - premium_per_share) * contracts * 100
 
-    return {
-        "current_price":      current_price,
-        "current_value":      current_value,
-        "gross_pnl":          gross_pnl,
-        "pnl_pct":            pnl_pct,
-        "profit_pct_of_max":  profit_pct_of_max,
-        "max_profit":         max_profit,
-        "dte":                dte,
-        "spread_value":       spread_value,
-    }
+        if strategy == "Bull Call Spread":
+            if current_price >= strike_high:
+                spread_value = spread_width
+            elif current_price <= strike_low:
+                spread_value = 0
+            else:
+                spread_value = current_price - strike_low
+        else:  # Bear Put Spread
+            if current_price <= strike_low:
+                spread_value = spread_width
+            elif current_price >= strike_high:
+                spread_value = 0
+            else:
+                spread_value = strike_high - current_price
+
+        current_value = spread_value * contracts * 100
+        gross_pnl     = current_value - total_cost
+        pnl_pct       = (gross_pnl / total_cost * 100) if total_cost > 0 else 0
+        profit_pct_of_max = (gross_pnl / max_profit) if max_profit > 0 else 0
+
+        return {
+            "current_price":      current_price,
+            "current_value":      current_value,
+            "gross_pnl":          gross_pnl,
+            "pnl_pct":            pnl_pct,
+            "profit_pct_of_max":  profit_pct_of_max,
+            "max_profit":         max_profit,
+            "dte":                dte,
+            "spread_value":       spread_value,
+            "strategy_type":      "debit_spread",
+            "delta":              None,
+        }
+
+    # ── LONG OPTIONS (Long Call, Long Put) ───────────────────────────────────
+    elif strategy in LONG_OPTIONS:
+        option_type = "call" if strategy == "Long Call" else "put"
+        premium_paid = total_cost / (contracts * 100) if contracts > 0 else 0
+
+        # Try to get live option price first
+        live_price = get_live_option_price(ticker, strike_low, exp_date, option_type)
+
+        if live_price is not None:
+            current_value = live_price * contracts * 100
+            delta = get_live_delta(ticker, strike_low, exp_date, option_type)
+        else:
+            # Fallback: delta approximation
+            delta = get_live_delta(ticker, strike_low, exp_date, option_type)
+            price_change  = current_price - price_at_open
+            estimated_val = max(0, premium_paid + (abs(delta) * price_change))
+            current_value = estimated_val * contracts * 100
+
+        # max_profit reference = 2x the premium paid (100% gain target)
+        max_profit = total_cost * 2
+        gross_pnl  = current_value - total_cost
+        pnl_pct    = (gross_pnl / total_cost * 100) if total_cost > 0 else 0
+        profit_pct_of_max = (gross_pnl / max_profit) if max_profit > 0 else 0
+
+        return {
+            "current_price":      current_price,
+            "current_value":      current_value,
+            "gross_pnl":          gross_pnl,
+            "pnl_pct":            pnl_pct,
+            "profit_pct_of_max":  profit_pct_of_max,
+            "max_profit":         max_profit,
+            "dte":                dte,
+            "spread_value":       current_value / (contracts * 100) if contracts > 0 else 0,
+            "strategy_type":      "long_option",
+            "delta":              delta,
+        }
+
+    # ── CREDIT OPTIONS (Cash Secured Put, Covered Call) ──────────────────────
+    elif strategy in CREDIT_OPTIONS:
+        option_type   = "put" if strategy == "Cash Secured Put" else "call"
+        premium_received = total_cost  # for credit strategies, total_cost = premium received
+
+        # Try to get current option price (cost to close)
+        live_price = get_live_option_price(ticker, strike_low, exp_date, option_type)
+
+        if live_price is not None:
+            cost_to_close = live_price * contracts * 100
+        else:
+            # Fallback: delta decay approximation
+            delta       = get_live_delta(ticker, strike_low, exp_date, option_type)
+            price_change = current_price - price_at_open
+            remaining   = max(0, (premium_received / (contracts * 100)) - (abs(delta) * abs(price_change)))
+            cost_to_close = remaining * contracts * 100
+
+        # For credit strategies: profit = premium received - cost to close now
+        max_profit    = premium_received  # keep 100% of premium
+        gross_pnl     = premium_received - cost_to_close
+        pnl_pct       = (gross_pnl / premium_received * 100) if premium_received > 0 else 0
+        profit_pct_of_max = (gross_pnl / max_profit) if max_profit > 0 else 0
+
+        return {
+            "current_price":      current_price,
+            "current_value":      cost_to_close,
+            "gross_pnl":          gross_pnl,
+            "pnl_pct":            pnl_pct,
+            "profit_pct_of_max":  profit_pct_of_max,
+            "max_profit":         max_profit,
+            "dte":                dte,
+            "spread_value":       cost_to_close / (contracts * 100) if contracts > 0 else 0,
+            "strategy_type":      "credit_option",
+            "delta":              None,
+        }
+
+    # ── LONG STRADDLE ────────────────────────────────────────────────────────
+    elif strategy in STRADDLES:
+        # strike_low = call strike, strike_high = put strike (usually same)
+        strike = strike_low
+        call_price = get_live_option_price(ticker, strike, exp_date, "call")
+        put_price  = get_live_option_price(ticker, strike, exp_date, "put")
+
+        if call_price is not None and put_price is not None:
+            current_value = (call_price + put_price) * contracts * 100
+        else:
+            # Fallback: intrinsic + approximation
+            call_delta = get_live_delta(ticker, strike, exp_date, "call")
+            put_delta  = get_live_delta(ticker, strike, exp_date, "put")
+            premium_per_share = total_cost / (contracts * 100) if contracts > 0 else 0
+            price_change = current_price - price_at_open
+            # Straddle benefits from movement in either direction
+            call_val = max(0, (premium_per_share / 2) + call_delta * price_change)
+            put_val  = max(0, (premium_per_share / 2) - abs(put_delta) * price_change)
+            current_value = (call_val + put_val) * contracts * 100
+
+        max_profit = total_cost * 3  # straddles target 200%+ on big moves
+        gross_pnl  = current_value - total_cost
+        pnl_pct    = (gross_pnl / total_cost * 100) if total_cost > 0 else 0
+        profit_pct_of_max = (gross_pnl / max_profit) if max_profit > 0 else 0
+
+        return {
+            "current_price":      current_price,
+            "current_value":      current_value,
+            "gross_pnl":          gross_pnl,
+            "pnl_pct":            pnl_pct,
+            "profit_pct_of_max":  profit_pct_of_max,
+            "max_profit":         max_profit,
+            "dte":                dte,
+            "spread_value":       current_value / (contracts * 100) if contracts > 0 else 0,
+            "strategy_type":      "straddle",
+            "delta":              None,
+        }
+
+    # ── FALLBACK (unknown strategy) ───────────────────────────────────────────
+    else:
+        return {
+            "current_price":      current_price,
+            "current_value":      0,
+            "gross_pnl":          0,
+            "pnl_pct":            0,
+            "profit_pct_of_max":  0,
+            "max_profit":         total_cost,
+            "dte":                dte,
+            "spread_value":       0,
+            "strategy_type":      "unknown",
+            "delta":              None,
+        }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -253,37 +439,48 @@ def evaluate_alert_level(pnl_data):
     profit_pct_of_max = pnl_data["profit_pct_of_max"]
     pnl_pct           = pnl_data["pnl_pct"]
     dte               = pnl_data["dte"]
+    strategy_type     = pnl_data.get("strategy_type", "debit_spread")
     reasons           = []
     level             = "NORMAL"
 
+    # ── URGENT conditions ────────────────────────────────────────────────────
     if profit_pct_of_max >= TAKE_PROFIT_MAX_PCT:
-        reasons.append(f"Ganancia {profit_pct_of_max*100:.0f}% del máximo — no dejes escapar")
+        reasons.append(f"Ganancia {profit_pct_of_max*100:.0f}% del maximo — no dejes escapar")
         level = "URGENT"
 
-    if pnl_pct <= -(STOP_LOSS_PCT * 100):
-        reasons.append(f"Stop loss alcanzado — pérdida {pnl_pct:.1f}%")
-        level = "URGENT"
+    # Stop loss: for credit strategies, a loss means the option gained value
+    if strategy_type == "credit_option":
+        if pnl_pct <= -(STOP_LOSS_PCT * 100):
+            reasons.append(f"Stop loss alcanzado — perdida {pnl_pct:.1f}%")
+            level = "URGENT"
+    else:
+        if pnl_pct <= -(STOP_LOSS_PCT * 100):
+            reasons.append(f"Stop loss alcanzado — perdida {pnl_pct:.1f}%")
+            level = "URGENT"
 
+    # ── ACTION conditions ────────────────────────────────────────────────────
     if level != "URGENT":
         if TAKE_PROFIT_MIN_PCT <= profit_pct_of_max < TAKE_PROFIT_MAX_PCT:
-            reasons.append(f"Take profit alcanzado — {profit_pct_of_max*100:.0f}% del máximo")
+            reasons.append(f"Take profit alcanzado — {profit_pct_of_max*100:.0f}% del maximo")
             level = "ACTION"
 
         if dte is not None and dte <= MIN_DTE:
-            reasons.append(f"Solo {dte} días al vencimiento — Theta acelerando")
-            level = "ACTION" if level != "URGENT" else level
+            reasons.append(f"Solo {dte} dias al vencimiento — Theta acelerando")
+            if level != "URGENT":
+                level = "ACTION"
 
+    # ── WATCH conditions ─────────────────────────────────────────────────────
     if level == "NORMAL":
         if WATCH_PROFIT_PCT <= profit_pct_of_max < TAKE_PROFIT_MIN_PCT:
-            reasons.append(f"Acercándose al objetivo — {profit_pct_of_max*100:.0f}% del máximo")
+            reasons.append(f"Acercandose al objetivo — {profit_pct_of_max*100:.0f}% del maximo")
             level = "WATCH"
 
         if pnl_pct <= -(STOP_LOSS_WATCH_PCT * 100):
-            reasons.append(f"Pérdida creciente — {pnl_pct:.1f}%")
+            reasons.append(f"Perdida creciente — {pnl_pct:.1f}%")
             level = "WATCH"
 
         if dte is not None and MIN_DTE < dte <= WATCH_DTE:
-            reasons.append(f"{dte} días al vencimiento — monitorear de cerca")
+            reasons.append(f"{dte} dias al vencimiento — monitorear de cerca")
             level = "WATCH"
 
     if not reasons:
@@ -291,8 +488,101 @@ def evaluate_alert_level(pnl_data):
 
     return level, reasons
 
+
 def level_icon(level):
-    return {"NORMAL": "🟢", "WATCH": "🟡", "ACTION": "🟠", "URGENT": "🔴"}.get(level, "—")
+    return {"NORMAL": "[OK]", "WATCH": "[!!]", "ACTION": "[ACT]", "URGENT": "[URG]"}.get(level, "---")
+
+
+def level_icon_emoji(level):
+    return {"NORMAL": "verde", "WATCH": "amarillo", "ACTION": "naranja", "URGENT": "rojo"}.get(level, "---")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NTFY NOTIFICATIONS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def send_ntfy(title, message, priority="default", tags=None):
+    """Send push notification via ntfy.sh."""
+    if not NTFY_TOPIC:
+        return
+
+    url = f"{NTFY_BASE_URL}/{NTFY_TOPIC}"
+    headers = {
+        "Title":    title.encode("utf-8"),
+        "Priority": priority,
+        "Content-Type": "text/plain; charset=utf-8",
+    }
+    if tags:
+        headers["Tags"] = ",".join(tags)
+
+    try:
+        resp = requests.post(
+            url,
+            data=message.encode("utf-8"),
+            headers=headers,
+            timeout=10,
+        )
+        if resp.status_code not in (200, 204):
+            print(f"  ntfy warning: HTTP {resp.status_code}")
+    except Exception as e:
+        print(f"  ntfy error: {e}")
+
+
+def send_alert_notification(position, pnl_data, alert_level, reasons):
+    ticker = position["ticker"]
+    strategy = position.get("strategy", "")
+    pnl    = pnl_data["gross_pnl"]
+    pct    = pnl_data["profit_pct_of_max"] * 100
+    dte    = pnl_data["dte"]
+
+    level_titles = {
+        "URGENT": f"URGENTE — {ticker}",
+        "ACTION": f"ACCION — {ticker}",
+        "WATCH":  f"WATCH — {ticker}",
+    }
+    priorities = {"URGENT": "urgent", "ACTION": "high", "WATCH": "default"}
+
+    title = level_titles.get(alert_level, ticker)
+    reason_text = "\n".join(f"- {r}" for r in reasons)
+    message = (
+        f"{strategy} | ${ticker}\n"
+        f"P&L: ${pnl:+.0f} ({pct:.0f}% del max) | {dte}d\n"
+        f"{reason_text}"
+    )
+
+    send_ntfy(title, message, priority=priorities.get(alert_level, "default"))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONSOLE REPORT
+# ══════════════════════════════════════════════════════════════════════════════
+
+def print_position_report(position, pnl_data, alert_level, reasons, scored=None):
+    icon     = level_icon(alert_level)
+    ticker   = position["ticker"]
+    strategy = position.get("strategy", "")
+
+    print(f"\n{icon} {ticker} — {strategy} — {alert_level}")
+    print(f"{'─' * 55}")
+    print(f"  Strike(s):      ${position['strike_low']} / ${position['strike_high']}")
+    print(f"  Expiracion:     {position['expiration']} ({pnl_data['dte']} dias)")
+    print(f"  Precio accion:  ${pnl_data['current_price']:.2f}")
+
+    if pnl_data.get("delta") is not None:
+        print(f"  Delta actual:   {pnl_data['delta']:.3f}")
+
+    print(f"  Costo total:    ${float(position.get('total_cost') or 0):.2f}")
+    print(f"  Ganancia/Perd:  ${pnl_data['gross_pnl']:.2f} ({pnl_data['pnl_pct']:.1f}%)")
+    print(f"  % del maximo:   {pnl_data['profit_pct_of_max']*100:.1f}%")
+    print(f"  Ganancia max:   ${pnl_data['max_profit']:.2f}")
+
+    if scored:
+        print(f"  Score actual:   {scored['score']}/{scored['score_max']} "
+              f"({scored['score_pct']}%) — {scored['verdict']}")
+
+    print(f"\n  Alertas:")
+    for reason in reasons:
+        print(f"    - {reason}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -300,146 +590,158 @@ def level_icon(level):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def generate_html_report(positions_data, timestamp):
-    """
-    Generate monitor_report.html — mobile-friendly dashboard.
-    Saved to scripts/monitor_report.html.
-    """
-    level_colors = {
-        "URGENT": "#ef4444",
-        "ACTION": "#f97316",
-        "WATCH":  "#f59e0b",
-        "NORMAL": "#22c55e",
-    }
+    """Generate monitor_report.html — mobile-friendly dashboard."""
 
-    cards = ""
-    for pd in positions_data:
-        pos   = pd["position"]
-        pnl   = pd["pnl_data"]
-        level = pd["alert_level"]
-        reasons = pd["reasons"]
-        color = level_colors.get(level, "#6b7280")
-        icon  = level_icon(level)
-
-        pnl_color  = "#22c55e" if pnl["gross_pnl"] >= 0 else "#ef4444"
-        pct_of_max = pnl["profit_pct_of_max"] * 100
-        bar_width  = min(100, max(0, pct_of_max))
-        bar_color  = "#22c55e" if pct_of_max >= 50 else "#f59e0b" if pct_of_max >= 30 else "#6b7280"
-
-        reasons_html = "".join(
-            f'<div style="display:flex;gap:8px;margin:4px 0;">'
-            f'<span style="color:{color};">›</span>'
-            f'<span style="color:#cbd5e1;font-size:13px;">{r}</span></div>'
-            for r in reasons
-        )
-
-        cards += f"""
-        <div style="background:#111;border:2px solid {color}44;border-radius:16px;
-                    padding:20px;margin-bottom:16px;">
-            <div style="display:flex;justify-content:space-between;
-                        align-items:center;margin-bottom:14px;">
-                <div>
-                    <span style="font-size:28px;font-weight:900;color:#f9fafb;">
-                        {pos['ticker']}
-                    </span>
-                    <span style="font-size:13px;color:#6b7280;margin-left:8px;">
-                        ${pos['strike_low']}/{pos['strike_high']} · {pnl['dte']}d
-                    </span>
-                </div>
-                <div style="background:{color}22;border:1px solid {color};
-                            border-radius:8px;padding:6px 14px;">
-                    <span style="color:{color};font-weight:700;font-size:14px;">
-                        {icon} {level}
-                    </span>
-                </div>
-            </div>
-
-            <div style="display:grid;grid-template-columns:1fr 1fr;
-                        gap:12px;margin-bottom:14px;">
-                <div style="background:#1a1a1a;border-radius:10px;padding:12px;">
-                    <div style="font-size:10px;color:#6b7280;letter-spacing:2px;
-                                text-transform:uppercase;margin-bottom:4px;">P&L</div>
-                    <div style="font-size:22px;font-weight:900;color:{pnl_color};">
-                        ${pnl['gross_pnl']:+.0f}
-                    </div>
-                    <div style="font-size:12px;color:{pnl_color};">
-                        {pnl['pnl_pct']:+.1f}%
-                    </div>
-                </div>
-                <div style="background:#1a1a1a;border-radius:10px;padding:12px;">
-                    <div style="font-size:10px;color:#6b7280;letter-spacing:2px;
-                                text-transform:uppercase;margin-bottom:4px;">DEL MÁXIMO</div>
-                    <div style="font-size:22px;font-weight:900;color:{bar_color};">
-                        {pct_of_max:.0f}%
-                    </div>
-                    <div style="font-size:12px;color:#6b7280;">
-                        máx: ${pnl['max_profit']:.0f}
-                    </div>
-                </div>
-            </div>
-
-            <div style="background:#1a1a1a;border-radius:8px;
-                        height:8px;margin-bottom:14px;">
-                <div style="background:{bar_color};width:{bar_width:.1f}%;
-                            height:8px;border-radius:8px;transition:width 0.5s;"></div>
-            </div>
-
-            <div style="background:#0d1117;border-radius:10px;padding:12px;">
-                {reasons_html}
-            </div>
-
-            <div style="margin-top:10px;display:flex;justify-content:space-between;
-                        font-size:11px;color:#4b5563;font-family:monospace;">
-                <span>Precio actual: ${pnl['current_price']:.2f}</span>
-                <span>Costo: ${float(pos.get('total_cost') or 0):.0f}</span>
-                <span>Exp: {pos['expiration']}</span>
-            </div>
-        </div>"""
-
-    market_status = get_market_status()
-    market_color  = "#22c55e" if market_status == "open" else \
-                    "#f59e0b" if market_status == "pre"  else "#6b7280"
-    market_label  = {"open": "ABIERTO", "pre": "PRE-MARKET", "closed": "CERRADO"}.get(market_status)
     next_interval = get_interval()
+
+    if not positions_data:
+        cards_html = """
+        <div style="text-align:center;padding:60px 20px;color:#6b7280;">
+            <div style="font-size:48px;margin-bottom:16px;">📭</div>
+            <div style="font-size:18px;font-weight:600;color:#9ca3af;">Sin posiciones abiertas</div>
+            <div style="font-size:13px;margin-top:8px;">El scanner buscara oportunidades automaticamente</div>
+        </div>"""
+    else:
+        cards = []
+        for pd in positions_data:
+            pos      = pd["position"]
+            pnl      = pd["pnl_data"]
+            level    = pd["alert_level"]
+            reasons  = pd["reasons"]
+            scored   = pd.get("scored")
+            strategy = pos.get("strategy", "")
+
+            level_colors = {
+                "NORMAL": "#22c55e",
+                "WATCH":  "#eab308",
+                "ACTION": "#f97316",
+                "URGENT": "#ef4444",
+            }
+            bar_color = level_colors.get(level, "#6b7280")
+            pnl_color = "#22c55e" if pnl["gross_pnl"] >= 0 else "#ef4444"
+
+            pct_of_max = pnl["profit_pct_of_max"] * 100
+            bar_width  = max(0, min(100, pct_of_max))
+
+            reasons_html = "".join(
+                f'<div style="color:#9ca3af;font-size:12px;padding:3px 0;">'
+                f'  {r}</div>'
+                for r in reasons
+            )
+
+            delta_html = ""
+            if pnl.get("delta") is not None:
+                delta_html = f'<span>Delta: {pnl["delta"]:.3f}</span>'
+
+            score_html = ""
+            if scored:
+                score_html = (
+                    f'<div style="margin-top:8px;font-size:11px;color:#6b7280;">'
+                    f'Score: {scored["score"]}/{scored["score_max"]} '
+                    f'({scored["score_pct"]}%) — {scored["verdict"]}</div>'
+                )
+
+            cards.append(f"""
+            <div style="background:#111827;border-radius:16px;padding:16px;
+                        margin-bottom:16px;border-left:4px solid {bar_color};">
+                <div style="display:flex;justify-content:space-between;
+                            align-items:center;margin-bottom:12px;">
+                    <div>
+                        <span style="font-size:22px;font-weight:900;color:#f9fafb;">
+                            {pos['ticker']}
+                        </span>
+                        <span style="font-size:12px;color:#6b7280;margin-left:8px;">
+                            {strategy}
+                        </span>
+                    </div>
+                    <div style="background:{bar_color};color:white;padding:4px 10px;
+                                border-radius:8px;font-size:12px;font-weight:700;">
+                        {level}
+                    </div>
+                </div>
+
+                <div style="display:grid;grid-template-columns:1fr 1fr;
+                            gap:12px;margin-bottom:14px;">
+                    <div style="background:#1a1a1a;border-radius:10px;padding:12px;">
+                        <div style="font-size:10px;color:#6b7280;letter-spacing:2px;
+                                    text-transform:uppercase;margin-bottom:4px;">P&L</div>
+                        <div style="font-size:22px;font-weight:900;color:{pnl_color};">
+                            ${pnl['gross_pnl']:+.0f}
+                        </div>
+                        <div style="font-size:12px;color:{pnl_color};">
+                            {pnl['pnl_pct']:+.1f}%
+                        </div>
+                    </div>
+                    <div style="background:#1a1a1a;border-radius:10px;padding:12px;">
+                        <div style="font-size:10px;color:#6b7280;letter-spacing:2px;
+                                    text-transform:uppercase;margin-bottom:4px;">DEL MAXIMO</div>
+                        <div style="font-size:22px;font-weight:900;color:{bar_color};">
+                            {pct_of_max:.0f}%
+                        </div>
+                        <div style="font-size:12px;color:#6b7280;">
+                            max: ${pnl['max_profit']:.0f}
+                        </div>
+                    </div>
+                </div>
+
+                <div style="background:#1a1a1a;border-radius:8px;
+                            height:8px;margin-bottom:14px;">
+                    <div style="background:{bar_color};width:{bar_width:.1f}%;
+                                height:8px;border-radius:8px;transition:width 0.5s;"></div>
+                </div>
+
+                <div style="background:#0d1117;border-radius:10px;padding:12px;">
+                    {reasons_html}
+                </div>
+
+                <div style="margin-top:10px;display:flex;justify-content:space-between;
+                            font-size:11px;color:#4b5563;font-family:monospace;">
+                    <span>Precio: ${pnl['current_price']:.2f}</span>
+                    {delta_html}
+                    <span>Costo: ${float(pos.get('total_cost') or 0):.0f}</span>
+                    <span>{pnl['dte']}d restantes</span>
+                </div>
+                {score_html}
+            </div>""")
+
+        cards_html = "\n".join(cards)
 
     html = f"""<!DOCTYPE html>
 <html lang="es">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta http-equiv="refresh" content="300">
     <title>Monitor — {timestamp}</title>
     <style>
-        * {{ box-sizing:border-box; margin:0; padding:0; }}
+        * {{ box-sizing: border-box; margin: 0; padding: 0; }}
         body {{
-            background:#0a0a0a; color:#f9fafb;
-            font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
-            padding:16px; max-width:480px; margin:0 auto;
+            background: #0d1117;
+            color: #f9fafb;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            max-width: 480px;
+            margin: 0 auto;
+            padding: 16px;
         }}
     </style>
 </head>
 <body>
     <div style="display:flex;justify-content:space-between;align-items:center;
-                margin-bottom:20px;padding-bottom:16px;border-bottom:1px solid #1e1e1e;">
+                margin-bottom:20px;padding-bottom:12px;border-bottom:1px solid #1f2937;">
         <div>
-            <div style="font-size:18px;font-weight:900;color:#f9fafb;">
-                📊 Monitor de Posiciones
+            <div style="font-size:18px;font-weight:800;color:#f9fafb;">
+                Monitor de Posiciones
             </div>
-            <div style="font-size:12px;color:#6b7280;font-family:monospace;margin-top:2px;">
+            <div style="font-size:11px;color:#6b7280;font-family:monospace;">
                 {timestamp}
             </div>
         </div>
-        <div style="background:{market_color}22;border:1px solid {market_color};
-                    border-radius:8px;padding:6px 12px;text-align:center;">
-            <div style="color:{market_color};font-size:11px;font-weight:700;
-                        letter-spacing:1px;">{market_label}</div>
-            <div style="color:{market_color}88;font-size:10px;">
-                cada {next_interval}min
-            </div>
+        <div style="text-align:right;font-size:11px;color:#6b7280;">
+            {len(positions_data)} {'posicion' if len(positions_data) == 1 else 'posiciones'} abiertas
         </div>
     </div>
 
-    {cards if cards else
-        '<div style="text-align:center;padding:40px;color:#6b7280;">No hay posiciones abiertas</div>'}
+    {cards_html}
 
     <div style="text-align:center;color:#374151;font-size:11px;
                 padding:16px 0;margin-top:8px;font-family:monospace;">
@@ -453,29 +755,83 @@ def generate_html_report(positions_data, timestamp):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CONSOLE REPORT
+# HEARTBEAT & MARKET CLOSE NOTIFICATIONS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def print_position_report(position, pnl_data, alert_level, reasons, scored=None):
-    icon   = level_icon(alert_level)
-    ticker = position["ticker"]
+def should_send_heartbeat():
+    global _last_heartbeat_time
+    if not is_market_open():
+        return False
+    now = datetime.now()
+    if _last_heartbeat_time is None:
+        return True
+    elapsed = (now - _last_heartbeat_time).total_seconds() / 60
+    return elapsed >= HEARTBEAT_INTERVAL_MIN
 
-    print(f"\n{icon} {ticker} — {alert_level}")
-    print(f"{'─' * 50}")
-    print(f"  Strikes:        ${position['strike_low']} / ${position['strike_high']}")
-    print(f"  Expiración:     {position['expiration']} ({pnl_data['dte']} días)")
-    print(f"  Costo total:    ${float(position.get('total_cost') or 0):.2f}")
-    print(f"  Ganancia/Perd:  ${pnl_data['gross_pnl']:.2f} ({pnl_data['pnl_pct']:.1f}%)")
-    print(f"  % del máximo:   {pnl_data['profit_pct_of_max']*100:.1f}%")
-    print(f"  Ganancia máx:   ${pnl_data['max_profit']:.2f}")
 
-    if scored:
-        print(f"  Score actual:   {scored['score']}/{scored['score_max']} "
-              f"({scored['score_pct']}%) — {scored['verdict']}")
+def send_heartbeat(positions_data, timestamp):
+    global _last_heartbeat_time
+    _last_heartbeat_time = datetime.now()
 
-    print(f"\n  Alertas:")
-    for reason in reasons:
-        print(f"    • {reason}")
+    if not positions_data:
+        send_ntfy(
+            title="Monitor OK - Sin posiciones",
+            message=f"Todo en orden. Sin posiciones abiertas.\n{timestamp}",
+            priority="low",
+        )
+        return
+
+    lines = []
+    for pd in positions_data:
+        pos   = pd["position"]
+        pnl   = pd["pnl_data"]
+        level = pd["alert_level"]
+        icon  = level_icon(level)
+        pct   = pnl["profit_pct_of_max"] * 100
+        strat = pos.get("strategy", "")
+        lines.append(
+            f"{icon} {pos['ticker']} ({strat}) | "
+            f"P&L: ${pnl['gross_pnl']:+.0f} ({pct:.0f}% max) | {pnl['dte']}d"
+        )
+
+    send_ntfy(
+        title=f"Monitor OK — {len(positions_data)} posicion(es)",
+        message="\n".join(lines) + f"\n{timestamp}",
+        priority="low",
+    )
+
+
+def send_market_close_summary(positions_data, timestamp):
+    global _market_close_sent
+    if _market_close_sent:
+        return
+    _market_close_sent = True
+
+    if not positions_data:
+        send_ntfy(
+            title="Mercado cerrado - Sin posiciones",
+            message=f"Mercado cerrado.\n{timestamp}",
+            priority="low",
+        )
+        return
+
+    lines = []
+    for pd in positions_data:
+        pos   = pd["position"]
+        pnl   = pd["pnl_data"]
+        level = pd["alert_level"]
+        icon  = level_icon(level)
+        pct   = pnl["profit_pct_of_max"] * 100
+        lines.append(
+            f"{icon} {pos['ticker']} ${pnl['gross_pnl']:+.0f} "
+            f"({pct:.0f}% max) | {pnl['dte']}d al venc."
+        )
+
+    send_ntfy(
+        title=f"Cierre de mercado — {len(positions_data)} posicion(es)",
+        message="\n".join(lines) + f"\n{timestamp}",
+        priority="default",
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -485,7 +841,7 @@ def print_position_report(position, pnl_data, alert_level, reasons, scored=None)
 def run_monitor(ask_ai=False):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-    print(f"\n{'═' * 60}")
+    print(f"\n{'=' * 60}")
     print(f"  MONITOR DE POSICIONES — {timestamp}")
 
     market_status = get_market_status()
@@ -493,9 +849,8 @@ def run_monitor(ask_ai=False):
     print(f"  Mercado: {status_label.get(market_status, '?')} | "
           f"Intervalo: {get_interval()}min")
 
-    alerts = []
     print(f"\n  Alertas:")
-    print(f"{'═' * 60}")
+    print(f"{'=' * 60}")
 
     positions = get_open_positions()
 
@@ -510,13 +865,14 @@ def run_monitor(ask_ai=False):
     ntfy_sent      = set()
 
     for position in positions:
-        ticker = position["ticker"]
-        print(f"\n⏳ Revisando {ticker}...", end=" ", flush=True)
+        ticker   = position["ticker"]
+        strategy = position.get("strategy", "desconocida")
+        print(f"\n  Revisando {ticker} ({strategy})...", end=" ", flush=True)
 
         try:
             criteria = get_all_criteria(ticker)
             if criteria is None:
-                print("❌ Sin datos")
+                print("Sin datos de mercado")
                 continue
 
             current_price = criteria["price"]
@@ -531,7 +887,6 @@ def run_monitor(ask_ai=False):
             print(f"{level_icon(alert_level)} {alert_level}")
             print_position_report(position, pnl_data, alert_level, reasons, scored)
 
-            # Send ntfy notification for WATCH/ACTION/URGENT
             if alert_level in ("WATCH", "ACTION", "URGENT") and ticker not in ntfy_sent:
                 send_alert_notification(position, pnl_data, alert_level, reasons)
                 ntfy_sent.add(ticker)
@@ -545,121 +900,29 @@ def run_monitor(ask_ai=False):
             })
 
         except Exception as e:
-            print(f"❌ Error: {e}")
+            print(f"Error: {e}")
             continue
 
-    # Generate HTML report (always, even with no alerts)
     generate_html_report(positions_data, timestamp)
 
-    # Summary
-    print(f"\n{'═' * 60}")
+    print(f"\n{'=' * 60}")
     urgent = sum(1 for p in positions_data if p["alert_level"] == "URGENT")
     action = sum(1 for p in positions_data if p["alert_level"] == "ACTION")
     watch  = sum(1 for p in positions_data if p["alert_level"] == "WATCH")
     normal = sum(1 for p in positions_data if p["alert_level"] == "NORMAL")
-    print(f"  🔴 URGENT: {urgent}  🟠 ACTION: {action}  "
-          f"🟡 WATCH: {watch}  🟢 NORMAL: {normal}")
-    print(f"{'═' * 60}")
-    print(f"✅ Monitor completado — {timestamp}\n")
+    print(f"  URGENT: {urgent}  ACTION: {action}  WATCH: {watch}  NORMAL: {normal}")
+    print(f"{'=' * 60}")
+    print(f"  Monitor completado — {timestamp}\n")
 
-    # Heartbeat — hourly status during market hours
     if should_send_heartbeat():
         send_heartbeat(positions_data, timestamp)
 
-    # Market close summary — once per day when market closes
     global _market_close_sent
     if get_market_status() == "closed" and not _market_close_sent:
         send_market_close_summary(positions_data, timestamp)
     elif get_market_status() == "open":
-        _market_close_sent = False  # reset flag for next trading day
+        _market_close_sent = False
 
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# HEARTBEAT & MARKET CLOSE NOTIFICATIONS
-# ══════════════════════════════════════════════════════════════════════════════
-
-def should_send_heartbeat():
-    """Return True if it's time to send an hourly status notification."""
-    global _last_heartbeat_time
-    if not is_market_open():
-        return False
-    now = datetime.now()
-    if _last_heartbeat_time is None:
-        return True
-    elapsed = (now - _last_heartbeat_time).total_seconds() / 60
-    return elapsed >= HEARTBEAT_INTERVAL_MIN
-
-
-def send_heartbeat(positions_data, timestamp):
-    """Send hourly status notification — all clear or summary of positions."""
-    global _last_heartbeat_time
-    _last_heartbeat_time = datetime.now()
-
-    if not positions_data:
-        send_ntfy(
-            title="📊 Monitor OK — Sin posiciones",
-            message=f"Todo en orden. Sin posiciones abiertas.\n{timestamp}",
-            priority="low",
-            tags=["white_check_mark"],
-        )
-        return
-
-    lines = []
-    for pd in positions_data:
-        pos   = pd["position"]
-        pnl   = pd["pnl_data"]
-        level = pd["alert_level"]
-        icon  = level_icon(level)
-        pct   = pnl["profit_pct_of_max"] * 100
-        lines.append(
-            f"{icon} {pos['ticker']} | P&L: ${pnl['gross_pnl']:+.0f} "
-            f"({pct:.0f}% máx) | {pnl['dte']}d"
-        )
-
-    send_ntfy(
-        title=f"📊 Monitor OK — {len(positions_data)} posición(es)",
-        message="\n".join(lines) + f"\n{timestamp}",
-        priority="low",
-        tags=["white_check_mark", "chart_increasing"],
-    )
-
-
-def send_market_close_summary(positions_data, timestamp):
-    """Send one notification when market closes with end-of-day summary."""
-    global _market_close_sent
-    if _market_close_sent:
-        return
-
-    _market_close_sent = True
-
-    if not positions_data:
-        send_ntfy(
-            title="🔔 Mercado cerrado — Sin posiciones",
-            message=f"Mercado cerrado. Sin posiciones abiertas.\n{timestamp}",
-            priority="low",
-            tags=["bell"],
-        )
-        return
-
-    lines = []
-    for pd in positions_data:
-        pos   = pd["position"]
-        pnl   = pd["pnl_data"]
-        level = pd["alert_level"]
-        icon  = level_icon(level)
-        pct   = pnl["profit_pct_of_max"] * 100
-        lines.append(
-            f"{icon} {pos['ticker']} ${pnl['gross_pnl']:+.0f} "
-            f"({pct:.0f}% máx) | {pnl['dte']}d al venc."
-        )
-
-    send_ntfy(
-        title=f"🔔 Cierre de mercado — {len(positions_data)} posición(es)",
-        message="\n".join(lines) + f"\n{timestamp}",
-        priority="default",
-        tags=["bell", "chart_increasing"],
-    )
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SCHEDULED RUN (Railway)
@@ -680,10 +943,10 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.loop:
-        print(f"\n🔄 Monitor en loop adaptativo")
-        print(f"   Mercado abierto:  cada {INTERVAL_MARKET_OPEN}min")
-        print(f"   Pre-market:       cada {INTERVAL_PRE_MARKET}min")
-        print(f"   Mercado cerrado:  cada {INTERVAL_MARKET_CLOSED}min\n")
+        print(f"\n  Monitor en loop adaptativo")
+        print(f"  Mercado abierto:  cada {INTERVAL_MARKET_OPEN}min")
+        print(f"  Pre-market:       cada {INTERVAL_PRE_MARKET}min")
+        print(f"  Mercado cerrado:  cada {INTERVAL_MARKET_CLOSED}min\n")
         scheduled_run()
         current_interval = get_interval()
         schedule.every(current_interval).minutes.do(scheduled_run)
@@ -695,7 +958,7 @@ if __name__ == "__main__":
                 schedule.clear()
                 schedule.every(new_interval).minutes.do(scheduled_run)
                 current_interval = new_interval
-                print(f"  ⏱  Intervalo ajustado → {current_interval}min")
+                print(f"  Intervalo ajustado: {current_interval}min")
             time.sleep(60)
     else:
         run_monitor(ask_ai=True)
