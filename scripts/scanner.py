@@ -12,7 +12,7 @@ Workflow:
          - Raw criteria per ticker (labels only)
          - Open positions
     5. AI recommends strategy per ticker and ranks opportunities
-    6. Generates scanner_report.html — opens in browser automatically
+    6. Generates scanner_report.md (solo tickers aptos) y scanner_report.html (todos)
 
 Usage:
     python scanner.py                          # default tickers
@@ -23,7 +23,7 @@ Dependencies:
     criteria.py          → raw market data
     db.py                → save to PostgreSQL
     market_context.json  → macro context from market_context.py
-    report_generator.py  → HTML report
+    report_generator.py  → markdown + HTML reports
     .env                 → DATABASE_URL, ANTHROPIC_API_KEY
 """
 
@@ -74,7 +74,7 @@ TRADING_CONTEXT = {
 def load_market_context():
     """
     Load macro context from market_context.json.
-    Returns None if file not found or outdated.
+    Returns None if file not found.
     """
     if not os.path.exists(MARKET_CONTEXT_JSON):
         return None
@@ -107,8 +107,8 @@ def format_market_context(ctx):
     ]
 
     for s in ctx.get("sectors", []):
-        icon = "✅" if s["priority"] == "PRIORITY"   else \
-               "⚠️" if s["priority"] == "ACCEPTABLE" else "❌"
+        icon = "[OK]" if s["priority"] == "PRIORITY"   else \
+               "[~]"  if s["priority"] == "ACCEPTABLE" else "[X]"
         lines.append(f"  {icon} {s['sector']:<35} {s['win_rate']:.1f}% win rate  [{s['priority']}]")
 
     return "\n".join(lines)
@@ -127,77 +127,76 @@ def format_criteria_for_ai(c):
     lines = []
 
     # ── Technical ─────────────────────────────────────────────────────────────
-    lines.append("TECHNICAL:")
     tech = c.get("technical", {})
+    if tech:
+        lines.append("TECHNICAL:")
+        trend = tech.get("trend_25d", {})
+        if trend:
+            direction = "BULLISH" if trend.get("is_bullish") else "BEARISH"
+            pct       = trend.get("pct_change", 0)
+            lines.append(f"  Trend 25d:        {direction} ({pct:+.1f}%)")
 
-    trend = tech.get("trend_25d", {})
-    pct   = trend.get("pct_change")
-    lines.append(f"  Trend 25d:        {'BULLISH' if trend.get('is_bullish') else 'BEARISH'} ({pct:+.1f}%)" if pct is not None else "  Trend 25d:        N/A")
+        ma = tech.get("moving_averages", {})
+        if ma:
+            above = "Above both" if ma.get("above_sma50") and ma.get("above_sma200") \
+                    else "Above SMA50" if ma.get("above_sma50") \
+                    else "Below both"
+            sma_dir = ma.get("sma50_direction", "N/A")
+            lines.append(f"  Moving averages:  {above} | SMA50 {sma_dir}")
 
-    ma = tech.get("moving_averages", {})
-    if ma.get("above_sma50") and ma.get("above_sma200"):
-        ma_label = "Above both SMAs"
-    elif ma.get("above_sma50"):
-        ma_label = "Above SMA50 only"
-    else:
-        ma_label = "Below both SMAs"
-    lines.append(f"  Moving averages:  {ma_label} | SMA50 {ma.get('sma50_direction', 'N/A')}")
+        rsi = tech.get("rsi")
+        lines.append(f"  RSI:              {rsi:.1f}" if rsi is not None else "  RSI:              N/A")
 
-    rsi = tech.get("rsi")
-    lines.append(f"  RSI:              {rsi:.1f}" if isinstance(rsi, (int, float)) else "  RSI:              N/A")
+        w52 = tech.get("week_52", {})
+        if w52:
+            pos = w52.get("position_pct", 0)
+            tag = w52.get("tag", "")
+            lines.append(f"  52-week:          {pos:.1f}% ({tag})")
 
-    w52 = tech.get("week_52", {})
-    pos = w52.get("position_pct")
-    pos_label = "near high" if w52.get("near_high") else "near low" if w52.get("near_low") else "mid range"
-    lines.append(f"  52-week:          {pos:.1f}% ({pos_label})" if pos is not None else "  52-week:          N/A")
+        sr = tech.get("support_resistance", {})
+        if sr:
+            sup = sr.get("support_pct")
+            res = sr.get("resistance_pct")
+            lines.append(f"  Support:          {sup:.1f}% away"    if sup is not None else "  Support:          N/A")
+            lines.append(f"  Resistance:       {res:.1f}% away"    if res is not None else "  Resistance:       N/A")
 
-    sr = tech.get("support_resistance", {})
-    sup_pct = sr.get("support_dist_pct")
-    res_pct = sr.get("resistance_dist_pct")
-    lines.append(f"  Support:          {sup_pct:.1f}% away" if sup_pct is not None else "  Support:          N/A")
-    lines.append(f"  Resistance:       {res_pct:.1f}% away" if res_pct is not None else "  Resistance:       N/A")
-
-    candle = tech.get("candlestick", {})
-    lines.append(f"  Candlestick:      {candle.get('pattern', 'N/A')} ({candle.get('signal', 'N/A')})")
+        candle = tech.get("candlestick", {})
+        if candle:
+            lines.append(f"  Candlestick:      {candle.get('pattern', 'N/A')} ({candle.get('sentiment', 'N/A')})")
 
     # ── Volatility ────────────────────────────────────────────────────────────
-    lines.append("VOLATILITY:")
     vol = c.get("volatility", {})
+    if vol:
+        lines.append("VOLATILITY:")
+        hv  = vol.get("hv_30d")
+        iv  = vol.get("iv")
+        ivp = vol.get("iv_percentile")
+        beta = vol.get("beta")
+        pcr  = vol.get("put_call_ratio")
+        oi   = vol.get("open_interest")
+        lines.append(f"  HV 30d:           {hv:.1f}%"       if hv   is not None else "  HV 30d:           N/A")
+        lines.append(f"  IV:               {iv:.1f}% (P{ivp:.0f})" if iv is not None and ivp is not None else "  IV:               N/A")
+        lines.append(f"  Beta:             {beta:.2f}"       if beta is not None else "  Beta:             N/A")
+        lines.append(f"  Put/Call ratio:   {pcr:.2f}"        if pcr  is not None else "  Put/Call ratio:   N/A")
+        lines.append(f"  Open interest:    {oi:,.0f}"        if oi   is not None else "  Open interest:    N/A")
 
-    hv = vol.get("hv_30d")
-    lines.append(f"  HV 30d:           {hv:.1f}%" if hv is not None else "  HV 30d:           N/A")
+    # ── Earnings ──────────────────────────────────────────────────────────────
+    earn = c.get("earnings", {})
+    if earn:
+        lines.append("OPERATIONAL:")
+        dte = earn.get("days_to_earnings")
+        if dte:
+            lines.append(f"  Earnings:         {dte}d")
+        elif earn.get("is_etf"):
+            lines.append("  Earnings:         ETF")
+        else:
+            lines.append("  Earnings:         N/A")
 
-    iv = vol.get("implied", {}).get("iv")
-    lines.append(f"  IV:               {iv:.1f}%" if iv is not None else "  IV:               N/A")
-
-    pct_iv = vol.get("iv_percentile", {}).get("percentile")
-    lines.append(f"  IV percentile:    P{pct_iv:.0f}" if pct_iv is not None else "  IV percentile:    N/A")
-
-    beta = vol.get("beta")
-    lines.append(f"  Beta:             {beta:.2f}" if beta is not None else "  Beta:             N/A")
-
-    pcr = vol.get("put_call_ratio", {}).get("pcr")
-    lines.append(f"  Put/Call ratio:   {pcr:.2f}" if pcr is not None else "  Put/Call ratio:   N/A")
-
-    oi = vol.get("open_interest", {}).get("oi")
-    lines.append(f"  Open interest:    {oi:,}" if oi is not None else "  Open interest:    N/A")
-
-    # ── Operational ───────────────────────────────────────────────────────────
-    lines.append("OPERATIONAL:")
-
-    earnings = c.get("earnings", {})
-    days = earnings.get("days_to_earnings")
-    is_etf = earnings.get("is_etf", False)
-    if is_etf:
-        lines.append("  Earnings:         ETF — no earnings risk")
-    elif days is not None:
-        lines.append(f"  Earnings:         {days}d away")
-    else:
-        lines.append("  Earnings:         N/A")
-
-    volume = c.get("volume", {})
-    vol_ratio = volume.get("volume_ratio_pct")
-    lines.append(f"  Volume:           {vol_ratio:.0f}% of 20d avg" if vol_ratio is not None else "  Volume:           N/A")
+    # ── Volume ────────────────────────────────────────────────────────────────
+    vol_data = c.get("volume", {})
+    if vol_data:
+        ratio = vol_data.get("volume_ratio_pct", 0)
+        lines.append(f"  Volume:           {ratio:.0f}% of avg" if ratio else "  Volume:           N/A")
 
     # ── Fundamental ───────────────────────────────────────────────────────────
     fund = c.get("fundamental", {})
@@ -207,9 +206,9 @@ def format_criteria_for_ai(c):
         eps_g  = fund.get("eps_growth_pct")
         de     = fund.get("debt_to_equity")
         margin = fund.get("profit_margin_pct")
-        lines.append(f"  PE ratio:         {pe:.1f}" if pe is not None else "  PE ratio:         N/A")
+        lines.append(f"  PE ratio:         {pe:.1f}"    if pe     is not None else "  PE ratio:         N/A")
         lines.append(f"  EPS growth:       {eps_g:+.1f}%" if eps_g is not None else "  EPS growth:       N/A")
-        lines.append(f"  Debt/equity:      {de:.2f}x" if de is not None else "  Debt/equity:      N/A")
+        lines.append(f"  Debt/equity:      {de:.2f}x"   if de     is not None else "  Debt/equity:      N/A")
         lines.append(f"  Profit margin:    {margin:.1f}%" if margin is not None else "  Profit margin:    N/A")
 
     return "\n".join(lines)
@@ -279,7 +278,7 @@ INSTRUCTIONS:
 
 For EACH ticker, provide a brief analysis with:
   STRATEGY: Which strategy fits best given the context?
-    Options: Bull Call Spread / Bear Put Spread / Long Straddle / Cash Secured Put / No trade
+    Options: Bull Call Spread / Bear Put Spread / Long Straddle / Cash Secured Put / Long Call / Long Put / No trade
   SETUP: Specific entry suggestion (strikes, expiration) if applicable
   RISK: Main risk to watch
 
@@ -305,7 +304,7 @@ def get_ai_interpretation(all_criteria, open_positions, market_ctx, context):
         client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
         prompt = build_ai_prompt(all_criteria, open_positions, market_ctx, context)
 
-        print("\n⏳ Getting AI interpretation...")
+        print("\nGetting AI interpretation...")
 
         conversation_history = [{"role": "user", "content": prompt}]
 
@@ -321,7 +320,7 @@ def get_ai_interpretation(all_criteria, open_positions, market_ctx, context):
         return client, conversation_history, ai_text
 
     except Exception as e:
-        return None, [], f"⚠️  AI interpretation unavailable: {e}"
+        return None, [], f"AI interpretation unavailable: {e}"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -329,31 +328,31 @@ def get_ai_interpretation(all_criteria, open_positions, market_ctx, context):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_scan(tickers):
-    timestamp   = datetime.now().strftime("%Y-%m-%d %H:%M")
-    market_ctx  = load_market_context()
+    timestamp  = datetime.now().strftime("%Y-%m-%d %H:%M")
+    market_ctx = load_market_context()
 
-    print(f"\n{'═' * 65}")
+    print(f"\n{'=' * 65}")
     print(f"  SCANNER — {timestamp}")
     print(f"  Tickers: {', '.join(tickers)}")
     if market_ctx:
         print(f"  Context: {market_ctx.get('verdict', 'N/A')} | "
               f"VIX {market_ctx['vix']['current']:.1f} | "
               f"SPY {market_ctx['spy']['trend']}")
-    print(f"{'═' * 65}")
+    print(f"{'=' * 65}")
 
-    all_criteria = {}  # ticker -> raw criteria dict
+    all_criteria = {}
     failed       = []
 
     for ticker in tickers:
-        print(f"\n⏳ {ticker}...", end=" ", flush=True)
+        print(f"\n  {ticker}...", end=" ", flush=True)
         try:
             criteria = get_all_criteria(ticker)
             if criteria is None:
-                print("❌ no data")
+                print("no data")
                 failed.append(ticker)
                 continue
 
-            # Save to DB (still saves scored version for monitor compatibility)
+            # Save to DB (scored version for monitor compatibility)
             from scoring import score_criteria
             scored = score_criteria(criteria)
             if scored:
@@ -361,60 +360,59 @@ def run_scan(tickers):
                 scored["analysis_id"] = analysis_id
 
             all_criteria[ticker] = criteria
-            print(f"✅ ${criteria.get('price', '?'):.2f}")
+            print(f"OK ${criteria.get('price', '?'):.2f}")
 
         except Exception as e:
-            print(f"❌ {e}")
+            print(f"ERROR {e}")
             failed.append(ticker)
 
     if not all_criteria:
-        print("\n❌ No tickers analyzed.")
+        print("\n  No tickers analyzed.")
         return
 
     if failed:
-        print(f"\n⚠️  Failed: {', '.join(failed)}")
+        print(f"\n  Failed: {', '.join(failed)}")
 
-    # AI interpretation
+    # ── AI interpretation ──────────────────────────────────────────────────────
     open_positions = get_open_positions()
     client, conversation_history, ai_text = get_ai_interpretation(
         all_criteria, open_positions, market_ctx, TRADING_CONTEXT
     )
 
-    # Generate HTML report
-    from report_generator import generate_report
+    # ── Build scored_list for report ───────────────────────────────────────────
+    from report_generator import generate_report, is_no_trade
 
-    # Build list with raw criteria for HTML report
     scored_list = []
     for ticker, data in all_criteria.items():
-        tech  = data.get("technical", {})
-        vol   = data.get("volatility", {})
-        earn  = data.get("earnings", {})
-        fund  = data.get("fundamental", {})
-        ma    = tech.get("moving_averages", {})
-        trend = tech.get("trend_25d", {})
-        w52   = tech.get("week_52", {})
-        sr    = tech.get("support_resistance", {})
+        tech   = data.get("technical", {})
+        vol    = data.get("volatility", {})
+        earn   = data.get("earnings", {})
+        fund   = data.get("fundamental", {})
+        ma     = tech.get("moving_averages", {})
+        trend  = tech.get("trend_25d", {})
+        w52    = tech.get("week_52", {})
+        sr     = tech.get("support_resistance", {})
         candle = tech.get("candlestick", {})
 
         criteria_scores = {
-            "trend_25d":          {"label": f"{'BULLISH' if trend.get('is_bullish') else 'BEARISH'} ({trend.get('pct_change', 0):+.1f}%)", "score": 0},
-            "moving_averages":    {"label": f"{'Above both' if ma.get('above_sma50') and ma.get('above_sma200') else 'Above SMA50' if ma.get('above_sma50') else 'Below both'} | SMA50 {ma.get('sma50_direction','N/A')}", "score": 0},
-            "rsi":                {"label": f"{tech.get('rsi', 'N/A'):.1f}" if isinstance(tech.get('rsi'), (int,float)) else "N/A", "score": 0},
-            "week_52":            {"label": f"{w52.get('position_pct', 0):.1f}% ({'near high' if w52.get('near_high') else 'near low' if w52.get('near_low') else 'mid range'})", "score": 0},
-            "support":            {"label": f"{sr.get('support_dist_pct', 'N/A'):.1f}% away" if sr.get('support_dist_pct') is not None else "N/A", "score": 0},
-            "resistance":         {"label": f"{sr.get('resistance_dist_pct', 'N/A'):.1f}% away" if sr.get('resistance_dist_pct') is not None else "N/A", "score": 0},
-            "candlestick":        {"label": f"{candle.get('pattern','N/A')} ({candle.get('signal','N/A')})", "score": 0},
-            "hv_30d":             {"label": f"{vol.get('hv_30d', 'N/A'):.1f}%" if isinstance(vol.get('hv_30d'), (int,float)) else "N/A", "score": 0},
-            "iv":                 {"label": f"{vol.get('implied',{}).get('iv','N/A'):.1f}% (P{vol.get('iv_percentile',{}).get('percentile',0):.0f})" if isinstance(vol.get('implied',{}).get('iv'), (int,float)) else "N/A", "score": 0},
-            "beta":               {"label": f"{vol.get('beta','N/A'):.2f}" if isinstance(vol.get('beta'), (int,float)) else "N/A", "score": 0},
-            "put_call_ratio":     {"label": f"{vol.get('put_call_ratio',{}).get('pcr','N/A'):.2f}" if isinstance(vol.get('put_call_ratio',{}).get('pcr'), (int,float)) else "N/A", "score": 0},
-            "open_interest":      {"label": f"{vol.get('open_interest',{}).get('oi','N/A'):,}" if isinstance(vol.get('open_interest',{}).get('oi'), (int,float)) else "N/A", "score": 0},
-            "earnings":           {"label": f"{earn.get('days_to_earnings','N/A')}d" if earn.get('days_to_earnings') else "ETF" if earn.get('is_etf') else "N/A", "score": 0},
-            "volume":             {"label": f"{data.get('volume',{}).get('volume_ratio_pct',0):.0f}% of avg", "score": 0},
-            "pe":                 {"label": f"{fund.get('pe','N/A'):.1f}" if isinstance(fund.get('pe'), (int,float)) else "N/A", "score": 0},
-            "eps_growth":         {"label": f"{fund.get('eps_growth_pct',0):+.1f}%" if isinstance(fund.get('eps_growth_pct'), (int,float)) else "N/A", "score": 0},
-            "debt_equity":        {"label": f"{fund.get('debt_to_equity',0):.2f}x" if isinstance(fund.get('debt_to_equity'), (int,float)) else "N/A", "score": 0},
-            "profit_margin":      {"label": f"{fund.get('profit_margin_pct',0):.1f}%" if isinstance(fund.get('profit_margin_pct'), (int,float)) else "N/A", "score": 0},
+            "trend_25d":     {"label": f"{'BULLISH' if trend.get('is_bullish') else 'BEARISH'} ({trend.get('pct_change', 0):+.1f}%)", "score": 0},
+            "moving_averages": {"label": f"{'Above both' if ma.get('above_sma50') and ma.get('above_sma200') else 'Above SMA50' if ma.get('above_sma50') else 'Below both'} | SMA50 {ma.get('sma50_direction', 'N/A')}", "score": 0},
+            "rsi":           {"label": f"{tech.get('rsi', 'N/A'):.1f}" if isinstance(tech.get('rsi'), (int, float)) else "N/A", "score": 0},
+            "week_52":       {"label": f"{w52.get('position_pct', 0):.1f}% ({w52.get('tag', '')})", "score": 0},
+            "support":       {"label": f"{sr.get('support_pct', 0):.1f}% away" if sr.get('support_pct') is not None else "N/A", "score": 0},
+            "resistance":    {"label": f"{sr.get('resistance_pct', 0):.1f}% away" if sr.get('resistance_pct') is not None else "N/A", "score": 0},
+            "candlestick":   {"label": f"{candle.get('pattern', 'N/A')} ({candle.get('sentiment', 'N/A')})", "score": 0},
+            "hv_30d":        {"label": f"{vol.get('hv_30d', 0):.1f}%" if isinstance(vol.get('hv_30d'), (int, float)) else "N/A", "score": 0},
+            "iv":            {"label": f"{vol.get('iv', 0):.1f}% (P{vol.get('iv_percentile', 0):.0f})" if isinstance(vol.get('iv'), (int, float)) and isinstance(vol.get('iv_percentile'), (int, float)) else "N/A", "score": 0},
+            "beta":          {"label": f"{vol.get('beta', 0):.2f}" if isinstance(vol.get('beta'), (int, float)) else "N/A", "score": 0},
+            "put_call_ratio": {"label": f"{vol.get('put_call_ratio', 0):.2f}" if isinstance(vol.get('put_call_ratio'), (int, float)) else "N/A", "score": 0},
+            "open_interest": {"label": f"{vol.get('open_interest', 0):,.0f}" if isinstance(vol.get('open_interest'), (int, float)) else "N/A", "score": 0},
+            "earnings":      {"label": f"{earn.get('days_to_earnings', 'N/A')}d" if earn.get('days_to_earnings') else "ETF" if earn.get('is_etf') else "N/A", "score": 0},
+            "volume":        {"label": f"{data.get('volume', {}).get('volume_ratio_pct', 0):.0f}% of avg", "score": 0},
+            "pe":            {"label": f"{fund.get('pe', 'N/A'):.1f}" if isinstance(fund.get('pe'), (int, float)) else "N/A", "score": 0},
+            "eps_growth":    {"label": f"{fund.get('eps_growth_pct', 0):+.1f}%" if isinstance(fund.get('eps_growth_pct'), (int, float)) else "N/A", "score": 0},
+            "debt_equity":   {"label": f"{fund.get('debt_to_equity', 0):.2f}x" if isinstance(fund.get('debt_to_equity'), (int, float)) else "N/A", "score": 0},
+            "profit_margin": {"label": f"{fund.get('profit_margin_pct', 0):.1f}%" if isinstance(fund.get('profit_margin_pct'), (int, float)) else "N/A", "score": 0},
         }
 
         scored_list.append({
@@ -427,14 +425,28 @@ def run_scan(tickers):
             "criteria_scores": criteria_scores,
         })
 
-    report_path = generate_report(scored_list, ai_text, market_context=market_ctx)
+    # ── Filter actionable tickers (not "No trade") for markdown ───────────────
+    actionable_list = [
+        s for s in scored_list
+        if not is_no_trade(ai_text, s["ticker"])
+    ]
+
+    print(f"\n  Actionable: {len(actionable_list)} de {len(scored_list)} tickers")
+
+    # ── Generate reports ───────────────────────────────────────────────────────
+    md_path, html_path = generate_report(
+        all_scored=scored_list,
+        actionable=actionable_list,
+        ai_text=ai_text,
+        market_context=market_ctx
+    )
 
     import webbrowser
-    webbrowser.open(f"file:///{report_path.replace(os.sep, '/')}")
+    webbrowser.open(f"file:///{html_path.replace(os.sep, '/')}")
 
-    # Conversation loop
+    # ── Conversation loop ──────────────────────────────────────────────────────
     if client:
-        print("\n💬 Ask me about the analysis. Type 'exit' to quit.\n")
+        print("\n  Ask me about the analysis. Type 'exit' to quit.\n")
         while True:
             user_input = input("Your question: ").strip()
             if not user_input:
@@ -450,9 +462,11 @@ def run_scan(tickers):
             )
             ai_reply = follow_up.content[0].text
             conversation_history.append({"role": "assistant", "content": ai_reply})
-            print(f"\n🤖 {ai_reply}\n")
+            print(f"\n  {ai_reply}\n")
 
-    print(f"\nScan complete: {len(all_criteria)} analyzed | {len(failed)} failed\n")
+    print(f"\n  Scan complete: {len(all_criteria)} analyzed | {len(failed)} failed")
+    print(f"  Markdown:  {md_path}")
+    print(f"  HTML:      {html_path}\n")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -470,10 +484,10 @@ if __name__ == "__main__":
         ctx = load_market_context()
         if ctx and ctx.get("recommended_tickers"):
             tickers = ctx["recommended_tickers"]
-            print(f"Context mode: {len(tickers)} tickers from priority sectors")
+            print(f"  Context mode: {len(tickers)} tickers from priority sectors")
         else:
-            print("⚠️  market_context.json not found — run market_context.py first")
-            print("    Falling back to default tickers")
+            print("  market_context.json not found — run market_context.py first")
+            print("  Falling back to default tickers")
             tickers = DEFAULT_TICKERS
     elif args.tickers:
         tickers = args.tickers

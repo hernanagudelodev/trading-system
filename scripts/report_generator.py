@@ -1,16 +1,16 @@
 """
 report_generator.py
 ===================
-Generates scanner_report.html from scan results.
+Generates scanner reports from scan results.
 
-Called by scanner.py after each scan. Overwrites the file each time.
-Open scanner_report.html in any browser to view results with full emoji support.
+Outputs TWO files:
+    scanner_report.md   — markdown (token-efficient, for sharing with AI)
+    scanner_report.html — HTML (for browser viewing)
 
-Fixes vs previous version:
-    - Markdown rendered in AI box (###, **, ---)
-    - Market context banner uses structured JSON fields (no raw dict)
-    - Score column hidden when score_max = 0 (no scoring mode)
-    - +0 column removed from criteria rows
+Key changes vs previous version:
+    - Markdown report only includes tickers with actionable strategy (not "No trade")
+    - HTML report still shows all tickers for completeness
+    - Markdown is the primary output — compact, readable, token-efficient
 
 Usage (from scanner.py):
     from report_generator import generate_report
@@ -23,10 +23,11 @@ from datetime import datetime
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# OUTPUT PATH
+# OUTPUT PATHS
 # ══════════════════════════════════════════════════════════════════════════════
 
-REPORT_PATH = os.path.join(os.path.dirname(__file__), "scanner_report.html")
+REPORT_HTML_PATH = os.path.join(os.path.dirname(__file__), "scanner_report.html")
+REPORT_MD_PATH   = os.path.join(os.path.dirname(__file__), "scanner_report.md")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -51,17 +52,47 @@ def verdict_bg(verdict):
 
 def verdict_emoji(verdict):
     return {
-        "VIABLE":       "✅",
-        "CAUTION":      "⚠️",
-        "DO_NOT_TRADE": "❌",
-        "ANALYZED":     "—",
-    }.get(verdict, "—")
+        "VIABLE":       "VIABLE",
+        "CAUTION":      "CAUTION",
+        "DO_NOT_TRADE": "NO TRADE",
+        "ANALYZED":     "ANALYZED",
+    }.get(verdict, "ANALYZED")
+
+
+def is_no_trade(ai_text, ticker):
+    """
+    Detect if AI recommended 'No trade' for a specific ticker.
+    Looks for patterns like 'TICKER - NO TRADE' or 'STRATEGY: No trade'
+    in the AI interpretation text.
+    """
+    if not ai_text:
+        return False
+
+    text_upper = ai_text.upper()
+    ticker_upper = ticker.upper()
+
+    # Common patterns the AI uses
+    patterns = [
+        f"{ticker_upper} - NO TRADE",
+        f"{ticker_upper} — NO TRADE",
+        f"{ticker_upper}: NO TRADE",
+        f"{ticker_upper} - NO",
+        f"NO TRADE\n",
+    ]
+
+    # Check around ticker mention
+    idx = text_upper.find(ticker_upper)
+    if idx >= 0:
+        # Look at the 200 chars after the ticker mention
+        snippet = text_upper[idx:idx+200]
+        if "NO TRADE" in snippet or "NO_TRADE" in snippet:
+            return True
+
+    return False
+
 
 def markdown_to_html(text):
-    """
-    Convert markdown-style text to HTML for the AI box.
-    Handles: ### headers, ## headers, **bold**, --- dividers, bullet lists.
-    """
+    """Convert markdown to HTML for the AI box."""
     if not text:
         return "No AI interpretation available."
 
@@ -69,291 +100,341 @@ def markdown_to_html(text):
     html_lines = []
 
     for line in lines:
-        # H2
         if line.startswith("## "):
             content = line[3:].strip()
             html_lines.append(
                 f'<h2 style="color:#f9fafb;font-size:16px;font-weight:900;'
                 f'margin:20px 0 8px;letter-spacing:-0.5px;">{content}</h2>'
             )
-        # H3
         elif line.startswith("### "):
             content = line[4:].strip()
             html_lines.append(
-                f'<h3 style="color:#e2e8f0;font-size:14px;font-weight:700;'
-                f'margin:16px 0 6px;letter-spacing:0.5px;text-transform:uppercase;'
-                f'color:#94a3b8;">{content}</h3>'
+                f'<h3 style="color:#94a3b8;font-size:14px;font-weight:700;'
+                f'margin:16px 0 6px;letter-spacing:0.5px;text-transform:uppercase;">'
+                f'{content}</h3>'
             )
-        # Horizontal rule
         elif line.strip() == "---":
             html_lines.append(
                 '<hr style="border:none;border-top:1px solid #1e3a5f;margin:16px 0;">'
             )
-        # Bullet list item
         elif line.startswith("- "):
             content = line[2:].strip()
-            # Apply bold inside bullet
-            content = re.sub(r'\*\*(.*?)\*\*', r'<strong style="color:#f9fafb;">\1</strong>', content)
+            content = re.sub(r'\*\*(.*?)\*\*',
+                             r'<strong style="color:#f9fafb;">\1</strong>', content)
             html_lines.append(
                 f'<div style="display:flex;gap:8px;margin:4px 0 4px 8px;">'
-                f'<span style="color:#3b82f6;flex-shrink:0;">›</span>'
+                f'<span style="color:#3b82f6;flex-shrink:0;">></span>'
                 f'<span>{content}</span></div>'
             )
-        # Numbered list item
         elif re.match(r'^\d+\.\s', line):
             content = re.sub(r'^\d+\.\s', '', line)
-            num = re.match(r'^(\d+)\.', line).group(1)
-            content = re.sub(r'\*\*(.*?)\*\*', r'<strong style="color:#f9fafb;">\1</strong>', content)
+            num     = re.match(r'^(\d+)\.', line).group(1)
+            content = re.sub(r'\*\*(.*?)\*\*',
+                             r'<strong style="color:#f9fafb;">\1</strong>', content)
             html_lines.append(
                 f'<div style="display:flex;gap:10px;margin:6px 0 6px 8px;">'
                 f'<span style="color:#3b82f6;font-weight:700;flex-shrink:0;">{num}.</span>'
                 f'<span>{content}</span></div>'
             )
-        # Empty line
         elif line.strip() == "":
             html_lines.append('<div style="height:8px;"></div>')
-        # Normal paragraph
         else:
-            # Apply bold
-            content = re.sub(r'\*\*(.*?)\*\*', r'<strong style="color:#f9fafb;">\1</strong>', line)
+            content = re.sub(r'\*\*(.*?)\*\*',
+                             r'<strong style="color:#f9fafb;">\1</strong>', line)
             html_lines.append(f'<p style="margin:4px 0;">{content}</p>')
 
     return "\n".join(html_lines)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MARKET CONTEXT BANNER
+# MARKDOWN REPORT — token-efficient, only actionable tickers
+# ══════════════════════════════════════════════════════════════════════════════
+
+def generate_markdown_report(actionable, ai_text, market_context=None):
+    """
+    Generate scanner_report.md — compact markdown for sharing with AI.
+
+    Only includes tickers where AI recommended an actionable strategy.
+    No mention of 'No trade' tickers — they are completely excluded.
+    """
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    lines     = []
+
+    # ── Header ────────────────────────────────────────────────────────────────
+    lines.append(f"# Scanner Report — {timestamp}")
+    lines.append("")
+
+    # ── Market Context ────────────────────────────────────────────────────────
+    if market_context:
+        vix     = market_context.get("vix", {})
+        spy     = market_context.get("spy", {})
+        verdict = market_context.get("verdict", "N/A")
+
+        lines.append("## Contexto Macro")
+        lines.append(f"**Verdict:** {verdict}")
+        lines.append(
+            f"**VIX:** {vix.get('current', 'N/A')} "
+            f"({vix.get('level', 'N/A')}, {vix.get('trend', 'N/A')})"
+        )
+        lines.append(
+            f"**SPY:** ${spy.get('price', 'N/A')} | "
+            f"{spy.get('trend', 'N/A')} ({spy.get('pct_25d', 0):+.1f}% 25d)"
+        )
+        priority = ", ".join(market_context.get("priority_sectors", []))
+        if priority:
+            lines.append(f"**Sectores prioritarios:** {priority}")
+        lines.append("")
+
+    # ── AI Interpretation ─────────────────────────────────────────────────────
+    lines.append("## Interpretacion AI")
+    lines.append("")
+    if ai_text:
+        lines.append(ai_text)
+    else:
+        lines.append("_No hay interpretacion AI disponible._")
+    lines.append("")
+
+    # ── Ticker detail — ONLY actionable tickers ───────────────────────────────
+    if actionable:
+        lines.append(f"## Tickers con Oportunidad ({len(actionable)})")
+        lines.append("")
+
+        for s in actionable:
+            ticker = s.get("ticker", "")
+            price  = s.get("price", 0)
+            scores = s.get("criteria_scores", {})
+
+            lines.append(f"### {ticker} — ${price:.2f}")
+            lines.append("")
+
+            technical_keys   = ["trend_25d", "moving_averages", "rsi",
+                                 "week_52", "support", "resistance", "candlestick"]
+            volatility_keys  = ["hv_30d", "iv", "beta",
+                                 "put_call_ratio", "open_interest"]
+            operational_keys = ["earnings", "volume"]
+            fundamental_keys = ["pe", "eps_growth", "debt_equity", "profit_margin"]
+
+            def render_group(title, keys):
+                rows = []
+                for k in keys:
+                    if k in scores:
+                        label = scores[k].get("label", "N/A")
+                        rows.append(f"- **{k}:** {label}")
+                if rows:
+                    return [f"**{title}**"] + rows + [""]
+                return []
+
+            lines += render_group("Technical",   technical_keys)
+            lines += render_group("Volatility",  volatility_keys)
+            lines += render_group("Operational", operational_keys)
+            lines += render_group("Fundamental", fundamental_keys)
+
+    else:
+        lines.append("## Tickers con Oportunidad")
+        lines.append("")
+        lines.append("_No hay tickers con estrategia recomendada hoy._")
+        lines.append("")
+
+    # ── Footer ────────────────────────────────────────────────────────────────
+    lines.append("---")
+    lines.append(f"_Generado {timestamp} · Options Trading System_")
+
+    content = "\n".join(lines)
+
+    with open(REPORT_MD_PATH, "w", encoding="utf-8") as f:
+        f.write(content)
+
+    print(f"Markdown report saved -> {REPORT_MD_PATH}")
+    return REPORT_MD_PATH
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HTML HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def render_context_banner(market_context):
-    """
-    Render macro context banner using structured JSON fields.
-    Never shows raw Python dicts.
-    """
     if not market_context:
         return ""
 
-    verdict = market_context.get("verdict", "")
+    vix     = market_context.get("vix", {})
+    spy     = market_context.get("spy", {})
+    verdict = market_context.get("verdict", "N/A")
     detail  = market_context.get("verdict_detail", "")
 
-    vix = market_context.get("vix", {})
-    spy = market_context.get("spy", {})
+    verdict_colors = {
+        "FAVORABLE":    "#22c55e",
+        "NEUTRAL":      "#f59e0b",
+        "DO_NOT_TRADE": "#ef4444",
+    }
+    color = verdict_colors.get(verdict, "#6b7280")
 
-    vix_current = vix.get("current", "N/A")
-    vix_level   = vix.get("level", "")
-    vix_trend   = vix.get("trend", "")
+    sectors = market_context.get("sectors", [])
+    sector_rows = ""
+    for s in sectors:
+        pri = s.get("priority", "")
+        pri_color = "#22c55e" if pri == "PRIORITY" else \
+                    "#f59e0b" if pri == "ACCEPTABLE" else "#ef4444"
+        sector_rows += (
+            f'<tr><td style="padding:4px 12px;color:#9ca3af;">{s["sector"]}</td>'
+            f'<td style="padding:4px 12px;color:#f9fafb;">{s["win_rate"]:.1f}%</td>'
+            f'<td style="padding:4px 12px;color:{pri_color};font-size:11px;">'
+            f'{pri}</td></tr>'
+        )
 
-    spy_price   = spy.get("price", "N/A")
-    spy_trend   = spy.get("trend", "")
-    spy_pct     = spy.get("pct_25d")
-    spy_sma     = spy.get("sma_status", "")
-
-    v_color = "#22c55e" if "FAVORABLE" in verdict else \
-              "#f59e0b" if "CAUTION"   in verdict else "#ef4444"
-    v_emoji = "🟢" if "FAVORABLE" in verdict else \
-              "🟡" if "CAUTION"   in verdict else "🔴"
-
-    spy_str = f"${spy_price} | {spy_trend}"
-    if spy_pct is not None:
-        spy_str += f" ({spy_pct:+.1f}% 25d)"
-    spy_str += f" | {spy_sma}"
-
-    vix_str = f"{vix_current} ({vix_level}"
-    if vix_trend:
-        vix_str += f", {vix_trend}"
-    vix_str += ")"
-
-    priority = market_context.get("priority_sectors", [])
-    priority_str = " · ".join(priority[:4]) if priority else ""
+    chips = " ".join(
+        f'<span style="background:#1a1a1a;border:1px solid #2a2a2a;'
+        f'border-radius:20px;padding:4px 12px;font-size:12px;color:#9ca3af;">'
+        f'{t}</span>'
+        for t in market_context.get("recommended_tickers", [])[:20]
+    )
 
     return f"""
-        <div style="background:#111;border:1px solid {v_color}44;border-radius:12px;
-                    padding:16px 24px;margin-bottom:24px;">
-            <div style="display:flex;align-items:flex-start;gap:16px;flex-wrap:wrap;">
-                <div style="font-size:28px;line-height:1;">{v_emoji}</div>
-                <div style="flex:1;min-width:200px;">
-                    <div style="color:{v_color};font-weight:900;font-size:16px;
-                                letter-spacing:1px;">{verdict}</div>
-                    <div style="color:#9ca3af;font-size:13px;margin-top:4px;">{detail}</div>
+    <div style="background:#111;border:1px solid {color}33;border-radius:16px;
+                padding:24px;margin-bottom:32px;">
+        <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;">
+            <div style="width:12px;height:12px;border-radius:50%;
+                        background:{color};box-shadow:0 0 8px {color};"></div>
+            <span style="font-size:20px;font-weight:900;color:{color};">{verdict}</span>
+            <span style="color:#6b7280;font-size:13px;">{detail}</span>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr 2fr;gap:16px;
+                    margin-bottom:16px;">
+            <div style="background:#1a1a1a;border-radius:10px;padding:12px 16px;">
+                <div style="font-size:10px;color:#6b7280;letter-spacing:2px;
+                            text-transform:uppercase;margin-bottom:6px;">VIX</div>
+                <div style="font-size:22px;font-weight:900;color:#f9fafb;">
+                    {vix.get('current', 'N/A')}
                 </div>
-                <div style="display:flex;gap:24px;flex-wrap:wrap;">
-                    <div>
-                        <div style="font-size:10px;color:#6b7280;letter-spacing:2px;
-                                    text-transform:uppercase;margin-bottom:2px;">VIX</div>
-                        <div style="font-size:13px;color:#f9fafb;font-family:monospace;">
-                            {vix_str}
-                        </div>
-                    </div>
-                    <div>
-                        <div style="font-size:10px;color:#6b7280;letter-spacing:2px;
-                                    text-transform:uppercase;margin-bottom:2px;">SPY</div>
-                        <div style="font-size:13px;color:#f9fafb;font-family:monospace;">
-                            {spy_str}
-                        </div>
-                    </div>
-                    {f'''<div>
-                        <div style="font-size:10px;color:#6b7280;letter-spacing:2px;
-                                    text-transform:uppercase;margin-bottom:2px;">PRIORITY SECTORS</div>
-                        <div style="font-size:13px;color:#22c55e;font-family:monospace;">
-                            {priority_str}
-                        </div>
-                    </div>''' if priority_str else ""}
+                <div style="font-size:11px;color:#6b7280;margin-top:2px;">
+                    {vix.get('level','')}, {vix.get('trend','')}
                 </div>
             </div>
-        </div>"""
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# TICKER CARD
-# ══════════════════════════════════════════════════════════════════════════════
-
-def render_ticker_card(scored):
-    verdict   = scored.get("verdict", "ANALYZED")
-    color     = verdict_color(verdict)
-    bg        = verdict_bg(verdict)
-    emoji     = verdict_emoji(verdict)
-    score     = scored.get("score", 0)
-    score_max = scored.get("score_max", 0)
-    score_pct = scored.get("score_pct", 0)
-
-    # Hide score bar when not using scoring (score_max == 0)
-    show_score = score_max > 0
-
-    score_html = ""
-    if show_score:
-        pct = score / score_max * 100 if score_max > 0 else 0
-        bar_color = "#22c55e" if pct >= 68 else "#f59e0b" if pct >= 35 else "#ef4444"
-        score_html = f"""
-            <div style="margin-bottom:16px;">
-                <div style="display:flex;justify-content:space-between;margin-bottom:4px;">
-                    <span style="font-size:12px;color:#9ca3af;">Score</span>
-                    <span style="font-size:12px;color:{color};font-weight:700;">
-                        {score}/{score_max} ({score_pct}%)
-                    </span>
+            <div style="background:#1a1a1a;border-radius:10px;padding:12px 16px;">
+                <div style="font-size:10px;color:#6b7280;letter-spacing:2px;
+                            text-transform:uppercase;margin-bottom:6px;">SPY</div>
+                <div style="font-size:22px;font-weight:900;color:#f9fafb;">
+                    ${spy.get('price', 'N/A')}
                 </div>
-                <div style="background:#1e1e1e;border-radius:4px;height:6px;width:100%;">
-                    <div style="background:{bar_color};width:{pct:.1f}%;
-                                height:6px;border-radius:4px;"></div>
+                <div style="font-size:11px;color:#22c55e;margin-top:2px;">
+                    {spy.get('trend','')} ({spy.get('pct_25d',0):+.1f}% 25d)
                 </div>
-            </div>"""
+            </div>
+            <div style="background:#1a1a1a;border-radius:10px;padding:12px 16px;
+                        overflow-y:auto;max-height:120px;">
+                <div style="font-size:10px;color:#6b7280;letter-spacing:2px;
+                            text-transform:uppercase;margin-bottom:6px;">
+                    SECTORS — WIN RATE HISTORY
+                </div>
+                <table style="width:100%;border-collapse:collapse;">
+                    {sector_rows}
+                </table>
+            </div>
+        </div>
+        <div style="font-size:10px;color:#6b7280;letter-spacing:2px;
+                    text-transform:uppercase;margin-bottom:8px;">
+            RECOMMENDED TICKERS — {len(market_context.get('recommended_tickers',[]))} FROM PRIORITY SECTORS
+        </div>
+        <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:20px;">
+            {chips}
+        </div>
+    </div>"""
 
+
+def render_ticker_card(scored, ai_text=""):
+    ticker  = scored.get("ticker", "")
+    price   = scored.get("price", 0)
+    verdict = scored.get("verdict", "ANALYZED")
+    scores  = scored.get("criteria_scores", {})
+
+    color  = verdict_color(verdict)
+    bg     = verdict_bg(verdict)
+    label  = verdict_emoji(verdict)
+
+    # Detect no trade from AI
+    if is_no_trade(ai_text, ticker):
+        color = "#6b7280"
+        label = "NO TRADE"
+
+    # Criteria rows
     categories = {
-        "TECHNICAL":   ["trend_25d", "moving_averages", "rsi", "week_52",
-                        "support", "resistance", "candlestick"],
-        "VOLATILITY":  ["hv_30d", "iv", "beta", "put_call_ratio", "open_interest"],
+        "TECHNICAL":   ["trend_25d", "moving_averages", "rsi",
+                        "week_52", "support", "resistance", "candlestick"],
+        "VOLATILITY":  ["hv_30d", "iv", "beta",
+                        "put_call_ratio", "open_interest"],
         "OPERATIONAL": ["earnings", "volume"],
         "FUNDAMENTAL": ["pe", "eps_growth", "debt_equity", "profit_margin"],
     }
 
     criteria_html = ""
-    criteria_scores = scored.get("criteria_scores", {})
-
     for cat, keys in categories.items():
         rows = ""
-        for key in keys:
-            if key not in criteria_scores:
+        for k in keys:
+            if k not in scores:
                 continue
-            c     = criteria_scores[key]
-            label = c.get("label", "N/A")
-            s     = c.get("score", 0)
-
-            # Color label based on content
-            if "BULLISH" in str(label).upper() or "RISING" in str(label).upper() or "ABOVE" in str(label).upper():
-                label_color = "#22c55e"
-            elif "BEARISH" in str(label).upper() or "FALLING" in str(label).upper() or "BELOW" in str(label).upper():
-                label_color = "#ef4444"
-            else:
-                label_color = "#9ca3af"
-
-            rows += f"""
-                <tr style="border-bottom:1px solid #1e1e1e;">
-                    <td style="padding:5px 8px;color:#6b7280;font-size:11px;
-                               font-family:monospace;white-space:nowrap;">{key}</td>
-                    <td style="padding:5px 8px;color:{label_color};font-size:12px;">
-                        {label}
-                    </td>
-                </tr>"""
-
+            label_val = scores[k].get("label", "N/A")
+            rows += (
+                f'<tr style="border-bottom:1px solid #1a1a1a;">'
+                f'<td style="padding:5px 8px;color:#6b7280;font-size:11px;'
+                f'white-space:nowrap;">{k}</td>'
+                f'<td style="padding:5px 8px;color:#e2e8f0;font-size:12px;">'
+                f'{label_val}</td></tr>'
+            )
         if rows:
-            criteria_html += f"""
-                <div style="margin-bottom:14px;">
-                    <div style="font-size:10px;font-weight:700;letter-spacing:2px;
-                                color:#4b5563;margin-bottom:6px;
-                                text-transform:uppercase;">{cat}</div>
-                    <table style="width:100%;border-collapse:collapse;">{rows}</table>
-                </div>"""
+            criteria_html += (
+                f'<div style="margin-bottom:10px;">'
+                f'<div style="font-size:9px;color:#4b5563;letter-spacing:2px;'
+                f'text-transform:uppercase;padding:4px 8px;">{cat}</div>'
+                f'<table style="width:100%;border-collapse:collapse;">{rows}</table>'
+                f'</div>'
+            )
 
     return f"""
-        <div style="background:#111;border:1px solid {color}22;border-radius:12px;
-                    padding:20px;">
-            <div style="display:flex;justify-content:space-between;
-                        align-items:center;margin-bottom:14px;">
-                <div>
-                    <span style="font-size:26px;font-weight:900;color:#f9fafb;
-                                 letter-spacing:-1px;">{scored['ticker']}</span>
-                    <span style="font-size:14px;color:#6b7280;margin-left:8px;">
-                        ${scored.get('price', 0):.2f}
-                    </span>
-                </div>
-                <div style="background:{bg};border:1px solid {color};
-                            border-radius:6px;padding:4px 12px;">
-                    <span style="color:{color};font-weight:700;font-size:12px;">
-                        {emoji} {verdict}
-                    </span>
-                </div>
+    <div style="background:#111;border:1px solid {color}33;border-radius:12px;
+                padding:20px;">
+        <div style="display:flex;justify-content:space-between;
+                    align-items:center;margin-bottom:14px;">
+            <div>
+                <span style="font-size:26px;font-weight:900;color:#f9fafb;
+                             letter-spacing:-1px;">{ticker}</span>
+                <span style="font-size:14px;color:#6b7280;margin-left:8px;">
+                    ${price:.2f}
+                </span>
             </div>
-            {score_html}
-            {criteria_html}
-        </div>"""
+            <div style="background:{bg};border:1px solid {color};
+                        border-radius:6px;padding:4px 12px;">
+                <span style="color:{color};font-weight:700;font-size:12px;">
+                    {label}
+                </span>
+            </div>
+        </div>
+        {criteria_html}
+    </div>"""
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# SUMMARY TABLE
-# ══════════════════════════════════════════════════════════════════════════════
-
-def render_summary_table(all_scored):
-    # Sort: VIABLE first, then by score descending
-    order = {"VIABLE": 0, "CAUTION": 1, "DO_NOT_TRADE": 2, "ANALYZED": 3}
-    sorted_results = sorted(
-        all_scored,
-        key=lambda x: (order.get(x.get("verdict", "ANALYZED"), 3), -x.get("score", 0))
-    )
-
-    show_score = any(s.get("score_max", 0) > 0 for s in all_scored)
-
-    score_header = '<th style="padding:10px 16px;text-align:left;color:#6b7280;font-size:11px;letter-spacing:2px;">SCORE</th>' if show_score else ""
-
+def render_summary_table(all_scored, ai_text=""):
     rows = ""
-    for s in sorted_results:
+    for s in all_scored:
+        ticker  = s.get("ticker", "")
+        price   = s.get("price", 0)
         verdict = s.get("verdict", "ANALYZED")
         color   = verdict_color(verdict)
-        emoji   = verdict_emoji(verdict)
 
-        score_cell = ""
-        if show_score:
-            score_cell = f"""
-                <td style="padding:10px 16px;">
-                    <span style="color:{color};font-weight:700;">
-                        {s.get('score',0)}/{s.get('score_max',0)}
-                    </span>
-                    <span style="color:#6b7280;font-size:12px;margin-left:4px;">
-                        ({s.get('score_pct',0)}%)
-                    </span>
-                </td>"""
+        tag = "NO TRADE" if is_no_trade(ai_text, ticker) else verdict_emoji(verdict)
+        if is_no_trade(ai_text, ticker):
+            color = "#6b7280"
 
         rows += f"""
             <tr style="border-bottom:1px solid #1e1e1e;"
                 onmouseover="this.style.background='#1a1a1a'"
                 onmouseout="this.style.background='transparent'">
                 <td style="padding:10px 16px;color:#f9fafb;font-weight:700;">
-                    {s.get('ticker','')}
+                    {ticker}
                 </td>
                 <td style="padding:10px 16px;color:#9ca3af;">
-                    ${s.get('price', 0):.2f}
+                    ${price:.2f}
                 </td>
-                {score_cell}
                 <td style="padding:10px 16px;">
-                    <span style="color:{color};">{emoji} {verdict}</span>
+                    <span style="color:{color};">{tag}</span>
                 </td>
             </tr>"""
 
@@ -365,7 +446,6 @@ def render_summary_table(all_scored):
                                font-size:11px;letter-spacing:2px;">TICKER</th>
                     <th style="padding:10px 16px;text-align:left;color:#6b7280;
                                font-size:11px;letter-spacing:2px;">PRICE</th>
-                    {score_header}
                     <th style="padding:10px 16px;text-align:left;color:#6b7280;
                                font-size:11px;letter-spacing:2px;">VERDICT</th>
                 </tr>
@@ -375,33 +455,18 @@ def render_summary_table(all_scored):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MAIN GENERATOR
+# HTML REPORT — full detail, all tickers
 # ══════════════════════════════════════════════════════════════════════════════
 
-def generate_report(all_scored, ai_text="", market_context=None):
-    """
-    Generate scanner_report.html from scan results.
-    Overwrites the file on every call.
-
-    Args:
-        all_scored      (list) — scored ticker dicts from scanner.py
-        ai_text         (str)  — AI interpretation text (markdown supported)
-        market_context  (dict) — structured JSON from market_context.json
-    """
+def generate_html_report(all_scored, ai_text, market_context=None):
+    """Generate scanner_report.html with full detail for all tickers."""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
 
     viable   = sum(1 for s in all_scored if s.get("verdict") == "VIABLE")
     caution  = sum(1 for s in all_scored if s.get("verdict") == "CAUTION")
     no_trade = sum(1 for s in all_scored if s.get("verdict") == "DO_NOT_TRADE")
 
-    # Sort cards: VIABLE first
-    order = {"VIABLE": 0, "CAUTION": 1, "DO_NOT_TRADE": 2, "ANALYZED": 3}
-    sorted_scored = sorted(
-        all_scored,
-        key=lambda x: (order.get(x.get("verdict", "ANALYZED"), 3), -x.get("score", 0))
-    )
-
-    ticker_cards = "\n".join(render_ticker_card(s) for s in sorted_scored)
+    ticker_cards = "\n".join(render_ticker_card(s, ai_text) for s in all_scored)
     ai_html      = markdown_to_html(ai_text)
     ctx_banner   = render_context_banner(market_context)
 
@@ -410,15 +475,13 @@ def generate_report(all_scored, ai_text="", market_context=None):
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Scanner Report — {timestamp}</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;700;900&display=swap" rel="stylesheet">
+    <title>Scanner Report -- {timestamp}</title>
     <style>
         * {{ box-sizing: border-box; margin: 0; padding: 0; }}
         body {{
             background: #0a0a0a;
             color: #f9fafb;
-            font-family: 'DM Sans', sans-serif;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
             min-height: 100vh;
             padding: 32px 24px;
         }}
@@ -464,15 +527,13 @@ def generate_report(all_scored, ai_text="", market_context=None):
 </head>
 <body>
 <div class="container">
-
-    <!-- Header -->
     <div style="margin-bottom:32px;border-bottom:1px solid #1e1e1e;padding-bottom:24px;">
         <div style="display:flex;justify-content:space-between;
                     align-items:flex-end;flex-wrap:wrap;gap:12px;">
             <div>
                 <h1 style="font-size:32px;font-weight:900;
                            letter-spacing:-1.5px;color:#f9fafb;">
-                    📊 Options Scanner
+                    Options Scanner
                 </h1>
                 <p style="color:#6b7280;margin-top:4px;font-size:14px;
                           font-family:monospace;">{timestamp}</p>
@@ -504,24 +565,20 @@ def generate_report(all_scored, ai_text="", market_context=None):
         </div>
     </div>
 
-    <!-- Market context banner -->
     {ctx_banner}
 
-    <!-- Summary table -->
     <div style="margin-bottom:40px;">
         <div class="section-title">Summary</div>
         <div class="summary-box">
-            {render_summary_table(all_scored)}
+            {render_summary_table(all_scored, ai_text)}
         </div>
     </div>
 
-    <!-- AI Interpretation -->
     <div style="margin-bottom:40px;">
-        <div class="section-title">🤖 AI Interpretation</div>
+        <div class="section-title">AI Interpretation</div>
         <div class="ai-box">{ai_html}</div>
     </div>
 
-    <!-- Ticker cards -->
     <div style="margin-bottom:40px;">
         <div class="section-title">Ticker Detail</div>
         <div class="grid-3">
@@ -532,15 +589,42 @@ def generate_report(all_scored, ai_text="", market_context=None):
     <div style="text-align:center;color:#374151;font-size:12px;
                 padding:24px 0;border-top:1px solid #1e1e1e;
                 font-family:monospace;">
-        Generated {timestamp} · Options Trading System · Paper Trading
+        Generated {timestamp} · Options Trading System
     </div>
 
 </div>
 </body>
 </html>"""
 
-    with open(REPORT_PATH, "w", encoding="utf-8") as f:
+    with open(REPORT_HTML_PATH, "w", encoding="utf-8") as f:
         f.write(html)
 
-    print(f"Report saved → {REPORT_PATH}")
-    return REPORT_PATH
+    print(f"HTML report saved  -> {REPORT_HTML_PATH}")
+    return REPORT_HTML_PATH
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN ENTRY POINT — called by scanner.py
+# ══════════════════════════════════════════════════════════════════════════════
+
+def generate_report(all_scored, ai_text="", market_context=None, actionable=None):
+    """
+    Generate both markdown and HTML reports.
+
+    Args:
+        all_scored      (list) — ALL scored ticker dicts (for HTML)
+        ai_text         (str)  — AI interpretation text (markdown)
+        market_context  (dict) — structured JSON from market_context.json
+        actionable      (list) — only tickers with actionable strategy (for markdown)
+                                 if None, uses all_scored filtered by is_no_trade
+
+    Returns:
+        tuple (md_path, html_path)
+    """
+    # If no actionable list provided, filter automatically
+    if actionable is None:
+        actionable = [s for s in all_scored if not is_no_trade(ai_text, s.get("ticker", ""))]
+
+    md_path   = generate_markdown_report(actionable, ai_text, market_context)
+    html_path = generate_html_report(all_scored, ai_text, market_context)
+    return md_path, html_path
