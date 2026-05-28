@@ -32,6 +32,7 @@ import sys
 import json
 import argparse
 from datetime import datetime
+import traceback
 
 import anthropic
 from dotenv import load_dotenv
@@ -168,17 +169,17 @@ def format_criteria_for_ai(c):
     vol = c.get("volatility", {})
     if vol:
         lines.append("VOLATILITY:")
-        hv  = vol.get("hv_30d")
-        iv  = vol.get("iv")
-        ivp = vol.get("iv_percentile")
+        hv   = vol.get("hv_30d")
+        iv   = vol.get("implied", {}).get("iv")
+        ivp  = vol.get("iv_percentile", {}).get("percentile") if isinstance(vol.get("iv_percentile"), dict) else vol.get("iv_percentile")
         beta = vol.get("beta")
-        pcr  = vol.get("put_call_ratio")
-        oi   = vol.get("open_interest")
-        lines.append(f"  HV 30d:           {hv:.1f}%"       if hv   is not None else "  HV 30d:           N/A")
-        lines.append(f"  IV:               {iv:.1f}% (P{ivp:.0f})" if iv is not None and ivp is not None else "  IV:               N/A")
-        lines.append(f"  Beta:             {beta:.2f}"       if beta is not None else "  Beta:             N/A")
-        lines.append(f"  Put/Call ratio:   {pcr:.2f}"        if pcr  is not None else "  Put/Call ratio:   N/A")
-        lines.append(f"  Open interest:    {oi:,.0f}"        if oi   is not None else "  Open interest:    N/A")
+        pcr  = vol.get("put_call_ratio", {}).get("pcr") if isinstance(vol.get("put_call_ratio"), dict) else vol.get("put_call_ratio")
+        oi   = vol.get("open_interest", {}).get("oi") if isinstance(vol.get("open_interest"), dict) else vol.get("open_interest")
+        lines.append(f"  HV 30d:           {hv:.1f}%"              if isinstance(hv,   (int, float)) else "  HV 30d:           N/A")
+        lines.append(f"  IV:               {iv:.1f}% (P{ivp:.0f})" if isinstance(iv,   (int, float)) and isinstance(ivp, (int, float)) else "  IV:               N/A")
+        lines.append(f"  Beta:             {beta:.2f}"              if isinstance(beta, (int, float)) else "  Beta:             N/A")
+        lines.append(f"  Put/Call ratio:   {pcr:.2f}"               if isinstance(pcr,  (int, float)) else "  Put/Call ratio:   N/A")
+        lines.append(f"  Open interest:    {oi:,.0f}"               if isinstance(oi,   (int, float)) else "  Open interest:    N/A")
 
     # ── Earnings ──────────────────────────────────────────────────────────────
     earn = c.get("earnings", {})
@@ -364,6 +365,7 @@ def run_scan(tickers):
 
         except Exception as e:
             print(f"ERROR {e}")
+            traceback.print_exc()
             failed.append(ticker)
 
     if not all_criteria:
@@ -394,22 +396,27 @@ def run_scan(tickers):
         sr     = tech.get("support_resistance", {})
         candle = tech.get("candlestick", {})
 
+        iv_val  = vol.get("implied", {}).get("iv") if isinstance(vol.get("implied"), dict) else None
+        ivp_val = vol.get("iv_percentile", {}).get("percentile") if isinstance(vol.get("iv_percentile"), dict) else vol.get("iv_percentile")
+        pcr_val = vol.get("put_call_ratio", {}).get("pcr") if isinstance(vol.get("put_call_ratio"), dict) else vol.get("put_call_ratio")
+        oi_val  = vol.get("open_interest", {}).get("oi") if isinstance(vol.get("open_interest"), dict) else vol.get("open_interest")
+
         criteria_scores = {
             "trend_25d":     {"label": f"{'BULLISH' if trend.get('is_bullish') else 'BEARISH'} ({trend.get('pct_change', 0):+.1f}%)", "score": 0},
             "moving_averages": {"label": f"{'Above both' if ma.get('above_sma50') and ma.get('above_sma200') else 'Above SMA50' if ma.get('above_sma50') else 'Below both'} | SMA50 {ma.get('sma50_direction', 'N/A')}", "score": 0},
-            "rsi":           {"label": f"{tech.get('rsi', 'N/A'):.1f}" if isinstance(tech.get('rsi'), (int, float)) else "N/A", "score": 0},
+            "rsi":           {"label": f"{tech.get('rsi', 0):.1f}" if isinstance(tech.get('rsi'), (int, float)) else "N/A", "score": 0},
             "week_52":       {"label": f"{w52.get('position_pct', 0):.1f}% ({w52.get('tag', '')})", "score": 0},
             "support":       {"label": f"{sr.get('support_pct', 0):.1f}% away" if sr.get('support_pct') is not None else "N/A", "score": 0},
             "resistance":    {"label": f"{sr.get('resistance_pct', 0):.1f}% away" if sr.get('resistance_pct') is not None else "N/A", "score": 0},
             "candlestick":   {"label": f"{candle.get('pattern', 'N/A')} ({candle.get('sentiment', 'N/A')})", "score": 0},
             "hv_30d":        {"label": f"{vol.get('hv_30d', 0):.1f}%" if isinstance(vol.get('hv_30d'), (int, float)) else "N/A", "score": 0},
-            "iv":            {"label": f"{vol.get('iv', 0):.1f}% (P{vol.get('iv_percentile', 0):.0f})" if isinstance(vol.get('iv'), (int, float)) and isinstance(vol.get('iv_percentile'), (int, float)) else "N/A", "score": 0},
+            "iv":            {"label": f"{iv_val:.1f}% (P{ivp_val:.0f})" if isinstance(iv_val, (int, float)) and isinstance(ivp_val, (int, float)) else "N/A", "score": 0},
             "beta":          {"label": f"{vol.get('beta', 0):.2f}" if isinstance(vol.get('beta'), (int, float)) else "N/A", "score": 0},
-            "put_call_ratio": {"label": f"{vol.get('put_call_ratio', 0):.2f}" if isinstance(vol.get('put_call_ratio'), (int, float)) else "N/A", "score": 0},
-            "open_interest": {"label": f"{vol.get('open_interest', 0):,.0f}" if isinstance(vol.get('open_interest'), (int, float)) else "N/A", "score": 0},
+            "put_call_ratio": {"label": f"{pcr_val:.2f}" if isinstance(pcr_val, (int, float)) else "N/A", "score": 0},
+            "open_interest": {"label": f"{oi_val:,.0f}" if isinstance(oi_val, (int, float)) else "N/A", "score": 0},
             "earnings":      {"label": f"{earn.get('days_to_earnings', 'N/A')}d" if earn.get('days_to_earnings') else "ETF" if earn.get('is_etf') else "N/A", "score": 0},
             "volume":        {"label": f"{data.get('volume', {}).get('volume_ratio_pct', 0):.0f}% of avg", "score": 0},
-            "pe":            {"label": f"{fund.get('pe', 'N/A'):.1f}" if isinstance(fund.get('pe'), (int, float)) else "N/A", "score": 0},
+            "pe":            {"label": f"{fund.get('pe', 0):.1f}" if isinstance(fund.get('pe'), (int, float)) else "N/A", "score": 0},
             "eps_growth":    {"label": f"{fund.get('eps_growth_pct', 0):+.1f}%" if isinstance(fund.get('eps_growth_pct'), (int, float)) else "N/A", "score": 0},
             "debt_equity":   {"label": f"{fund.get('debt_to_equity', 0):.2f}x" if isinstance(fund.get('debt_to_equity'), (int, float)) else "N/A", "score": 0},
             "profit_margin": {"label": f"{fund.get('profit_margin_pct', 0):.1f}%" if isinstance(fund.get('profit_margin_pct'), (int, float)) else "N/A", "score": 0},
