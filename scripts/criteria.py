@@ -602,7 +602,7 @@ def passes_hard_filters(criteria):
         oi = oi_data.get("oi")
     else:
         oi = oi_data
-    if oi is not None and oi < 500:
+    if oi is not None and oi < 200:
         reasons.append(f"Low open interest ({oi:,})")
 
     passed = len(reasons) == 0

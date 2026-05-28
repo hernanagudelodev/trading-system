@@ -1,7 +1,7 @@
 """
 scoring.py
 ==========
-Scoring and qualification module for Bull Call Spread analysis system.
+Scoring and qualification module for options trading system.
 
 This file receives raw criteria data from criteria.py and applies
 scoring rules to produce a verdict for each ticker.
@@ -13,69 +13,58 @@ IMPORTANT: This is the ONLY file that should be modified when:
     - Incorporating audit feedback to improve the system
 
 Raw data comes from:    criteria.py
-History management:     history.py
 Audit logic:            audit.py
-Orchestration:          main.py
+
+NOTE: criteria.py now uses Tastytrade API for volatility data.
+      iv_percentile, put_call_ratio, open_interest arrive as
+      direct floats/ints — not dicts. score_criteria handles both.
 """
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SCORING CONSTANTS — edit these to tune the system
 # ══════════════════════════════════════════════════════════════════════════════
-# Each constant defines how many points a criterion adds or subtracts.
-# Positive = bullish signal, Negative = bearish/risky signal.
-# Zero = neutral, does not affect score.
-#
-# SCORE_MAX must equal the sum of all maximum positive scores.
-# Update it whenever you add or change a criterion's max score.
-# ══════════════════════════════════════════════════════════════════════════════
 
 # ── Verdict thresholds (as % of SCORE_MAX) ───────────────────────────────────
-THRESHOLD_VIABLE      = 0.55   # bajado de 0.68 — sistema era muy conservador
-THRESHOLD_CAUTION     = 0.35   # sin cambio
+THRESHOLD_VIABLE      = 0.55
+THRESHOLD_CAUTION     = 0.35
 
 # ── Maximum possible score (sum of all max positive scores) ──────────────────
-SCORE_MAX = 21  # reducido por eliminación y reducción de pesos
+SCORE_MAX = 21
 
 # ── Trend 25d (max +1) ───────────────────────────────────────────────────────
 SCORE_TREND_BULLISH   =  1
 SCORE_TREND_BEARISH   = -1
 
 # ── Moving Averages — SMA50/200 position (max +1) ────────────────────────────
-# Reducido — baja predictividad (+2.2% diff bullish vs bearish)
-SCORE_SMA_ABOVE_BOTH  =  1    # antes +2
+SCORE_SMA_ABOVE_BOTH  =  1
 SCORE_SMA_ABOVE_50    =  1
-SCORE_SMA_BELOW_BOTH  = -1    # antes -2
+SCORE_SMA_BELOW_BOTH  = -1
 
 # ── SMA50 Direction (max +1) ─────────────────────────────────────────────────
-# Baja predictividad (+4.1% diff) — mantenemos pero sin cambio
 SCORE_SMA50_RISING    =  1
 SCORE_SMA50_FLAT      =  0
 SCORE_SMA50_FALLING   = -1
 
 # ── RSI (max +1) ─────────────────────────────────────────────────────────────
-# Sobrecomprado tiene 66% win rate — no penalizar
-# RSI neutral solo +1 (antes +2)
 RSI_OVERBOUGHT        = 70
 RSI_OVERSOLD          = 30
 RSI_NEUTRAL_LOW       = 40
 RSI_NEUTRAL_HIGH      = 60
 
-SCORE_RSI_NEUTRAL     =  1    # antes +2
-SCORE_RSI_CAUTION     =  0    # antes +1
-SCORE_RSI_EXTREME     =  0    # antes -1 — sobrecomprado sigue subiendo
+SCORE_RSI_NEUTRAL     =  1
+SCORE_RSI_CAUTION     =  0
+SCORE_RSI_EXTREME     =  0
 
 # ── Historical Volatility (max +1) ───────────────────────────────────────────
-# Baja predictividad (-0.5% diff) — reducimos peso
 HV_LOW_THRESHOLD      = 20
 HV_HIGH_THRESHOLD     = 35
 
-SCORE_HV_LOW          =  1    # antes +2
+SCORE_HV_LOW          =  1
 SCORE_HV_NORMAL       =  1
-SCORE_HV_HIGH         =  0    # antes -1
+SCORE_HV_HIGH         =  0
 
 # ── IV vs HV (max +2) ────────────────────────────────────────────────────────
-# Sin cambio — siempre positivo, no hay bearish signals para comparar
 IV_NORMAL_THRESHOLD   = 1.3
 
 SCORE_IV_CHEAP        =  2
@@ -83,7 +72,6 @@ SCORE_IV_NORMAL       =  1
 SCORE_IV_EXPENSIVE    = -1
 
 # ── IV Percentile (max +2) ───────────────────────────────────────────────────
-# Más predictivo (+10.1% diff) — mantenemos pesos
 IV_PCT_CHEAP          = 25
 IV_PCT_NORMAL_LOW     = 50
 IV_PCT_NORMAL_HIGH    = 75
@@ -94,59 +82,52 @@ SCORE_IVP_NORMAL_HIGH =  0
 SCORE_IVP_EXPENSIVE   = -1
 
 # ── Beta (max +0) ────────────────────────────────────────────────────────────
-# Beta alta tiene mejor win rate (66%) — no penalizar
 BETA_HIGH_THRESHOLD   = 1.5
 BETA_LOW_THRESHOLD    = 0.8
 
-SCORE_BETA_NORMAL     =  0    # antes +1
+SCORE_BETA_NORMAL     =  0
 SCORE_BETA_LOW        =  0
-SCORE_BETA_HIGH       =  0    # antes -1
+SCORE_BETA_HIGH       =  0
 
 # ── Put/Call Ratio (max +0) ──────────────────────────────────────────────────
-# Eliminado del score — no disponible históricamente, siempre 0
 PCR_FEAR_THRESHOLD    = 1.3
 PCR_NEUTRAL_LOW       = 0.7
 PCR_OPTIMISM          = 0.5
 
-SCORE_PCR_FEAR        =  0    # antes +1
-SCORE_PCR_NEUTRAL     =  0    # antes +1
+SCORE_PCR_FEAR        =  0
+SCORE_PCR_NEUTRAL     =  0
 SCORE_PCR_OPTIMISM    =  0
-SCORE_PCR_EUPHORIA    =  0    # antes -1
+SCORE_PCR_EUPHORIA    =  0
 
 # ── Open Interest (max +0) ───────────────────────────────────────────────────
-# Eliminado del score — no disponible históricamente, siempre 0
 OI_HIGH_THRESHOLD     = 10000
 OI_LOW_THRESHOLD      = 1000
 
-SCORE_OI_HIGH         =  0    # antes +1
+SCORE_OI_HIGH         =  0
 SCORE_OI_NORMAL       =  0
-SCORE_OI_LOW          =  0    # antes -1
+SCORE_OI_LOW          =  0
 
 # ── 52-Week Position (max +1) ────────────────────────────────────────────────
-# Cerca del máximo no penaliza — win rate similar en ambos casos
 SCORE_52W_NEAR_LOW    =  1
 SCORE_52W_MID         =  1
-SCORE_52W_NEAR_HIGH   =  0    # antes -1
+SCORE_52W_NEAR_HIGH   =  0
 
 # ── Support / Resistance (max +2) ────────────────────────────────────────────
-# Cuando es bearish tiene 63.2% win rate — reducimos penalización
 SR_NEAR_THRESHOLD_PCT = 3.0
 
 SCORE_SR_NEAR_SUPPORT     =  2
 SCORE_SR_MIDDLE           =  1
-SCORE_SR_NEAR_RESISTANCE  =  0    # antes -1
+SCORE_SR_NEAR_RESISTANCE  =  0
 SCORE_SR_NO_DATA          =  0
 
 # ── Candlestick Pattern (max +1) ─────────────────────────────────────────────
-# Baja predictividad (-2.5% diff) — reducimos pesos
-SCORE_CANDLE_STRONG_BULLISH =  1   # antes +2
+SCORE_CANDLE_STRONG_BULLISH =  1
 SCORE_CANDLE_WEAK_BULLISH   =  1
 SCORE_CANDLE_NEUTRAL        =  0
-SCORE_CANDLE_WEAK_BEARISH   =  0   # antes -1
-SCORE_CANDLE_STRONG_BEARISH = -1   # antes -2
+SCORE_CANDLE_WEAK_BEARISH   =  0
+SCORE_CANDLE_STRONG_BEARISH = -1
 
 # ── Earnings (max +1) ────────────────────────────────────────────────────────
-# Sin cambio — tiene lógica clara
 EARNINGS_SAFE_DAYS    = 35
 EARNINGS_CAUTION_DAYS = 20
 
@@ -155,27 +136,24 @@ SCORE_EARNINGS_CAUTION=  0
 SCORE_EARNINGS_DANGER = -2
 
 # ── Volume (max +1) ──────────────────────────────────────────────────────────
-# Baja predictividad (+0.5% diff) — eliminamos penalización
 VOLUME_HIGH_PCT       = 150
 VOLUME_LOW_PCT        = 80
 
 SCORE_VOLUME_NORMAL   =  1
 SCORE_VOLUME_HIGH     =  0
-SCORE_VOLUME_LOW      =  0    # antes -1
+SCORE_VOLUME_LOW      =  0
 
 # ── P/E Ratio (max +1) ───────────────────────────────────────────────────────
-# Baja predictividad (+1.4% diff) — reducimos peso máximo
 PE_CHEAP_THRESHOLD    = 15
 PE_NORMAL_THRESHOLD   = 25
 PE_EXPENSIVE_THRESHOLD= 40
 
-SCORE_PE_CHEAP        =  1    # antes +2
+SCORE_PE_CHEAP        =  1
 SCORE_PE_NORMAL       =  1
 SCORE_PE_EXPENSIVE    =  0
-SCORE_PE_VERY_EXP     =  0    # antes -1
+SCORE_PE_VERY_EXP     =  0
 
 # ── EPS Growth (max +2) ──────────────────────────────────────────────────────
-# Sin cambio — siempre positivo, señal fuerte
 EPS_STRONG_GROWTH     = 15
 EPS_MILD_DECLINE      = -10
 
@@ -185,16 +163,14 @@ SCORE_EPS_DECLINING   = -1
 SCORE_EPS_DETERIORATING= -2
 
 # ── Debt to Equity (max +0) ──────────────────────────────────────────────────
-# Baja predictividad (+2.5% diff) — eliminamos del score
 DE_LOW_THRESHOLD      = 1.0
 DE_HIGH_THRESHOLD     = 2.0
 
-SCORE_DE_LOW          =  0    # antes +1
+SCORE_DE_LOW          =  0
 SCORE_DE_MODERATE     =  0
-SCORE_DE_HIGH         =  0    # antes -1
+SCORE_DE_HIGH         =  0
 
 # ── Profit Margin (max +2) ───────────────────────────────────────────────────
-# Sin cambio — siempre positivo, señal fuerte
 MARGIN_HIGH_THRESHOLD = 20
 MARGIN_LOW_THRESHOLD  = 10
 
@@ -203,10 +179,10 @@ SCORE_MARGIN_NORMAL   =  1
 SCORE_MARGIN_LOW      =  0
 SCORE_MARGIN_NEGATIVE = -2
 
+
 # ══════════════════════════════════════════════════════════════════════════════
 # INDIVIDUAL CRITERION SCORERS
-# Each function receives the relevant slice of criteria data
-# and returns (score: int, label: str)
+# Each returns (score: int, label: str)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def score_trend(trend_data):
@@ -218,7 +194,6 @@ def score_trend(trend_data):
 def score_moving_averages(ma_data):
     above_50  = ma_data.get("above_sma50", False)
     above_200 = ma_data.get("above_sma200", False)
-
     if above_50 and above_200:
         return SCORE_SMA_ABOVE_BOTH, "ABOVE BOTH"
     elif above_50:
@@ -267,8 +242,14 @@ def score_iv_vs_hv(iv_value, hv_value):
     return SCORE_IV_EXPENSIVE, f"EXPENSIVE ({iv_value:.1f}% vs HV {hv_value:.1f}%)"
 
 
-def score_iv_percentile(pct_data):
-    pct = pct_data.get("percentile")
+def score_iv_percentile(pct):
+    """
+    Accepts either:
+        - float/int directly (new format from Tastytrade API)
+        - dict {"percentile": float} (legacy format)
+    """
+    if isinstance(pct, dict):
+        pct = pct.get("percentile")
     if pct is None:
         return 0, "NO DATA"
     if pct <= IV_PCT_CHEAP:
@@ -290,8 +271,14 @@ def score_beta(beta_value):
     return SCORE_BETA_LOW, f"LOW ({beta_value:.1f})"
 
 
-def score_put_call_ratio(pcr_data):
-    pcr = pcr_data.get("pcr")
+def score_put_call_ratio(pcr):
+    """
+    Accepts either:
+        - float/int directly (new format from Tastytrade API)
+        - dict {"pcr": float} (legacy format)
+    """
+    if isinstance(pcr, dict):
+        pcr = pcr.get("pcr")
     if pcr is None:
         return 0, "NO DATA"
     if pcr > PCR_FEAR_THRESHOLD:
@@ -303,8 +290,14 @@ def score_put_call_ratio(pcr_data):
     return SCORE_PCR_EUPHORIA, f"EUPHORIA ({pcr:.2f})"
 
 
-def score_open_interest(oi_data):
-    oi = oi_data.get("oi")
+def score_open_interest(oi):
+    """
+    Accepts either:
+        - int/float directly (new format from Tastytrade API)
+        - dict {"oi": int} (legacy format)
+    """
+    if isinstance(oi, dict):
+        oi = oi.get("oi")
     if oi is None:
         return 0, "NO DATA"
     if oi > OI_HIGH_THRESHOLD:
@@ -315,125 +308,126 @@ def score_open_interest(oi_data):
 
 
 def score_52_week(week52_data):
-    if week52_data.get("near_high"):
-        pct = week52_data.get("position_pct", 0)
-        return SCORE_52W_NEAR_HIGH, f"NEAR HIGH ({pct:.0f}%)"
-    elif week52_data.get("near_low"):
-        pct = week52_data.get("position_pct", 0)
-        return SCORE_52W_NEAR_LOW, f"NEAR LOW ({pct:.0f}%)"
-    pct = week52_data.get("position_pct", 0)
-    return SCORE_52W_MID, f"MID RANGE ({pct:.0f}%)"
+    if not week52_data:
+        return 0, "NO DATA"
+    near_high = week52_data.get("near_high", False)
+    near_low  = week52_data.get("near_low",  False)
+    pos       = week52_data.get("position_pct", 50)
+    if near_low:
+        return SCORE_52W_NEAR_LOW, f"NEAR LOW ({pos:.0f}%)"
+    elif near_high:
+        return SCORE_52W_NEAR_HIGH, f"NEAR HIGH ({pos:.0f}%)"
+    return SCORE_52W_MID, f"MID RANGE ({pos:.0f}%)"
 
 
 def score_support_resistance(sr_data):
-    sup_dist = sr_data.get("support_dist_pct")
-    res_dist = sr_data.get("resistance_dist_pct")
-
-    if sup_dist is None and res_dist is None:
+    if not sr_data:
         return SCORE_SR_NO_DATA, "NO DATA"
-
-    if sup_dist is not None and sup_dist <= SR_NEAR_THRESHOLD_PCT:
-        return SCORE_SR_NEAR_SUPPORT, f"NEAR SUPPORT ({sup_dist:.1f}%)"
-
-    if res_dist is not None and res_dist <= SR_NEAR_THRESHOLD_PCT:
-        return SCORE_SR_NEAR_RESISTANCE, f"NEAR RESISTANCE ({res_dist:.1f}%)"
-
-    parts = []
-    if sup_dist is not None:
-        parts.append(f"S:{sup_dist:.1f}%")
-    if res_dist is not None:
-        parts.append(f"R:{res_dist:.1f}%")
-    return SCORE_SR_MIDDLE, " ".join(parts)
+    sup_pct = sr_data.get("support_pct")
+    res_pct = sr_data.get("resistance_pct")
+    if sup_pct is None and res_pct is None:
+        return SCORE_SR_NO_DATA, "NO DATA"
+    if sup_pct is not None and sup_pct <= SR_NEAR_THRESHOLD_PCT:
+        return SCORE_SR_NEAR_SUPPORT, f"NEAR SUPPORT ({sup_pct:.1f}% away)"
+    if res_pct is not None and res_pct <= SR_NEAR_THRESHOLD_PCT:
+        return SCORE_SR_NEAR_RESISTANCE, f"NEAR RESISTANCE ({res_pct:.1f}% away)"
+    return SCORE_SR_MIDDLE, "MIDDLE RANGE"
 
 
 def score_candlestick(candle_data):
-    pattern = candle_data.get("pattern", "")
-    signal  = candle_data.get("signal", "NEUTRAL")
-
-    strong_bullish = {"MORNING STAR", "BULLISH ENGULFING", "MARUBOZU GREEN"}
-    strong_bearish = {"EVENING STAR", "BEARISH ENGULFING", "MARUBOZU RED"}
-    weak_bullish   = {"HAMMER", "GREEN CANDLE"}
-    weak_bearish   = {"SHOOTING STAR", "RED CANDLE"}
-
-    if pattern in strong_bullish:
-        return SCORE_CANDLE_STRONG_BULLISH, f"{pattern} ✅"
-    elif pattern in strong_bearish:
-        return SCORE_CANDLE_STRONG_BEARISH, f"{pattern} ⚠️"
-    elif pattern in weak_bullish:
-        return SCORE_CANDLE_WEAK_BULLISH, f"{pattern}"
-    elif pattern in weak_bearish:
-        return SCORE_CANDLE_WEAK_BEARISH, f"{pattern}"
-    return SCORE_CANDLE_NEUTRAL, f"{pattern}"
+    if not candle_data:
+        return 0, "NO DATA"
+    signal = candle_data.get("signal", "NEUTRAL")
+    pattern = candle_data.get("pattern", "UNKNOWN")
+    if signal == "BULLISH":
+        candles = candle_data.get("candles", 1)
+        if candles >= 2:
+            return SCORE_CANDLE_STRONG_BULLISH, f"{pattern} (STRONG BULLISH)"
+        return SCORE_CANDLE_WEAK_BULLISH, f"{pattern} (BULLISH)"
+    elif signal == "BEARISH":
+        candles = candle_data.get("candles", 1)
+        if candles >= 2:
+            return SCORE_CANDLE_STRONG_BEARISH, f"{pattern} (STRONG BEARISH)"
+        return SCORE_CANDLE_WEAK_BEARISH, f"{pattern} (BEARISH)"
+    return SCORE_CANDLE_NEUTRAL, f"{pattern} (NEUTRAL)"
 
 
-def score_earnings(earnings_data):
-    is_etf = earnings_data.get("is_etf", False)
-    days   = earnings_data.get("days_to_earnings")
-
-    if is_etf:
-        return 0, "ETF"
+def score_earnings(earn_data):
+    if not earn_data:
+        return 0, "NO DATA"
+    if earn_data.get("is_etf"):
+        return SCORE_EARNINGS_SAFE, "ETF (no earnings)"
+    days = earn_data.get("days_to_earnings")
     if days is None:
         return 0, "NO DATA"
-    if days > EARNINGS_SAFE_DAYS:
-        return SCORE_EARNINGS_SAFE, f"{days}d"
+    if days >= EARNINGS_SAFE_DAYS:
+        return SCORE_EARNINGS_SAFE, f"SAFE ({days}d away)"
     elif days >= EARNINGS_CAUTION_DAYS:
-        return SCORE_EARNINGS_CAUTION, f"{days}d CAUTION"
-    return SCORE_EARNINGS_DANGER, f"{days}d DANGER"
+        return SCORE_EARNINGS_CAUTION, f"CAUTION ({days}d away)"
+    return SCORE_EARNINGS_DANGER, f"DANGER ({days}d away)"
 
 
-def score_volume(volume_data):
-    ratio = volume_data.get("volume_ratio_pct", 0)
-    if ratio > VOLUME_HIGH_PCT:
-        return SCORE_VOLUME_HIGH, f"HIGH ({ratio:.0f}%)"
+def score_volume(vol_data):
+    if not vol_data:
+        return 0, "NO DATA"
+    ratio = vol_data.get("volume_ratio_pct", 0)
+    if ratio >= VOLUME_HIGH_PCT:
+        return SCORE_VOLUME_HIGH, f"HIGH ({ratio:.0f}% of avg)"
     elif ratio >= VOLUME_LOW_PCT:
-        return SCORE_VOLUME_NORMAL, f"NORMAL ({ratio:.0f}%)"
-    return SCORE_VOLUME_LOW, f"LOW ({ratio:.0f}%)"
+        return SCORE_VOLUME_NORMAL, f"NORMAL ({ratio:.0f}% of avg)"
+    return SCORE_VOLUME_LOW, f"LOW ({ratio:.0f}% of avg)"
 
 
 def score_pe(fund_data):
+    if not fund_data:
+        return 0, "NO DATA"
     pe = fund_data.get("pe")
     if pe is None:
         return 0, "NO DATA"
-    if pe < 0:
-        return SCORE_PE_VERY_EXP, f"NEGATIVE ({pe:.1f})"
-    elif pe < PE_CHEAP_THRESHOLD:
-        return SCORE_PE_CHEAP, f"CHEAP ({pe:.1f})"
+    if pe <= PE_CHEAP_THRESHOLD:
+        return SCORE_PE_CHEAP, f"CHEAP ({pe:.1f}x)"
     elif pe <= PE_NORMAL_THRESHOLD:
-        return SCORE_PE_NORMAL, f"NORMAL ({pe:.1f})"
+        return SCORE_PE_NORMAL, f"NORMAL ({pe:.1f}x)"
     elif pe <= PE_EXPENSIVE_THRESHOLD:
-        return SCORE_PE_EXPENSIVE, f"EXPENSIVE ({pe:.1f})"
-    return SCORE_PE_VERY_EXP, f"VERY EXP ({pe:.1f})"
+        return SCORE_PE_EXPENSIVE, f"EXPENSIVE ({pe:.1f}x)"
+    return SCORE_PE_VERY_EXP, f"VERY EXPENSIVE ({pe:.1f}x)"
 
 
 def score_eps_growth(fund_data):
+    if not fund_data:
+        return 0, "NO DATA"
     growth = fund_data.get("eps_growth_pct")
     if growth is None:
         return 0, "NO DATA"
-    if growth > EPS_STRONG_GROWTH:
-        return SCORE_EPS_STRONG, f"GROWING ({growth:.1f}%)"
-    elif growth > 0:
-        return SCORE_EPS_STABLE, f"STABLE ({growth:.1f}%)"
-    elif growth > EPS_MILD_DECLINE:
-        return SCORE_EPS_DECLINING, f"DECLINING ({growth:.1f}%)"
-    return SCORE_EPS_DETERIORATING, f"DETERIORATING ({growth:.1f}%)"
+    if growth >= EPS_STRONG_GROWTH:
+        return SCORE_EPS_STRONG, f"STRONG GROWTH ({growth:+.1f}%)"
+    elif growth >= 0:
+        return SCORE_EPS_STABLE, f"STABLE ({growth:+.1f}%)"
+    elif growth >= EPS_MILD_DECLINE:
+        return SCORE_EPS_DECLINING, f"DECLINING ({growth:+.1f}%)"
+    return SCORE_EPS_DETERIORATING, f"DETERIORATING ({growth:+.1f}%)"
 
 
 def score_debt_equity(fund_data):
+    if not fund_data:
+        return 0, "NO DATA"
     de = fund_data.get("debt_to_equity")
     if de is None:
         return 0, "NO DATA"
-    if de < DE_LOW_THRESHOLD:
-        return SCORE_DE_LOW, f"LOW ({de:.1f}x)"
+    if de <= DE_LOW_THRESHOLD:
+        return SCORE_DE_LOW, f"LOW ({de:.2f}x)"
     elif de <= DE_HIGH_THRESHOLD:
-        return SCORE_DE_MODERATE, f"MODERATE ({de:.1f}x)"
-    return SCORE_DE_HIGH, f"HIGH ({de:.1f}x)"
+        return SCORE_DE_MODERATE, f"MODERATE ({de:.2f}x)"
+    return SCORE_DE_HIGH, f"HIGH ({de:.2f}x)"
 
 
 def score_profit_margin(fund_data):
+    if not fund_data:
+        return 0, "NO DATA"
     margin = fund_data.get("profit_margin_pct")
     if margin is None:
         return 0, "NO DATA"
-    if margin > MARGIN_HIGH_THRESHOLD:
+    if margin >= MARGIN_HIGH_THRESHOLD:
         return SCORE_MARGIN_HIGH, f"HIGH ({margin:.1f}%)"
     elif margin >= MARGIN_LOW_THRESHOLD:
         return SCORE_MARGIN_NORMAL, f"NORMAL ({margin:.1f}%)"
@@ -447,15 +441,6 @@ def score_profit_margin(fund_data):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def get_verdict(score, score_max=SCORE_MAX):
-    """
-    Convert a raw score into a human-readable verdict.
-
-    Uses percentage thresholds to remain calibrated as criteria are added.
-    Thresholds are defined as constants at the top of this file.
-
-    Returns:
-        str — "VIABLE" | "CAUTION" | "DO_NOT_TRADE"
-    """
     pct = score / score_max if score_max > 0 else 0
     if pct >= THRESHOLD_VIABLE:
         return "VIABLE"
@@ -472,19 +457,9 @@ def score_criteria(criteria):
     """
     Apply all scoring rules to a criteria dict from criteria.py.
 
-    Args:
-        criteria (dict) — output of get_all_criteria(ticker)
-
-    Returns:
-        dict with keys:
-            ticker              (str)
-            timestamp           (str)
-            price               (float)
-            score               (int)
-            score_max           (int)
-            score_pct           (float)
-            verdict             (str)  — VIABLE | CAUTION | DO_NOT_TRADE
-            criteria_scores     (dict) — score and label per criterion
+    Compatible with both old (yfinance) and new (Tastytrade) data formats.
+    iv_percentile, put_call_ratio, open_interest may arrive as direct
+    floats/ints or as legacy dicts — scorer functions handle both.
     """
     if criteria is None:
         return None
@@ -496,32 +471,30 @@ def score_criteria(criteria):
     fund  = criteria.get("fundamental", {})
 
     hv_value = vol.get("hv_30d")
-    iv_value = vol.get("implied", {}).get("iv")
+    iv_value = vol.get("iv") or vol.get("implied", {}).get("iv")
 
-    # ── Score each criterion ──────────────────────────────────────────────────
     results = {}
 
-    results["trend_25d"]           = score_trend(tech.get("trend_25d", {}))
-    results["moving_averages"]     = score_moving_averages(tech.get("moving_averages", {}))
-    results["sma50_direction"]     = score_sma50_direction(tech.get("moving_averages", {}))
-    results["rsi"]                 = score_rsi(tech.get("rsi"))
-    results["week_52"]             = score_52_week(tech.get("week_52", {}))
-    results["support_resistance"]  = score_support_resistance(tech.get("support_resistance", {}))
-    results["candlestick"]         = score_candlestick(tech.get("candlestick", {}))
-    results["hv"]                  = score_hv(hv_value)
-    results["iv_vs_hv"]            = score_iv_vs_hv(iv_value, hv_value)
-    results["iv_percentile"]       = score_iv_percentile(vol.get("iv_percentile", {}))
-    results["beta"]                = score_beta(vol.get("beta"))
-    results["put_call_ratio"]      = score_put_call_ratio(vol.get("put_call_ratio", {}))
-    results["open_interest"]       = score_open_interest(vol.get("open_interest", {}))
-    results["earnings"]            = score_earnings(earn)
-    results["volume"]              = score_volume(volum)
-    results["pe"]                  = score_pe(fund)
-    results["eps_growth"]          = score_eps_growth(fund)
-    results["debt_equity"]         = score_debt_equity(fund)
-    results["profit_margin"]       = score_profit_margin(fund)
+    results["trend_25d"]          = score_trend(tech.get("trend_25d", {}))
+    results["moving_averages"]    = score_moving_averages(tech.get("moving_averages", {}))
+    results["sma50_direction"]    = score_sma50_direction(tech.get("moving_averages", {}))
+    results["rsi"]                = score_rsi(tech.get("rsi"))
+    results["week_52"]            = score_52_week(tech.get("week_52", {}))
+    results["support_resistance"] = score_support_resistance(tech.get("support_resistance", {}))
+    results["candlestick"]        = score_candlestick(tech.get("candlestick", {}))
+    results["hv"]                 = score_hv(hv_value)
+    results["iv_vs_hv"]           = score_iv_vs_hv(iv_value, hv_value)
+    results["iv_percentile"]      = score_iv_percentile(vol.get("iv_percentile"))
+    results["beta"]               = score_beta(vol.get("beta"))
+    results["put_call_ratio"]     = score_put_call_ratio(vol.get("put_call_ratio"))
+    results["open_interest"]      = score_open_interest(vol.get("open_interest"))
+    results["earnings"]           = score_earnings(earn)
+    results["volume"]             = score_volume(volum)
+    results["pe"]                 = score_pe(fund)
+    results["eps_growth"]         = score_eps_growth(fund)
+    results["debt_equity"]        = score_debt_equity(fund)
+    results["profit_margin"]      = score_profit_margin(fund)
 
-    # ── Aggregate score ───────────────────────────────────────────────────────
     total_score = sum(v[0] for v in results.values())
     score_pct   = round(total_score / SCORE_MAX * 100, 1)
     verdict     = get_verdict(total_score)

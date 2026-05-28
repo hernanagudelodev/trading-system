@@ -1,409 +1,508 @@
 """
 trade.py
 ========
-Registro de posiciones de opciones.
+Position and account tracker — syncs with Tastytrade API.
 
-Usa los nombres exactos que muestra Thinkorswim para que
-no tengas que traducir nada.
+Does NOT execute orders. You open/close manually in Tastytrade.
+This script reads what you have open and keeps DB in sync.
 
-Comandos:
-    python trade.py --open    → registrar nueva posición
-    python trade.py --close   → cerrar posición existente
-    python trade.py --list    → ver posiciones abiertas
+Commands:
+    python trade.py --sync          # sync positions + save account snapshot
+    python trade.py --list          # show open positions from DB
+    python trade.py --account       # show account balance history
+    python trade.py --history       # show closed positions P&L history
 
-Al abrir, solo necesitas tener Thinkorswim abierto con la
-orden lista para ver los valores.
+Sync logic:
+    1. Fetch open positions from Tastytrade API
+    2. Compare with DB positions (status='open')
+    3. New positions in Tastytrade → insert in DB
+    4. Positions in DB but not in Tastytrade → mark as closed, calculate P&L
+    5. Save account snapshot (balances) to DB
+
+DB tables used:
+    positions       — open/closed option positions
+    account_snapshots — daily balance history
 """
 
-import argparse
+import os
+import sys
+import asyncio
+from decimal import Decimal
 from datetime import datetime, date
+from dotenv import load_dotenv
 
-from db import open_position, close_position, get_open_positions
+load_dotenv()
+sys.stdout.reconfigure(encoding="utf-8")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# INPUT HELPERS
+# TASTYTRADE — fetch positions and balances
 # ══════════════════════════════════════════════════════════════════════════════
 
-def ask(label, hint=None, default=None, cast=str, required=True):
-    """Prompt with optional hint and default."""
-    line = f"  {label}"
-    if hint:
-        line += f"\n    → {hint}"
-    if default is not None:
-        line += f" [{default}]"
-    line += ": "
+async def _fetch_tastytrade_data():
+    """
+    Fetch current positions and balances from Tastytrade API.
 
-    while True:
-        raw = input(line).strip()
+    Returns:
+        dict with keys:
+            account_number  (str)
+            balances        (dict)
+            positions       (list of dicts)
+    """
+    from tastytrade import Session
+    from tastytrade.account import Account
 
-        if not raw:
-            if default is not None:
-                return default
-            if not required:
-                return None
-            print("    ⚠️  Requerido.\n")
+    session = Session(
+        os.getenv("TASTYTRADE_CLIENT_SECRET"),
+        os.getenv("TASTYTRADE_REFRESH_TOKEN")
+    )
+
+    accounts = await Account.get(session)
+    account  = accounts[0]
+
+    # ── Balances ──────────────────────────────────────────────────────────────
+    bal = await account.get_balances(session)
+    balances = {
+        "account_number":        account.account_number,
+        "net_liquidating_value": float(bal.net_liquidating_value or 0),
+        "equity_buying_power":   float(bal.equity_buying_power or 0),
+        "derivative_buying_power": float(bal.derivative_buying_power or 0),
+        "cash_balance":          float(bal.cash_balance or 0),
+        "pending_cash":          float(bal.pending_cash or 0),
+        "long_derivative_value": float(bal.long_derivative_value or 0),
+        "maintenance_excess":    float(bal.maintenance_excess or 0),
+        "updated_at":            bal.updated_at,
+    }
+
+    # ── Positions ─────────────────────────────────────────────────────────────
+    raw_positions = await account.get_positions(session)
+    positions = []
+
+    for p in raw_positions:
+        # Only process options (not stocks)
+        if p.instrument_type not in ("Equity Option",):
             continue
 
-        try:
-            return cast(raw)
-        except (ValueError, TypeError):
-            print(f"    ⚠️  Valor inválido — se esperaba {cast.__name__}\n")
+        # Parse option symbol: .SLB260618C58 → ticker, exp, type, strike
+        symbol   = str(p.symbol)
+        quantity = int(p.quantity)
+        avg_open = float(p.average_open_price or 0)
+        close_px = float(p.close_price or 0)
+        mark     = float(p.mark or close_px)
 
+        # Parse OCC symbol
+        parsed = _parse_option_symbol(symbol)
 
-def ask_date(label, hint=None):
-    """Prompt for a date in YYYY-MM-DD format."""
-    line = f"  {label}"
-    if hint:
-        line += f"\n    → {hint}"
-    line += " (YYYY-MM-DD): "
+        positions.append({
+            "symbol":           symbol,
+            "ticker":           parsed["ticker"],
+            "expiration":       parsed["expiration"],
+            "strike":           parsed["strike"],
+            "option_type":      parsed["option_type"],  # CALL or PUT
+            "quantity":         quantity,
+            "avg_open_price":   avg_open,
+            "mark":             mark,
+            "close_price":      close_px,
+            "cost_basis":       round(avg_open * quantity * 100, 2),
+            "market_value":     round(mark * quantity * 100, 2),
+            "unrealized_pnl":   round((mark - avg_open) * quantity * 100, 2),
+        })
 
-    while True:
-        raw = input(line).strip()
-        try:
-            return datetime.strptime(raw, "%Y-%m-%d").date()
-        except ValueError:
-            print("    ⚠️  Formato inválido. Ejemplo: 2026-06-18\n")
-
-
-def confirm(msg):
-    return input(f"\n  {msg} (s/n): ").strip().lower() in ("s", "si", "sí")
-
-
-def sep(char="─", width=52):
-    print(f"  {char * width}")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# OPEN POSITION
-# ══════════════════════════════════════════════════════════════════════════════
-
-def cmd_open():
-    print()
-    print("  ╔══════════════════════════════════════════════════╗")
-    print("  ║          REGISTRAR NUEVA POSICIÓN               ║")
-    print("  ╚══════════════════════════════════════════════════╝")
-    print()
-    print("  Ten Thinkorswim abierto con la orden lista.")
-    print("  Los campos usan los mismos nombres que ves en pantalla.")
-    print()
-
-    # ── Ticker ───────────────────────────────────────────────────────────────
-    sep()
-    ticker = ask(
-        "Ticker",
-        hint="Ej: HAL, XOM, CAT"
-    ).upper()
-
-    # ── Tipo de operación ────────────────────────────────────────────────────
-    print()
-    print("  Estrategia:")
-    strategies = {
-        "1": "Bull Call Spread",
-        "2": "Bear Put Spread",
-        "3": "Long Call",
-        "4": "Long Put",
-        "5": "Cash Secured Put",
-        "6": "Covered Call",
-    }
-    for k, v in strategies.items():
-        print(f"    {k}. {v}")
-    strategy_key = ask("  Número", cast=str, default="1")
-    strategy = strategies.get(strategy_key, "Bull Call Spread")
-
-    # ── Paper o real ─────────────────────────────────────────────────────────
-    print()
-    is_paper_input = ask(
-        "¿Es paper trading?",
-        hint="paperMoney en Thinkorswim = s | dinero real = n",
-        default="s"
-    ).lower()
-    is_paper = is_paper_input in ("s", "si", "sí", "y", "yes")
-    broker = "Thinkorswim (paperMoney)" if is_paper else "Schwab / Thinkorswim"
-
-    # ── Datos de la orden (lo que ves en Thinkorswim) ────────────────────────
-    sep()
-    print()
-    print(f"  Datos de la orden en Thinkorswim")
-    print(f"  (lo que aparece en la barra inferior: BUY +N VERTICAL...)")
-    print()
-
-    contracts = ask(
-        "Contratos",
-        hint="El número que ves: 'Buy 2 Vertical' → escribe 2",
-        cast=int
-    )
-
-    strike_low = ask(
-        "Strike bajo (long strike)",
-        hint="El primer número del spread: '41/44' → escribe 41",
-        cast=float
-    )
-
-    strike_high = ask(
-        "Strike alto (short strike)",
-        hint="El segundo número del spread: '41/44' → escribe 44",
-        cast=float
-    )
-
-    expiration = ask_date(
-        "Fecha de vencimiento",
-        hint="'Jun 18 (30d)' → escribe 2026-06-18"
-    )
-
-    print()
-    precio_spread = ask(
-        "Precio del spread pagado",
-        hint="El valor @X.XX en la orden: 'Buy 2 Vertical @1.13 LIMIT' → escribe 1.13\n"
-             "    Este es el COSTO TOTAL POR ACCIÓN del spread (ya descontado el sold)",
-        cast=float
-    )
-
-    price_at_open = ask(
-        "Precio de la acción ahora",
-        hint="El precio grande en la esquina superior: ej 42.98",
-        cast=float
-    )
-
-    # ── Cálculos automáticos ─────────────────────────────────────────────────
-    total_cost  = round(precio_spread * contracts * 100, 2)
-    max_profit  = round((strike_high - strike_low - precio_spread) * contracts * 100, 2)
-    breakeven   = round(strike_low + precio_spread, 2)
-    max_loss    = total_cost
-
-    print()
-    sep("═")
-    print(f"  RESUMEN DE LA POSICIÓN")
-    sep("═")
-    print(f"  Ticker:          {ticker}")
-    print(f"  Estrategia:      {strategy}")
-    print(f"  Spread:          ${strike_low} / ${strike_high}")
-    print(f"  Contratos:       {contracts}")
-    print(f"  Vencimiento:     {expiration}")
-    print(f"  Precio acción:   ${price_at_open}")
-    print()
-    print(f"  ── Calculado automáticamente ──")
-    print(f"  Costo total:     ${total_cost:.2f}  ({contracts} contratos × {precio_spread} × 100)")
-    print(f"  Ganancia máx:    ${max_profit:.2f}  (si acción ≥ ${strike_high} al vencimiento)")
-    print(f"  Pérdida máx:     ${max_loss:.2f}  (si acción ≤ ${strike_low} al vencimiento)")
-    print(f"  Breakeven:       ${breakeven:.2f}  (precio mínimo para no perder)")
-    print()
-
-    # Targets
-    target_50 = round(total_cost + max_profit * 0.50, 2)
-    target_70 = round(total_cost + max_profit * 0.70, 2)
-    stop_loss = round(total_cost * 0.50, 2)
-    print(f"  ── Reglas de salida ──")
-    print(f"  Cerrar si el spread vale:  ${target_50:.2f} (50%) → ${target_70:.2f} (70%)")
-    print(f"  Stop loss si costo cae a:  ${stop_loss:.2f} (50% del costo)")
-    print(f"  Cerrar si DTE ≤ 7:         {(expiration - date.today()).days - 7} días desde hoy")
-    print()
-    sep("═")
-
-    notas = ask(
-        "Notas (opcional)",
-        hint="Ej: 'Entrada cerca de soporte, RSI 52, sector Energy PRIORITY'",
-        required=False
-    )
-
-    if not confirm("¿Confirmar registro de posición?"):
-        print("\n  ❌ Cancelado.\n")
-        return
-
-    # ── Guardar en DB ─────────────────────────────────────────────────────────
-    position_data = {
-        "ticker":            ticker,
-        "strategy":          strategy,
-        "broker":            broker,
-        "is_paper":          is_paper,
-        "strike_low":        strike_low,
-        "strike_high":       strike_high,
-        "contracts":         contracts,
-        "expiration":        expiration,
-        "premium_paid":      precio_spread,
-        "total_cost":        total_cost,
-        "commission_open":   0.0,
-        "opened_at":         datetime.now(),
-        "price_at_open":     price_at_open,
-        "score_at_open":     None,
-        "score_pct_at_open": None,
-        "verdict_at_open":   None,
-        "notes":             notas or "",
-        "analysis_id":       None,
+    return {
+        "account_number": account.account_number,
+        "balances":        balances,
+        "positions":       positions,
     }
 
-    position_id = open_position(position_data)
 
-    print()
-    print(f"  ✅ Posición #{position_id} registrada.")
-    print(f"  El monitor en Railway la vigilará automáticamente.")
-    print(f"  Para ver el estado: python trade.py --list")
-    print()
+def _parse_option_symbol(symbol):
+    """
+    Parse OCC option symbol format: .SLB260618C58
+    Returns dict with ticker, expiration, option_type, strike.
+    """
+    import re
+    # Format: .TICKER YYMMDD C/P STRIKE
+    # Example: .SLB260618C58 or .AAPL260619P150
+    pattern = r'\.([A-Z]+)(\d{6})([CP])(\d+(?:\.\d+)?)'
+    m = re.match(pattern, symbol.replace(" ", ""))
+    if not m:
+        return {
+            "ticker": symbol, "expiration": None,
+            "option_type": "CALL", "strike": 0.0
+        }
+    ticker     = m.group(1)
+    date_str   = m.group(2)  # YYMMDD
+    opt_type   = "CALL" if m.group(3) == "C" else "PUT"
+    strike     = float(m.group(4))
 
+    try:
+        exp_date = datetime.strptime(date_str, "%y%m%d").date()
+    except Exception:
+        exp_date = None
 
-# ══════════════════════════════════════════════════════════════════════════════
-# CLOSE POSITION
-# ══════════════════════════════════════════════════════════════════════════════
-
-def cmd_close():
-    print()
-    print("  ╔══════════════════════════════════════════════════╗")
-    print("  ║             CERRAR POSICIÓN                     ║")
-    print("  ╚══════════════════════════════════════════════════╝")
-    print()
-
-    positions = get_open_positions()
-
-    if not positions:
-        print("  No hay posiciones abiertas.\n")
-        return
-
-    # Mostrar tabla simple
-    sep("═")
-    print(f"  {'ID':<4} {'TICKER':<6} {'SPREAD':<10} {'EXP':<12} {'COSTO':>8} {'PAPER'}")
-    sep()
-    for p in positions:
-        spread = f"{p['strike_low']}/{p['strike_high']}"
-        exp    = str(p['expiration'])
-        cost   = f"${float(p['total_cost'] or 0):.2f}"
-        paper  = "📝" if p['is_paper'] else "💵"
-        print(f"  {p['id']:<4} {p['ticker']:<6} {spread:<10} {exp:<12} {cost:>8} {paper}")
-    sep("═")
-    print()
-
-    valid_ids = [p["id"] for p in positions]
-    position_id = ask(
-        f"ID de la posición a cerrar",
-        hint=f"Opciones disponibles: {valid_ids}",
-        cast=int
-    )
-
-    if position_id not in valid_ids:
-        print(f"\n  ❌ ID {position_id} no válido.\n")
-        return
-
-    selected = next(p for p in positions if p["id"] == position_id)
-    contracts  = selected["contracts"]
-    total_cost = float(selected["total_cost"] or 0)
-
-    print()
-    print(f"  Cerrando: {selected['ticker']} "
-          f"${selected['strike_low']}/{selected['strike_high']} "
-          f"exp {selected['expiration']}")
-    print(f"  Costo original: ${total_cost:.2f}")
-    print()
-    print("  En Thinkorswim, cuando ejecutas el cierre verás:")
-    print("  'Sell 2 Vertical @X.XX' — ese X.XX es lo que recibes")
-    print()
-
-    precio_cierre = ask(
-        "Precio del spread al cerrar",
-        hint="El valor @X.XX de la orden de cierre en Thinkorswim",
-        cast=float
-    )
-
-    price_at_close = ask(
-        "Precio de la acción al cerrar",
-        hint="El precio de la acción en ese momento",
-        cast=float
-    )
-
-    print()
-    print("  Razón de cierre:")
-    reasons = {
-        "1": "TARGET_REACHED",
-        "2": "STOP_LOSS",
-        "3": "MANUAL",
-        "4": "EXPIRY",
+    return {
+        "ticker":      ticker,
+        "expiration":  exp_date,
+        "option_type": opt_type,
+        "strike":      strike,
     }
-    print("    1. TARGET_REACHED — alcanzaste el 50-70% de ganancia máxima")
-    print("    2. STOP_LOSS — perdiste el 50% del costo")
-    print("    3. MANUAL — decidiste cerrar por otra razón")
-    print("    4. EXPIRY — expiró")
-    reason_key = ask("  Número", default="1")
-    close_reason = reasons.get(reason_key, "MANUAL")
 
-    notas = ask("Notas (opcional)", required=False)
 
-    # ── Calcular P&L ──────────────────────────────────────────────────────────
-    total_received = round(precio_cierre * contracts * 100, 2)
+def fetch_tastytrade_data():
+    """Synchronous wrapper."""
+    return asyncio.run(_fetch_tastytrade_data())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DB HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_db_connection():
+    import psycopg2
+    return psycopg2.connect(os.getenv("DATABASE_URL"))
+
+
+def ensure_tables():
+    """Create account_snapshots table if it doesn't exist."""
+    conn = get_db_connection()
+    cur  = conn.cursor()
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS account_snapshots (
+            id                      SERIAL PRIMARY KEY,
+            account_number          VARCHAR(20),
+            net_liquidating_value   DECIMAL(12,2),
+            equity_buying_power     DECIMAL(12,2),
+            derivative_buying_power DECIMAL(12,2),
+            cash_balance            DECIMAL(12,2),
+            pending_cash            DECIMAL(12,2),
+            long_derivative_value   DECIMAL(12,2),
+            maintenance_excess      DECIMAL(12,2),
+            snapshot_at             TIMESTAMP DEFAULT NOW(),
+            created_at              TIMESTAMP DEFAULT NOW()
+        )
+    """)
+
+    # Add tastytrade_symbol column to positions if not exists
+    cur.execute("""
+        ALTER TABLE positions
+        ADD COLUMN IF NOT EXISTS tastytrade_symbol VARCHAR(50),
+        ADD COLUMN IF NOT EXISTS broker            VARCHAR(20) DEFAULT 'tastytrade',
+        ADD COLUMN IF NOT EXISTS option_type       VARCHAR(10)
+    """)
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def get_open_positions_from_db():
+    """Get all open positions from DB."""
+    conn = get_db_connection()
+    cur  = conn.cursor()
+    cur.execute("""
+        SELECT id, ticker, strategy, strike_low, strike_high,
+               expiration, contracts, total_cost, tastytrade_symbol,
+               broker, opened_at
+        FROM positions
+        WHERE UPPER(status) = 'OPEN'
+        ORDER BY opened_at DESC
+    """)
+    cols = [d[0] for d in cur.description]
+    rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+    cur.close()
+    conn.close()
+    return rows
+
+
+def save_account_snapshot(balances):
+    """Save account balance snapshot to DB."""
+    conn = get_db_connection()
+    cur  = conn.cursor()
+    cur.execute("""
+        INSERT INTO account_snapshots
+            (account_number, net_liquidating_value, equity_buying_power,
+             derivative_buying_power, cash_balance, pending_cash,
+             long_derivative_value, maintenance_excess)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        RETURNING id
+    """, (
+        balances["account_number"],
+        balances["net_liquidating_value"],
+        balances["equity_buying_power"],
+        balances["derivative_buying_power"],
+        balances["cash_balance"],
+        balances["pending_cash"],
+        balances["long_derivative_value"],
+        balances["maintenance_excess"],
+    ))
+    snapshot_id = cur.fetchone()[0]
+    conn.commit()
+    cur.close()
+    conn.close()
+    return snapshot_id
+
+
+def insert_position(tt_pos, account_number):
+    """Insert a new position found in Tastytrade into DB."""
+    conn = get_db_connection()
+    cur  = conn.cursor()
+
+    # Determine strategy from option type and quantity
+    strategy = "Long Call" if tt_pos["option_type"] == "CALL" else "Long Put"
+
+    cur.execute("""
+        INSERT INTO positions
+            (ticker, strategy, broker, is_paper,
+             strike_low, strike_high, contracts, expiration,
+             premium_paid, total_cost,
+             status, opened_at, price_at_open,
+             tastytrade_symbol, option_type, notes)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                'open', NOW(), %s, %s, %s, %s)
+        RETURNING id
+    """, (
+        tt_pos["ticker"],
+        strategy,
+        "tastytrade",
+        False,                          # real money
+        tt_pos["strike"],               # strike_low
+        tt_pos["strike"],               # strike_high (same for single leg)
+        tt_pos["quantity"],
+        tt_pos["expiration"],
+        tt_pos["avg_open_price"],       # premium per share
+        tt_pos["cost_basis"],           # total cost
+        0.0,                            # price_at_open (stock price — unknown here)
+        tt_pos["symbol"],               # tastytrade_symbol
+        tt_pos["option_type"],
+        f"Auto-imported from Tastytrade. Avg open: ${tt_pos['avg_open_price']:.2f}"
+    ))
+
+    pos_id = cur.fetchone()[0]
+    conn.commit()
+    cur.close()
+    conn.close()
+    return pos_id
+
+
+def close_position_in_db(db_pos_id, tt_pos, close_reason="Closed in Tastytrade"):
+    """Mark a position as closed in DB and calculate P&L."""
+    conn = get_db_connection()
+    cur  = conn.cursor()
+
+    # Get original position data
+    cur.execute("""
+        SELECT total_cost, contracts, premium_paid
+        FROM positions WHERE id = %s
+    """, (db_pos_id,))
+    row = cur.fetchone()
+    if not row:
+        cur.close()
+        conn.close()
+        return
+
+    total_cost, contracts, premium_paid = row
+    total_cost   = float(total_cost or 0)
+    contracts    = int(contracts or 1)
+
+    # Use mark price as close price
+    close_price    = tt_pos["mark"] if tt_pos else 0.0
+    total_received = round(close_price * contracts * 100, 2)
     gross_pnl      = round(total_received - total_cost, 2)
-    pnl_pct        = round(gross_pnl / total_cost * 100, 1) if total_cost else 0
-    max_profit = (float(selected["strike_high"]) - float(selected["strike_low"])) * contracts * 100 - total_cost
-    pct_of_max     = round(gross_pnl / max_profit * 100, 1) if max_profit else 0
+    pnl_pct        = round(gross_pnl / total_cost * 100, 2) if total_cost else 0
 
-    result_icon = "✅" if gross_pnl >= 0 else "❌"
-    print()
-    sep("═")
-    print(f"  RESULTADO")
-    sep("═")
-    print(f"  Costo original:   ${total_cost:.2f}")
-    print(f"  Recibido:         ${total_received:.2f}")
-    print(f"  Ganancia/Pérdida: {result_icon} ${gross_pnl:+.2f} ({pnl_pct:+.1f}%)")
-    print(f"  % del máximo:     {pct_of_max:.1f}%")
-    print(f"  Razón:            {close_reason}")
-    sep("═")
-    print()
+    cur.execute("""
+        UPDATE positions SET
+            status           = 'closed',
+            closed_at        = NOW(),
+            premium_received = %s,
+            total_received   = %s,
+            gross_pnl        = %s,
+            net_pnl          = %s,
+            pnl_pct          = %s,
+            close_reason     = %s
+        WHERE id = %s
+    """, (
+        close_price,
+        total_received,
+        gross_pnl,
+        gross_pnl,      # net = gross (no separate commission tracking here)
+        pnl_pct,
+        close_reason,
+        db_pos_id,
+    ))
 
-    if not confirm("¿Confirmar cierre?"):
-        print("\n  ❌ Cancelado.\n")
-        return
-
-    close_data = {
-        "premium_received": precio_cierre,
-        "commission_close": 0.0,
-        "closed_at":        datetime.now(),
-        "price_at_close":   price_at_close,
-        "close_reason":     close_reason,
-        "notes":            notas or "",
-    }
-
-    updated = close_position(position_id, close_data)
-
-    print()
-    print(f"  ✅ Posición #{position_id} cerrada.")
-    print(f"  Resultado: ${updated['net_pnl']:.2f} ({updated['pnl_pct']:.1f}%)")
-    print()
+    conn.commit()
+    cur.close()
+    conn.close()
+    return gross_pnl
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# LIST POSITIONS
+# SYNC LOGIC
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_sync():
+    """
+    Main sync: Tastytrade → DB.
+
+    1. Fetch Tastytrade positions + balances
+    2. Save account snapshot
+    3. Compare positions: insert new, close removed
+    """
+    print(f"\n{'=' * 55}")
+    print(f"  TRADE SYNC — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"{'=' * 55}\n")
+
+    # Ensure tables exist
+    ensure_tables()
+
+    # Fetch from Tastytrade
+    print("  Fetching from Tastytrade...", end=" ", flush=True)
+    try:
+        tt_data = fetch_tastytrade_data()
+        print("OK")
+    except Exception as e:
+        print(f"ERROR: {e}")
+        return
+
+    account_number = tt_data["account_number"]
+    balances       = tt_data["balances"]
+    tt_positions   = tt_data["positions"]
+
+    # Save account snapshot
+    snapshot_id = save_account_snapshot(balances)
+    print(f"  Account snapshot saved (id={snapshot_id})")
+    print(f"  Net liquidating value: ${balances['net_liquidating_value']:,.2f}")
+    print(f"  Derivative buying power: ${balances['derivative_buying_power']:,.2f}")
+    print(f"  Pending cash: ${balances['pending_cash']:,.2f}")
+    if balances['long_derivative_value']:
+        print(f"  Options value: ${balances['long_derivative_value']:,.2f}")
+
+    # Get DB positions
+    db_positions = get_open_positions_from_db()
+
+    print(f"\n  Tastytrade positions: {len(tt_positions)}")
+    print(f"  DB open positions:    {len(db_positions)}")
+
+    # ── Find new positions (in TT but not in DB) ──────────────────────────────
+    db_symbols = {
+        p.get("tastytrade_symbol") for p in db_positions
+        if p.get("tastytrade_symbol")
+    }
+
+    new_count = 0
+    for tt_pos in tt_positions:
+        if tt_pos["symbol"] not in db_symbols:
+            pos_id = insert_position(tt_pos, account_number)
+            print(f"\n  NEW position imported:")
+            print(f"    {tt_pos['ticker']} {tt_pos['option_type']} "
+                  f"${tt_pos['strike']} exp {tt_pos['expiration']}")
+            print(f"    Qty: {tt_pos['quantity']} | "
+                  f"Avg open: ${tt_pos['avg_open_price']:.2f} | "
+                  f"Cost: ${tt_pos['cost_basis']:.2f}")
+            print(f"    DB id: {pos_id}")
+            new_count += 1
+
+    # ── Find closed positions (in DB but not in TT) ───────────────────────────
+    tt_symbols = {p["symbol"] for p in tt_positions}
+
+    closed_count = 0
+    for db_pos in db_positions:
+        db_symbol = db_pos.get("tastytrade_symbol")
+        if db_symbol and db_symbol not in tt_symbols:
+            pnl = close_position_in_db(db_pos["id"], None, "Closed in Tastytrade")
+            print(f"\n  CLOSED position detected:")
+            print(f"    {db_pos['ticker']} (DB id={db_pos['id']})")
+            print(f"    P&L: ${pnl:.2f}" if pnl is not None else "    P&L: unknown")
+            closed_count += 1
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    print(f"\n{'=' * 55}")
+    print(f"  Sync complete:")
+    print(f"    New positions imported: {new_count}")
+    print(f"    Positions closed:       {closed_count}")
+    print(f"    Account snapshot:       saved")
+    print(f"{'=' * 55}\n")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DISPLAY COMMANDS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def cmd_list():
-    print()
-    positions = get_open_positions()
-
-    if not positions:
-        print("  No hay posiciones abiertas.\n")
-        return
-
-    sep("═")
-    print(f"  POSICIONES ABIERTAS ({len(positions)})")
-    sep("═")
-
+    """Show open positions from DB."""
+    positions = get_open_positions_from_db()
+    print(f"\n  Open positions in DB: {len(positions)}\n")
     for p in positions:
-        spread     = f"${p['strike_low']}/{p['strike_high']}"
-        exp        = str(p['expiration'])
-        cost       = float(p['total_cost'] or 0)
-        dte        = (p['expiration'] - date.today()).days if p['expiration'] else "?"
-        paper_icon = "📝 paper" if p['is_paper'] else "💵 real"
+        exp    = str(p["expiration"])[:10] if p["expiration"] else "N/A"
+        cost   = float(p["total_cost"] or 0)
+        broker = p.get("broker", "N/A")
+        print(f"  #{p['id']} {p['ticker']} {p['strategy']} "
+              f"${p['strike_low']} | Exp {exp} | "
+              f"Cost ${cost:.2f} | {broker}")
+    print()
 
-        max_profit = (float(p['strike_high']) - float(p['strike_low'])) * p['contracts'] * 100 - cost
-        target_50  = round(cost + max_profit * 0.50, 2)
-        target_70  = round(cost + max_profit * 0.70, 2)
-        stop_loss  = round(cost * 0.50, 2)
 
-        print(f"  #{p['id']} {p['ticker']} {spread} | {p['strategy']}")
-        print(f"     Vence: {exp} ({dte} días) | Costo: ${cost:.2f} | {paper_icon}")
-        print(f"     Cerrar si spread vale: ${target_50:.2f}-${target_70:.2f}")
-        print(f"     Stop loss si spread vale menos de: ${stop_loss:.2f}")
-        if p.get("notes"):
-            print(f"     Notas: {p['notes']}")
-        sep()
+def cmd_account():
+    """Show account balance history."""
+    conn = get_db_connection()
+    cur  = conn.cursor()
+    cur.execute("""
+        SELECT snapshot_at, net_liquidating_value, derivative_buying_power,
+               pending_cash, long_derivative_value
+        FROM account_snapshots
+        ORDER BY snapshot_at DESC
+        LIMIT 30
+    """)
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
 
-    total = sum(float(p['total_cost'] or 0) for p in positions)
-    print(f"  Total invertido: ${total:.2f}\n")
+    print(f"\n  Account history (last {len(rows)} snapshots):\n")
+    print(f"  {'Date/Time':<22} {'NLV':>10} {'Deriv BP':>10} "
+          f"{'Pending':>10} {'Options':>10}")
+    print(f"  {'-'*22} {'-'*10} {'-'*10} {'-'*10} {'-'*10}")
+
+    for row in rows:
+        snap_at, nlv, dbp, pending, options = row
+        print(f"  {str(snap_at)[:19]:<22} "
+              f"${float(nlv or 0):>9,.0f} "
+              f"${float(dbp or 0):>9,.0f} "
+              f"${float(pending or 0):>9,.0f} "
+              f"${float(options or 0):>9,.0f}")
+    print()
+
+
+def cmd_history():
+    """Show closed positions P&L history."""
+    conn = get_db_connection()
+    cur  = conn.cursor()
+    cur.execute("""
+        SELECT ticker, strategy, strike_low, expiration,
+               total_cost, total_received, net_pnl, pnl_pct,
+               close_reason, closed_at
+        FROM positions
+        WHERE UPPER(status) = 'CLOSED'
+        ORDER BY closed_at DESC
+        LIMIT 20
+    """)
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    print(f"\n  Closed positions history (last {len(rows)}):\n")
+    for row in rows:
+        ticker, strategy, strike, exp, cost, received, pnl, pnl_pct, reason, closed = row
+        pnl      = float(pnl or 0)
+        pnl_pct  = float(pnl_pct or 0)
+        cost     = float(cost or 0)
+        emoji    = "+" if pnl >= 0 else "-"
+        print(f"  {ticker} {strategy} ${strike} | "
+              f"Cost ${cost:.0f} | "
+              f"P&L {emoji}${abs(pnl):.0f} ({pnl_pct:+.1f}%) | "
+              f"{str(closed)[:10] if closed else 'N/A'}")
+    print()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -411,16 +510,20 @@ def cmd_list():
 # ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Registro de posiciones de opciones")
+    import argparse
+    parser = argparse.ArgumentParser(description="Trade sync with Tastytrade")
     group  = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--open",  action="store_true", help="Registrar nueva posición")
-    group.add_argument("--close", action="store_true", help="Cerrar posición existente")
-    group.add_argument("--list",  action="store_true", help="Ver posiciones abiertas")
+    group.add_argument("--sync",    action="store_true", help="Sync positions + save account snapshot")
+    group.add_argument("--list",    action="store_true", help="Show open positions from DB")
+    group.add_argument("--account", action="store_true", help="Show account balance history")
+    group.add_argument("--history", action="store_true", help="Show closed positions P&L history")
     args = parser.parse_args()
 
-    if args.open:
-        cmd_open()
-    elif args.close:
-        cmd_close()
+    if args.sync:
+        run_sync()
     elif args.list:
         cmd_list()
+    elif args.account:
+        cmd_account()
+    elif args.history:
+        cmd_history()

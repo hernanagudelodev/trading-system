@@ -1,28 +1,41 @@
-# test rápido — corre esto antes de tocar criteria.py
-import os, asyncio
+import os
+import asyncio
 from dotenv import load_dotenv
+from tastytrade import Session
+from tastytrade.account import Account
+
 load_dotenv()
 
-from criteria import get_volatility_from_tastytrade, get_all_criteria
+async def main():
+    session = Session(
+        os.getenv("TASTYTRADE_CLIENT_SECRET"),
+        os.getenv("TASTYTRADE_REFRESH_TOKEN")
+    )
 
-# Test 1: Tastytrade directo
-print("=== Tastytrade raw ===")
-tt = get_volatility_from_tastytrade("SLB")
-print(tt)
+    accounts = await Account.get(session)
+    account = accounts[0]
+    print(f"Cuenta: {account.account_number}")
 
-print("\n=== Tastytrade MPC ===")
-tt2 = get_volatility_from_tastytrade("MPC")
-print(tt2)
+    # Balances
+    balances = await account.get_balances(session)
+    print(f"\nBalances:")
+    print(f"  Atributos: {[a for a in dir(balances) if not a.startswith('_') and not callable(getattr(balances, a))]}")
+    print(f"  Raw: {balances}")
 
-# Test 2: get_all_criteria
-print("\n=== get_all_criteria SLB ===")
-import json
-c = get_all_criteria("SLB")
-if c:
-    print(json.dumps({
-        "price": c["price"],
-        "volatility": c["volatility"],
-        "earnings": c["earnings"]
-    }, indent=2, default=str))
-else:
-    print("None")
+    # Posiciones
+    positions = await account.get_positions(session)
+    print(f"\nPosiciones: {len(positions)}")
+    if positions:
+        p = positions[0]
+        print(f"  Atributos: {[a for a in dir(p) if not a.startswith('_') and not callable(getattr(p, a))]}")
+        print(f"  Raw: {p}")
+
+    # Historial reciente
+    history = await account.get_history(session)
+    print(f"\nHistorial: {len(history)} items")
+    if history:
+        h = history[0]
+        print(f"  Atributos: {[a for a in dir(h) if not a.startswith('_') and not callable(getattr(h, a))]}")
+        print(f"  Raw: {h}")
+
+asyncio.run(main())
