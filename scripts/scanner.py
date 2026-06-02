@@ -529,10 +529,21 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Options opportunity scanner")
     parser.add_argument("--tickers", nargs="+", default=None)
     parser.add_argument("--context", action="store_true",
-                        help="Use tickers from market_context.json")
+                        help="Use tickers from market_context.json (legacy, 32 tickers)")
+    parser.add_argument("--universe", action="store_true",
+                        help="Scan full S&P 500 with fast pre-filter")
+    parser.add_argument("--no-cache", action="store_true",
+                        help="Force re-fetch of S&P 500 list (ignore cache)")
     args = parser.parse_args()
 
-    if args.context:
+    if args.universe:
+        from universe import get_scanner_candidates
+        print("\n  UNIVERSE MODE — scanning full S&P 500 with pre-filter\n")
+        tickers = get_scanner_candidates(use_cache=not args.no_cache)
+        if not tickers:
+            print("  Could not build universe — falling back to defaults")
+            tickers = DEFAULT_TICKERS
+    elif args.context:
         ctx = load_market_context()
         if ctx and ctx.get("recommended_tickers"):
             tickers = ctx["recommended_tickers"]
