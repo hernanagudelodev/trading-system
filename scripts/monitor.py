@@ -227,6 +227,106 @@ def get_live_option_price(ticker, strike, expiration, option_type="call"):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# SPREAD VALUE — live from Tastytrade (real market price, includes time value)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _get_tt_session_monitor():
+    """Create a Tastytrade session for the monitor."""
+    client_secret = os.getenv("TASTYTRADE_CLIENT_SECRET")
+    refresh_token = os.getenv("TASTYTRADE_REFRESH_TOKEN")
+    if not client_secret or not refresh_token:
+        return None
+    try:
+        from tastytrade import Session as TTSession
+        return TTSession(client_secret, refresh_token)
+    except Exception:
+        return None
+
+
+async def _fetch_spread_value_async(ticker, strike_low, strike_high, expiration):
+    """
+    Fetch real market value of a Bull Call Spread from Tastytrade.
+    Returns net spread value per share (long_mid - short_mid), or None on failure.
+    """
+    import asyncio
+    from tastytrade.instruments import NestedOptionChain
+    from tastytrade.dxfeed import Quote
+    from tastytrade import DXLinkStreamer
+
+    session = _get_tt_session_monitor()
+    if session is None:
+        return None
+
+    try:
+        chains = await NestedOptionChain.get(session, ticker)
+        if not chains:
+            return None
+        chain = chains[0]
+
+        target_exp = None
+        for exp in chain.expirations:
+            if exp.expiration_date == expiration:
+                target_exp = exp
+                break
+        if target_exp is None:
+            return None
+
+        long_strike_obj  = None
+        short_strike_obj = None
+        for s in target_exp.strikes:
+            sp = float(s.strike_price)
+            if abs(sp - strike_low) < 0.01:
+                long_strike_obj = s
+            elif abs(sp - strike_high) < 0.01:
+                short_strike_obj = s
+
+        if long_strike_obj is None or short_strike_obj is None:
+            return None
+
+        long_sym  = long_strike_obj.call_streamer_symbol
+        short_sym = short_strike_obj.call_streamer_symbol
+        symbols   = [long_sym, short_sym]
+
+        quotes_map = {}
+        async with DXLinkStreamer(session) as streamer:
+            await streamer.subscribe(Quote, symbols)
+            for _ in symbols:
+                try:
+                    q = await asyncio.wait_for(streamer.get_event(Quote), timeout=10)
+                    quotes_map[q.event_symbol] = q
+                except asyncio.TimeoutError:
+                    break
+
+        long_q  = quotes_map.get(long_sym)
+        short_q = quotes_map.get(short_sym)
+        if long_q is None or short_q is None:
+            return None
+
+        long_bid  = float(long_q.bid_price)  if long_q.bid_price  else 0.0
+        long_ask  = float(long_q.ask_price)  if long_q.ask_price  else 0.0
+        short_bid = float(short_q.bid_price) if short_q.bid_price else 0.0
+        short_ask = float(short_q.ask_price) if short_q.ask_price else 0.0
+
+        long_mid  = (long_bid + long_ask) / 2   if (long_bid and long_ask)   else 0.0
+        short_mid = (short_bid + short_ask) / 2 if (short_bid and short_ask) else 0.0
+
+        spread_value = round(long_mid - short_mid, 2)
+        return spread_value if spread_value > 0 else None
+
+    except Exception as e:
+        print(f"  spread value fetch error for {ticker}: {e}")
+        return None
+
+
+def get_spread_value_tastytrade(ticker, strike_low, strike_high, expiration):
+    """Synchronous wrapper. Returns net spread value per share or None."""
+    import asyncio
+    try:
+        return asyncio.run(_fetch_spread_value_async(ticker, strike_low, strike_high, expiration))
+    except Exception:
+        return None
+
+# ══════════════════════════════════════════════════════════════════════════════
 # P&L CALCULATION — strategy-aware
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -285,7 +385,7 @@ def calculate_current_pnl(position, current_price):
                 spread_value = 0
             else:
                 spread_value = strike_high - current_price
-
+                
         current_value = spread_value * contracts * 100
         gross_pnl     = current_value - total_cost
         pnl_pct       = (gross_pnl / total_cost * 100) if total_cost > 0 else 0
