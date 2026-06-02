@@ -60,16 +60,25 @@ def _get_tt_session():
 async def _fetch_market_metrics(symbols):
     """
     Async helper — fetch MarketMetricInfo for a list of symbols.
+    Creates a FRESH session inside this event loop to avoid the
+    "session bound to closed loop" problem when asyncio.run() is
+    called repeatedly.
     Returns dict: {symbol: MarketMetricInfo}
     """
+    from tastytrade import Session as TTSession
     from tastytrade.metrics import get_market_metrics
-    session = _get_tt_session()
-    if session is None:
+
+    client_secret = os.getenv("TASTYTRADE_CLIENT_SECRET")
+    refresh_token = os.getenv("TASTYTRADE_REFRESH_TOKEN")
+    if not client_secret or not refresh_token:
         return {}
+
     try:
+        session = TTSession(client_secret, refresh_token)
         metrics = await get_market_metrics(session, symbols)
         return {m.symbol: m for m in metrics}
-    except Exception:
+    except Exception as e:
+        print(f"  _fetch_market_metrics error for {symbols}: {e}")
         return {}
 
 
@@ -358,24 +367,33 @@ def get_volatility_from_tastytrade(ticker):
         except Exception:
             return None
 
+    # Safe float conversion — handles None, strings, and 0 correctly
+    def safe_float(val, multiplier=1.0, decimals=2):
+        if val is None:
+            return None
+        try:
+            return round(float(val) * multiplier, decimals)
+        except (ValueError, TypeError):
+            return None
+
     # Earnings date
     earnings_date = None
     if m.earnings and m.earnings.expected_report_date:
         earnings_date = m.earnings.expected_report_date
 
     return {
-        "iv":             round(float(m.implied_volatility_index) * 100, 2)   if m.implied_volatility_index  else None,
-        "iv_30d":         round(float(m.implied_volatility_30_day), 2)        if m.implied_volatility_30_day else None,
+        "iv":             safe_float(m.implied_volatility_index, 100, 2),
+        "iv_30d":         safe_float(m.implied_volatility_30_day, 1.0, 2),
         "iv_percentile":  pct_to_100(m.implied_volatility_percentile),
-        "iv_rank":        round(float(m.tw_implied_volatility_index_rank), 3) if m.tw_implied_volatility_index_rank else None,
-        "iv_hv_diff":     round(float(m.iv_hv_30_day_difference), 2)          if m.iv_hv_30_day_difference   else None,
-        "beta":           round(float(m.beta), 2)                              if m.beta                      else None,
+        "iv_rank":        safe_float(m.tw_implied_volatility_index_rank, 1.0, 3),
+        "iv_hv_diff":     safe_float(m.iv_hv_30_day_difference, 1.0, 2),
+        "beta":           safe_float(m.beta, 1.0, 2),
         "put_call_ratio":  None,   # not in MarketMetrics — fetched from option chain if needed
         "open_interest":   None,   # not in MarketMetrics — fetched from option chain if needed
         "earnings_date":  earnings_date,
-        "pe":             round(float(m.price_earnings_ratio), 2)              if m.price_earnings_ratio      else None,
-        "eps":            round(float(m.earnings_per_share), 4)                if m.earnings_per_share        else None,
-        "market_cap":     float(m.market_cap)                                  if m.market_cap                else None,
+        "pe":             safe_float(m.price_earnings_ratio, 1.0, 2),
+        "eps":            safe_float(m.earnings_per_share, 1.0, 4),
+        "market_cap":     safe_float(m.market_cap, 1.0, 0),
         "dividend_ex_date": m.dividend_ex_date,
         "liquidity_rating": m.liquidity_rating,
     }

@@ -79,6 +79,7 @@ async def _fetch_tastytrade_data():
     positions = []
 
     for p in raw_positions:
+        print(f"DEBUG raw: symbol={p.symbol} qty={p.quantity} instrument={p.instrument_type}")  # <-- agrega esto
         # Only process options (not stocks)
         if p.instrument_type not in ("Equity Option",):
             continue
@@ -114,39 +115,62 @@ async def _fetch_tastytrade_data():
         "positions":       positions,
     }
 
-
 def _parse_option_symbol(symbol):
     """
-    Parse OCC option symbol format: .SLB260618C58
-    Returns dict with ticker, expiration, option_type, strike.
+    Parse OCC option symbol format.
+    Handles: .SLB260618C58  AND  XYZ   260702C00079000
     """
     import re
-    # Format: .TICKER YYMMDD C/P STRIKE
-    # Example: .SLB260618C58 or .AAPL260619P150
-    pattern = r'\.([A-Z]+)(\d{6})([CP])(\d+(?:\.\d+)?)'
-    m = re.match(pattern, symbol.replace(" ", ""))
-    if not m:
+
+    # Remove leading dot and collapse spaces
+    clean = symbol.lstrip(".").replace(" ", "")
+
+    # OCC format: TICKER YYMMDD C/P STRIKE(8 digits, strike * 1000)
+    # Example: XYZ260702C00079000 → ticker=XYZ, exp=260702, C, strike=79.0
+    pattern = r'^([A-Z]+)(\d{6})([CP])(\d{8})$'
+    m = re.match(pattern, clean)
+    if m:
+        ticker   = m.group(1)
+        date_str = m.group(2)
+        opt_type = "CALL" if m.group(3) == "C" else "PUT"
+        strike   = int(m.group(4)) / 1000.0
+        try:
+            exp_date = datetime.strptime(date_str, "%y%m%d").date()
+        except Exception:
+            exp_date = None
         return {
-            "ticker": symbol, "expiration": None,
-            "option_type": "CALL", "strike": 0.0
+            "ticker":      ticker,
+            "expiration":  exp_date,
+            "option_type": opt_type,
+            "strike":      strike,
         }
-    ticker     = m.group(1)
-    date_str   = m.group(2)  # YYMMDD
-    opt_type   = "CALL" if m.group(3) == "C" else "PUT"
-    strike     = float(m.group(4))
 
-    try:
-        exp_date = datetime.strptime(date_str, "%y%m%d").date()
-    except Exception:
-        exp_date = None
+    # Fallback: short format .SLB260618C58
+    pattern2 = r'^([A-Z]+)(\d{6})([CP])(\d+(?:\.\d+)?)$'
+    m2 = re.match(pattern2, clean)
+    if m2:
+        ticker   = m2.group(1)
+        date_str = m2.group(2)
+        opt_type = "CALL" if m2.group(3) == "C" else "PUT"
+        strike   = float(m2.group(4))
+        try:
+            exp_date = datetime.strptime(date_str, "%y%m%d").date()
+        except Exception:
+            exp_date = None
+        return {
+            "ticker":      ticker,
+            "expiration":  exp_date,
+            "option_type": opt_type,
+            "strike":      strike,
+        }
 
+    # Cannot parse
     return {
-        "ticker":      ticker,
-        "expiration":  exp_date,
-        "option_type": opt_type,
-        "strike":      strike,
+        "ticker":      clean[:10],
+        "expiration":  None,
+        "option_type": "CALL",
+        "strike":      0.0,
     }
-
 
 def fetch_tastytrade_data():
     """Synchronous wrapper."""
@@ -242,14 +266,23 @@ def save_account_snapshot(balances):
     conn.close()
     return snapshot_id
 
-
 def insert_position(tt_pos, account_number):
     """Insert a new position found in Tastytrade into DB."""
     conn = get_db_connection()
     cur  = conn.cursor()
 
-    # Determine strategy from option type and quantity
-    strategy = "Long Call" if tt_pos["option_type"] == "CALL" else "Long Put"
+    # Determine strategy
+    qty = tt_pos["quantity"]
+    if tt_pos["option_type"] == "CALL" and qty > 0:
+        strategy = "Long Call"
+    elif tt_pos["option_type"] == "CALL" and qty < 0:
+        strategy = "Short Call"
+    elif tt_pos["option_type"] == "PUT" and qty > 0:
+        strategy = "Long Put"
+    else:
+        strategy = "Short Put"
+
+    notes = f"Auto-imported from Tastytrade. Avg open: ${tt_pos['avg_open_price']:.2f}"
 
     cur.execute("""
         INSERT INTO positions
@@ -265,17 +298,17 @@ def insert_position(tt_pos, account_number):
         tt_pos["ticker"],
         strategy,
         "tastytrade",
-        False,                          # real money
-        tt_pos["strike"],               # strike_low
-        tt_pos["strike"],               # strike_high (same for single leg)
-        tt_pos["quantity"],
+        False,
+        tt_pos["strike"],
+        tt_pos["strike"],
+        abs(tt_pos["quantity"]),
         tt_pos["expiration"],
-        tt_pos["avg_open_price"],       # premium per share
-        tt_pos["cost_basis"],           # total cost
-        0.0,                            # price_at_open (stock price — unknown here)
-        tt_pos["symbol"],               # tastytrade_symbol
+        tt_pos["avg_open_price"],
+        tt_pos["cost_basis"],
+        0.0,
+        tt_pos["symbol"],
         tt_pos["option_type"],
-        f"Auto-imported from Tastytrade. Avg open: ${tt_pos['avg_open_price']:.2f}"
+        notes,
     ))
 
     pos_id = cur.fetchone()[0]
@@ -283,7 +316,6 @@ def insert_position(tt_pos, account_number):
     cur.close()
     conn.close()
     return pos_id
-
 
 def close_position_in_db(db_pos_id, tt_pos, close_reason="Closed in Tastytrade"):
     """Mark a position as closed in DB and calculate P&L."""
@@ -394,6 +426,7 @@ def run_sync():
     new_count = 0
     for tt_pos in tt_positions:
         if tt_pos["symbol"] not in db_symbols:
+            print(f"DEBUG tt_pos: {tt_pos}")  # <-- agrega esta línea
             pos_id = insert_position(tt_pos, account_number)
             print(f"\n  NEW position imported:")
             print(f"    {tt_pos['ticker']} {tt_pos['option_type']} "

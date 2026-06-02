@@ -1,9 +1,11 @@
-import requests
+import os
+from dotenv import load_dotenv
+load_dotenv()
 
-API_KEY = "LlDb7F7KZDgqhl8KtdNMx1SSv8yx4pMf"
+from criteria import get_volatility_from_tastytrade
 
-# Endpoint que SÍ funciona en plan gratis
-url = f"https://financialmodelingprep.com/api/v3/profile/AAPL?apikey={API_KEY}"
-r = requests.get(url)
-print(r.status_code)
-print(r.json())
+for symbol in ["MPC", "NVDA", "SLB"]:
+    print(f"\n{symbol}:")
+    tt = get_volatility_from_tastytrade(symbol)
+    print(f"  iv:            {tt['iv']}")
+    print(f"  iv_percentile: {tt['iv_percentile']}")

@@ -177,38 +177,14 @@ def save_analysis(scored_result):
     """
     Save a real-time scored analysis result to the database.
     Uses UPSERT to avoid duplicates if scanner runs twice same day.
-
-    Requires unique index: unique_real_analysis_per_day
-    Created with:
-        CREATE UNIQUE INDEX unique_real_analysis_per_day
-        ON analysis (ticker, DATE(timestamp))
-        WHERE is_backtest = FALSE;
-
-    Args:
-        scored_result (dict) — output of scoring.score_criteria()
-
-    Returns:
-        int — the analysis id
     """
     conn = get_connection()
     cur  = conn.cursor()
 
     cur.execute("""
-        INSERT INTO analysis (
-            ticker, timestamp, price,
-            score, score_max, score_pct, verdict,
-            is_backtest, backtest_date
-        )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, FALSE, NULL)
-        ON CONFLICT (ticker, DATE(timestamp))
-        WHERE is_backtest = FALSE
-        DO UPDATE SET
-            price     = EXCLUDED.price,
-            score     = EXCLUDED.score,
-            score_max = EXCLUDED.score_max,
-            score_pct = EXCLUDED.score_pct,
-            verdict   = EXCLUDED.verdict,
-            timestamp = EXCLUDED.timestamp
+        INSERT INTO analysis (ticker, timestamp, price, score, score_max, score_pct, verdict, is_backtest)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, FALSE)
+        ON CONFLICT DO NOTHING
         RETURNING id;
     """, (
         scored_result["ticker"],
@@ -220,15 +196,16 @@ def save_analysis(scored_result):
         scored_result["verdict"],
     ))
 
-    analysis_id = cur.fetchone()[0]
+    row = cur.fetchone()
+    if row is None:
+        conn.rollback()
+        cur.close()
+        conn.close()
+        return None
 
-    # Delete old criteria scores before reinserting
-    cur.execute(
-        "DELETE FROM criteria_scores WHERE analysis_id = %s;",
-        (analysis_id,)
-    )
+    analysis_id = row[0]
 
-    for criterion, data in scored_result["criteria_scores"].items():
+    for criterion, data in scored_result.get("criteria_scores", {}).items():
         cur.execute("""
             INSERT INTO criteria_scores (analysis_id, criterion, score, label)
             VALUES (%s, %s, %s, %s);
@@ -240,16 +217,66 @@ def save_analysis(scored_result):
     return analysis_id
 
 
-def get_latest_analysis(ticker, limit=10):
+def save_backtest_analysis(scored_result, backtest_date, sector=None):
+    """
+    Save a backtest analysis result to the database.
+    Same as save_analysis but marks is_backtest=True
+    and stores the simulated date.
+    Uses UPSERT — safe to re-run without creating duplicates.
+    """
+    conn = get_connection()
+    cur  = conn.cursor()
+
+    cur.execute("""
+        INSERT INTO analysis (
+            ticker, timestamp, price, score, score_max, score_pct,
+            verdict, is_backtest, backtest_date, sector
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, TRUE, %s, %s)
+        ON CONFLICT ON CONSTRAINT unique_backtest_ticker_date DO UPDATE SET
+            price     = EXCLUDED.price,
+            score     = EXCLUDED.score,
+            score_max = EXCLUDED.score_max,
+            score_pct = EXCLUDED.score_pct,
+            verdict   = EXCLUDED.verdict
+        RETURNING id;
+    """, (
+        scored_result["ticker"],
+        scored_result["timestamp"],
+        scored_result["price"],
+        scored_result["score"],
+        scored_result["score_max"],
+        scored_result["score_pct"],
+        scored_result["verdict"],
+        backtest_date,
+        sector,
+    ))
+
+    row = cur.fetchone()
+    if not row:
+        conn.rollback()
+        cur.close()
+        conn.close()
+        return None
+
+    analysis_id = row[0]
+
+    cur.execute("DELETE FROM criteria_scores WHERE analysis_id = %s;", (analysis_id,))
+    for criterion, data in scored_result.get("criteria_scores", {}).items():
+        cur.execute("""
+            INSERT INTO criteria_scores (analysis_id, criterion, score, label)
+            VALUES (%s, %s, %s, %s);
+        """, (analysis_id, criterion, data["score"], data["label"]))
+
+    conn.commit()
+    cur.close()
+    conn.close()
+    return analysis_id
+
+
+def get_latest_analysis(ticker, limit=5):
     """
     Retrieve the most recent real-time analysis records for a ticker.
-
-    Args:
-        ticker  (str) — stock symbol
-        limit   (int) — max records to return
-
-    Returns:
-        list of dicts
     """
     conn = get_connection()
     cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
@@ -281,14 +308,6 @@ def get_latest_analysis(ticker, limit=10):
 def get_analysis_history(ticker=None, verdict=None, days=30):
     """
     Retrieve real-time analysis history with optional filters.
-
-    Args:
-        ticker  (str | None) — filter by ticker
-        verdict (str | None) — filter by verdict
-        days    (int)        — how many days back to look
-
-    Returns:
-        list of dicts
     """
     conn = get_connection()
     cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
@@ -404,7 +423,6 @@ def close_position(position_id, close_data):
     conn = get_connection()
     cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
-    # Fetch current position to calculate P&L
     cur.execute("SELECT * FROM positions WHERE id = %s;", (position_id,))
     pos = dict(cur.fetchone())
 
@@ -453,7 +471,6 @@ def close_position(position_id, close_data):
 
     conn.commit()
 
-    # Return updated position
     cur.execute("SELECT * FROM positions WHERE id = %s;", (position_id,))
     updated = dict(cur.fetchone())
 
@@ -465,6 +482,7 @@ def close_position(position_id, close_data):
 def get_open_positions():
     """
     Retrieve all currently open positions.
+    Uses UPPER(status) to handle mixed case ('open', 'OPEN').
 
     Returns:
         list of dicts
@@ -474,7 +492,7 @@ def get_open_positions():
 
     cur.execute("""
         SELECT * FROM positions
-        WHERE status = 'OPEN'
+        WHERE UPPER(status) = 'OPEN'
         ORDER BY opened_at DESC;
     """)
 
@@ -498,7 +516,7 @@ def get_position_history(ticker=None, is_paper=None):
     conn = get_connection()
     cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
-    conditions = ["status = 'CLOSED'"]
+    conditions = ["UPPER(status) = 'CLOSED'"]
     params     = []
 
     if ticker:
@@ -533,42 +551,25 @@ def save_outcome(analysis_id, ticker, price_at_analysis,
     Record the actual market outcome for an analysis.
     Used by audit.py to compare predictions vs reality.
     Uses UPSERT to avoid duplicates on re-runs.
-
-    Requires unique constraint: unique_outcome_analysis
-    Created with:
-        ALTER TABLE outcomes ADD CONSTRAINT unique_outcome_analysis
-        UNIQUE (analysis_id);
-
-    Args:
-        analysis_id         (int)   — the analysis being evaluated
-        ticker              (str)
-        price_at_analysis   (float) — price when analysis was run
-        price_at_30d        (float) — price 30 days later
-        price_at_expiry     (float) — price at option expiration
-
-    Returns:
-        int — outcome id
     """
+    would_have_profited = None
+    pct_change_30d      = None
+
+    if price_at_30d is not None and price_at_analysis:
+        pct_change_30d      = round((price_at_30d - price_at_analysis) / price_at_analysis * 100, 4)
+        would_have_profited = pct_change_30d > 0
+
     conn = get_connection()
     cur  = conn.cursor()
-
-    pct_change   = None
-    would_profit = None
-
-    if price_at_30d and price_at_analysis:
-        pct_change   = round(
-            (price_at_30d - price_at_analysis) / price_at_analysis * 100, 4
-        )
-        would_profit = pct_change > 0
 
     cur.execute("""
         INSERT INTO outcomes (
             analysis_id, ticker, price_at_analysis,
             price_at_30d, price_at_expiry,
             pct_change_30d, would_have_profited
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (analysis_id)
-        DO UPDATE SET
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT ON CONSTRAINT unique_outcome_analysis DO UPDATE SET
             price_at_30d        = EXCLUDED.price_at_30d,
             price_at_expiry     = EXCLUDED.price_at_expiry,
             pct_change_30d      = EXCLUDED.pct_change_30d,
@@ -576,9 +577,13 @@ def save_outcome(analysis_id, ticker, price_at_analysis,
             recorded_at         = NOW()
         RETURNING id;
     """, (
-        analysis_id, ticker, price_at_analysis,
-        price_at_30d, price_at_expiry,
-        pct_change, would_profit
+        analysis_id,
+        ticker,
+        price_at_analysis,
+        price_at_30d,
+        price_at_expiry,
+        pct_change_30d,
+        would_have_profited,
     ))
 
     outcome_id = cur.fetchone()[0]
@@ -588,123 +593,13 @@ def save_outcome(analysis_id, ticker, price_at_analysis,
     return outcome_id
 
 
-def get_outcomes_for_audit(days=90, backtest_only=False):
-    """
-    Retrieve analysis + outcome pairs for audit processing.
-    Only returns records where outcomes have been recorded.
-
-    Args:
-        days          (int)  — how far back to look
-        backtest_only (bool) — if True, only return backtest records
-
-    Returns:
-        list of dicts with analysis and outcome data joined
-    """
-    conn = get_connection()
-    cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-
-    backtest_filter = "AND a.is_backtest = TRUE" if backtest_only else ""
-
-    cur.execute(f"""
-        SELECT
-            a.id, a.ticker, a.timestamp, a.price,
-            a.score, a.score_pct, a.verdict,
-            a.is_backtest, a.backtest_date,
-            o.price_at_30d, o.pct_change_30d, o.would_have_profited
-        FROM analysis a
-        JOIN outcomes o ON o.analysis_id = a.id
-        WHERE a.timestamp >= NOW() - INTERVAL '%s days'
-        {backtest_filter}
-        ORDER BY a.timestamp DESC;
-    """, (days,))
-
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
-    return [dict(r) for r in rows]
-
-
 # ══════════════════════════════════════════════════════════════════════════════
-# BACKTESTING — READ / WRITE
+# BACKTESTING — READ
 # ══════════════════════════════════════════════════════════════════════════════
-
-def save_backtest_analysis(scored_result, backtest_date, sector=None):
-    """
-    Save a backtest analysis result to the database.
-    Same as save_analysis but marks is_backtest=True
-    and stores the simulated date.
-    Uses UPSERT — safe to re-run without creating duplicates.
-
-    Requires unique constraint: unique_backtest_ticker_date
-    Created with:
-        ALTER TABLE analysis
-        ADD CONSTRAINT unique_backtest_ticker_date
-        UNIQUE (ticker, backtest_date, is_backtest)
-        WHERE is_backtest = TRUE;
-
-    Args:
-        scored_result (dict) — output of scoring.score_criteria()
-        backtest_date (date) — the date being simulated
-        sector        (str)  — GICS sector (e.g. 'Information Technology')
-
-    Returns:
-        int — the analysis id
-    """
-    conn = get_connection()
-    cur  = conn.cursor()
-
-    cur.execute("""
-        INSERT INTO analysis (
-            ticker, timestamp, price,
-            score, score_max, score_pct, verdict,
-            is_backtest, backtest_date, sector
-        )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, TRUE, %s, %s)
-        ON CONFLICT (ticker, backtest_date, is_backtest)
-        WHERE is_backtest = TRUE
-        DO UPDATE SET
-            price     = EXCLUDED.price,
-            score     = EXCLUDED.score,
-            score_max = EXCLUDED.score_max,
-            score_pct = EXCLUDED.score_pct,
-            verdict   = EXCLUDED.verdict,
-            timestamp = EXCLUDED.timestamp,
-            sector    = EXCLUDED.sector
-        RETURNING id;
-    """, (
-        scored_result["ticker"],
-        scored_result["timestamp"],
-        scored_result["price"],
-        scored_result["score"],
-        scored_result["score_max"],
-        scored_result["score_pct"],
-        scored_result["verdict"],
-        backtest_date,
-        sector,
-    ))
-
-    analysis_id = cur.fetchone()[0]
-
-    # Delete old criteria scores before reinserting
-    cur.execute(
-        "DELETE FROM criteria_scores WHERE analysis_id = %s;",
-        (analysis_id,)
-    )
-
-    for criterion, data in scored_result["criteria_scores"].items():
-        cur.execute("""
-            INSERT INTO criteria_scores (analysis_id, criterion, score, label)
-            VALUES (%s, %s, %s, %s);
-        """, (analysis_id, criterion, data["score"], data["label"]))
-
-    conn.commit()
-    cur.close()
-    conn.close()
-    return analysis_id
 
 def get_backtest_progress(ticker):
     """
-    Get the last backtest_date processed for a ticker.
+    Get the most recent backtest date for a ticker.
     Used by --resume mode to continue where it left off.
 
     Returns:
@@ -728,13 +623,6 @@ def get_backtest_progress(ticker):
 def get_backtest_results(ticker=None, verdict=None):
     """
     Retrieve backtest analysis records for audit.
-
-    Args:
-        ticker  (str | None) — filter by ticker
-        verdict (str | None) — filter by verdict
-
-    Returns:
-        list of dicts
     """
     conn = get_connection()
     cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
@@ -767,6 +655,35 @@ def get_backtest_results(ticker=None, verdict=None):
         GROUP BY a.id
         ORDER BY a.backtest_date ASC, a.ticker ASC;
     """, params)
+
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_audit_data(days=90, backtest_only=True):
+    """
+    Retrieve analysis + outcome data joined for audit purposes.
+    Only returns records where outcomes have been recorded.
+    """
+    conn = get_connection()
+    cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    backtest_filter = "AND a.is_backtest = TRUE" if backtest_only else ""
+
+    cur.execute(f"""
+        SELECT
+            a.id, a.ticker, a.timestamp, a.price,
+            a.score, a.score_pct, a.verdict,
+            a.is_backtest, a.backtest_date,
+            o.price_at_30d, o.pct_change_30d, o.would_have_profited
+        FROM analysis a
+        JOIN outcomes o ON o.analysis_id = a.id
+        WHERE a.timestamp >= NOW() - INTERVAL '%s days'
+        {backtest_filter}
+        ORDER BY a.timestamp DESC;
+    """, (days,))
 
     rows = cur.fetchall()
     cur.close()
