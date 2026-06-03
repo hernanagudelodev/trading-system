@@ -53,11 +53,26 @@ load_dotenv()
 
 TAKE_PROFIT_MIN_PCT  = 0.50   # 50% of max profit → ACTION
 TAKE_PROFIT_MAX_PCT  = 0.70   # 70% of max profit → URGENT
-STOP_LOSS_PCT        = 0.50   # 50% loss on premium paid → URGENT
-STOP_LOSS_WATCH_PCT  = 0.25   # 25% loss → WATCH
 WATCH_PROFIT_PCT     = 0.30   # 30% of max → WATCH
 MIN_DTE              = 7      # days → ACTION
 WATCH_DTE            = 10     # days → WATCH
+
+# Stop loss escalonado por DTE — más espacio cuando queda más tiempo
+# >15 DTE: -65%  |  8-15 DTE: -55%  |  <8 DTE: -50%
+STOP_LOSS_PCT_HIGH_DTE = 0.65   # >15 DTE
+STOP_LOSS_PCT_MID_DTE  = 0.55   # 8-15 DTE
+STOP_LOSS_PCT_LOW_DTE  = 0.50   # <8 DTE
+STOP_LOSS_WATCH_PCT    = 0.30   # 30% loss → WATCH
+
+
+def get_stop_loss_pct(dte):
+    """Returns stop loss threshold based on DTE."""
+    if dte is None or dte > 15:
+        return STOP_LOSS_PCT_HIGH_DTE
+    elif dte >= 8:
+        return STOP_LOSS_PCT_MID_DTE
+    else:
+        return STOP_LOSS_PCT_LOW_DTE
 
 MARKET_OPEN_HOUR     = 9
 MARKET_OPEN_MIN      = 30
@@ -523,19 +538,20 @@ def evaluate_alert_level(pnl_data):
     reasons           = []
     level             = "NORMAL"
 
+    # Stop loss threshold depends on DTE — more room when more time remains
+    stop_loss_pct = get_stop_loss_pct(dte)
+
     # ── URGENT conditions ────────────────────────────────────────────────────
     if profit_pct_of_max >= TAKE_PROFIT_MAX_PCT:
         reasons.append(f"Ganancia {profit_pct_of_max*100:.0f}% del maximo — no dejes escapar")
         level = "URGENT"
 
-    if strategy_type == "credit_option":
-        if pnl_pct <= -(STOP_LOSS_PCT * 100):
-            reasons.append(f"Stop loss alcanzado — perdida {pnl_pct:.1f}%")
-            level = "URGENT"
-    else:
-        if pnl_pct <= -(STOP_LOSS_PCT * 100):
-            reasons.append(f"Stop loss alcanzado — perdida {pnl_pct:.1f}%")
-            level = "URGENT"
+    if pnl_pct <= -(stop_loss_pct * 100):
+        reasons.append(
+            f"Stop loss alcanzado — perdida {pnl_pct:.1f}% "
+            f"(umbral {stop_loss_pct*100:.0f}% con {dte}d restantes)"
+        )
+        level = "URGENT"
 
     # ── ACTION conditions ────────────────────────────────────────────────────
     if level != "URGENT":
@@ -545,8 +561,7 @@ def evaluate_alert_level(pnl_data):
 
         if dte is not None and dte <= MIN_DTE:
             reasons.append(f"Solo {dte} dias al vencimiento — Theta acelerando")
-            if level != "URGENT":
-                level = "ACTION"
+            level = "ACTION"
 
     # ── WATCH conditions ─────────────────────────────────────────────────────
     if level == "NORMAL":
@@ -967,8 +982,11 @@ def run_monitor(ask_ai=False):
             print_position_report(position, pnl_data, alert_level, reasons, scored)
 
             if alert_level in ("WATCH", "ACTION", "URGENT") and ticker not in ntfy_sent:
-                send_alert_notification(position, pnl_data, alert_level, reasons)
-                ntfy_sent.add(ticker)
+                # Solo notificar si el mercado está abierto o en pre-market
+                # Con mercado cerrado no puedes actuar — silencio hasta apertura
+                if get_market_status() in ("open", "pre"):
+                    send_alert_notification(position, pnl_data, alert_level, reasons)
+                    ntfy_sent.add(ticker)
 
             positions_data.append({
                 "position":    position,
