@@ -31,6 +31,7 @@ Dependencies:
 
 import os
 import time
+import asyncio
 import argparse
 import schedule
 import requests
@@ -136,27 +137,15 @@ def get_live_delta(ticker, strike, expiration, option_type="call"):
     """
     Fetch live delta for a specific option from yfinance.
     Returns delta as float, or fallback value if unavailable.
-
-    Args:
-        ticker      (str)  — e.g. "OKE"
-        strike      (float)
-        expiration  (date) — position expiration date
-        option_type (str)  — "call" or "put"
-
-    Returns:
-        float — delta value (positive for calls, negative for puts)
     """
     fallback = 0.45 if option_type == "call" else -0.45
     try:
         tk = yf.Ticker(ticker)
-        exp_str = expiration.strftime("%Y-%m-%d")
 
-        # Find closest available expiration
         available = tk.options
         if not available:
             return fallback
 
-        # Pick closest expiration to our target
         target = expiration
         closest = min(
             available,
@@ -164,15 +153,11 @@ def get_live_delta(ticker, strike, expiration, option_type="call"):
         )
 
         chain = tk.option_chain(closest)
-        if option_type == "call":
-            df = chain.calls
-        else:
-            df = chain.puts
+        df = chain.calls if option_type == "call" else chain.puts
 
         if df is None or df.empty:
             return fallback
 
-        # Find closest strike
         df = df.copy()
         df["strike_diff"] = (df["strike"] - strike).abs()
         row = df.sort_values("strike_diff").iloc[0]
@@ -194,7 +179,6 @@ def get_live_option_price(ticker, strike, expiration, option_type="call"):
     """
     try:
         tk = yf.Ticker(ticker)
-        exp_str = expiration.strftime("%Y-%m-%d")
 
         available = tk.options
         if not available:
@@ -248,7 +232,6 @@ async def _fetch_spread_value_async(ticker, strike_low, strike_high, expiration)
     Fetch real market value of a Bull Call Spread from Tastytrade.
     Returns net spread value per share (long_mid - short_mid), or None on failure.
     """
-    import asyncio
     from tastytrade.instruments import NestedOptionChain
     from tastytrade.dxfeed import Quote
     from tastytrade import DXLinkStreamer
@@ -320,11 +303,11 @@ async def _fetch_spread_value_async(ticker, strike_low, strike_high, expiration)
 
 def get_spread_value_tastytrade(ticker, strike_low, strike_high, expiration):
     """Synchronous wrapper. Returns net spread value per share or None."""
-    import asyncio
     try:
         return asyncio.run(_fetch_spread_value_async(ticker, strike_low, strike_high, expiration))
     except Exception:
         return None
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # P&L CALCULATION — strategy-aware
@@ -336,7 +319,8 @@ def calculate_current_pnl(position, current_price):
 
     Strategy logic:
         Bull Call Spread / Bear Put Spread
-            → spread value based on subyacente movement
+            → real spread value from Tastytrade (includes time value)
+              fallback: intrinsic-only estimate
         Long Call / Long Put
             → live option price from yfinance (fallback: delta approximation)
         Cash Secured Put / Covered Call
@@ -348,13 +332,13 @@ def calculate_current_pnl(position, current_price):
                        profit_pct_of_max, max_profit, dte, spread_value,
                        strategy_type, delta (for long options)
     """
-    strategy    = position.get("strategy", "Bull Call Spread")
-    strike_low  = float(position["strike_low"])
-    strike_high = float(position["strike_high"])
-    contracts   = int(position["contracts"])
-    total_cost  = float(position.get("total_cost") or 0)
-    expiration  = position["expiration"]
-    ticker      = position["ticker"]
+    strategy      = position.get("strategy", "Bull Call Spread")
+    strike_low    = float(position["strike_low"])
+    strike_high   = float(position["strike_high"])
+    contracts     = int(position["contracts"])
+    total_cost    = float(position.get("total_cost") or 0)
+    expiration    = position["expiration"]
+    ticker        = position["ticker"]
     price_at_open = float(position.get("price_at_open") or strike_low)
 
     # Parse expiration
@@ -371,24 +355,29 @@ def calculate_current_pnl(position, current_price):
         premium_per_share = total_cost / (contracts * 100) if contracts > 0 else 0
         max_profit        = (spread_width - premium_per_share) * contracts * 100
 
-        if strategy == "Bull Call Spread":
-            if current_price >= strike_high:
-                spread_value = spread_width
-            elif current_price <= strike_low:
-                spread_value = 0
-            else:
-                spread_value = current_price - strike_low
-        else:  # Bear Put Spread
-            if current_price <= strike_low:
-                spread_value = spread_width
-            elif current_price >= strike_high:
-                spread_value = 0
-            else:
-                spread_value = strike_high - current_price
-                
-        current_value = spread_value * contracts * 100
-        gross_pnl     = current_value - total_cost
-        pnl_pct       = (gross_pnl / total_cost * 100) if total_cost > 0 else 0
+        # Try real market value from Tastytrade first (includes time value)
+        spread_value = get_spread_value_tastytrade(ticker, strike_low, strike_high, exp_date)
+
+        if spread_value is None:
+            # Fallback: intrinsic-only estimate (no time value)
+            if strategy == "Bull Call Spread":
+                if current_price >= strike_high:
+                    spread_value = spread_width
+                elif current_price <= strike_low:
+                    spread_value = 0
+                else:
+                    spread_value = current_price - strike_low
+            else:  # Bear Put Spread
+                if current_price <= strike_low:
+                    spread_value = spread_width
+                elif current_price >= strike_high:
+                    spread_value = 0
+                else:
+                    spread_value = strike_high - current_price
+
+        current_value     = spread_value * contracts * 100
+        gross_pnl         = current_value - total_cost
+        pnl_pct           = (gross_pnl / total_cost * 100) if total_cost > 0 else 0
         profit_pct_of_max = (gross_pnl / max_profit) if max_profit > 0 else 0
 
         return {
@@ -406,26 +395,23 @@ def calculate_current_pnl(position, current_price):
 
     # ── LONG OPTIONS (Long Call, Long Put) ───────────────────────────────────
     elif strategy in LONG_OPTIONS:
-        option_type = "call" if strategy == "Long Call" else "put"
+        option_type  = "call" if strategy == "Long Call" else "put"
         premium_paid = total_cost / (contracts * 100) if contracts > 0 else 0
 
-        # Try to get live option price first
         live_price = get_live_option_price(ticker, strike_low, exp_date, option_type)
 
         if live_price is not None:
             current_value = live_price * contracts * 100
             delta = get_live_delta(ticker, strike_low, exp_date, option_type)
         else:
-            # Fallback: delta approximation
-            delta = get_live_delta(ticker, strike_low, exp_date, option_type)
+            delta         = get_live_delta(ticker, strike_low, exp_date, option_type)
             price_change  = current_price - price_at_open
             estimated_val = max(0, premium_paid + (abs(delta) * price_change))
             current_value = estimated_val * contracts * 100
 
-        # max_profit reference = 2x the premium paid (100% gain target)
-        max_profit = total_cost * 2
-        gross_pnl  = current_value - total_cost
-        pnl_pct    = (gross_pnl / total_cost * 100) if total_cost > 0 else 0
+        max_profit        = total_cost * 2
+        gross_pnl         = current_value - total_cost
+        pnl_pct           = (gross_pnl / total_cost * 100) if total_cost > 0 else 0
         profit_pct_of_max = (gross_pnl / max_profit) if max_profit > 0 else 0
 
         return {
@@ -443,25 +429,22 @@ def calculate_current_pnl(position, current_price):
 
     # ── CREDIT OPTIONS (Cash Secured Put, Covered Call) ──────────────────────
     elif strategy in CREDIT_OPTIONS:
-        option_type   = "put" if strategy == "Cash Secured Put" else "call"
-        premium_received = total_cost  # for credit strategies, total_cost = premium received
+        option_type      = "put" if strategy == "Cash Secured Put" else "call"
+        premium_received = total_cost
 
-        # Try to get current option price (cost to close)
         live_price = get_live_option_price(ticker, strike_low, exp_date, option_type)
 
         if live_price is not None:
             cost_to_close = live_price * contracts * 100
         else:
-            # Fallback: delta decay approximation
-            delta       = get_live_delta(ticker, strike_low, exp_date, option_type)
+            delta        = get_live_delta(ticker, strike_low, exp_date, option_type)
             price_change = current_price - price_at_open
-            remaining   = max(0, (premium_received / (contracts * 100)) - (abs(delta) * abs(price_change)))
+            remaining    = max(0, (premium_received / (contracts * 100)) - (abs(delta) * abs(price_change)))
             cost_to_close = remaining * contracts * 100
 
-        # For credit strategies: profit = premium received - cost to close now
-        max_profit    = premium_received  # keep 100% of premium
-        gross_pnl     = premium_received - cost_to_close
-        pnl_pct       = (gross_pnl / premium_received * 100) if premium_received > 0 else 0
+        max_profit        = premium_received
+        gross_pnl         = premium_received - cost_to_close
+        pnl_pct           = (gross_pnl / premium_received * 100) if premium_received > 0 else 0
         profit_pct_of_max = (gross_pnl / max_profit) if max_profit > 0 else 0
 
         return {
@@ -479,27 +462,24 @@ def calculate_current_pnl(position, current_price):
 
     # ── LONG STRADDLE ────────────────────────────────────────────────────────
     elif strategy in STRADDLES:
-        # strike_low = call strike, strike_high = put strike (usually same)
-        strike = strike_low
+        strike     = strike_low
         call_price = get_live_option_price(ticker, strike, exp_date, "call")
         put_price  = get_live_option_price(ticker, strike, exp_date, "put")
 
         if call_price is not None and put_price is not None:
             current_value = (call_price + put_price) * contracts * 100
         else:
-            # Fallback: intrinsic + approximation
-            call_delta = get_live_delta(ticker, strike, exp_date, "call")
-            put_delta  = get_live_delta(ticker, strike, exp_date, "put")
+            call_delta        = get_live_delta(ticker, strike, exp_date, "call")
+            put_delta         = get_live_delta(ticker, strike, exp_date, "put")
             premium_per_share = total_cost / (contracts * 100) if contracts > 0 else 0
-            price_change = current_price - price_at_open
-            # Straddle benefits from movement in either direction
-            call_val = max(0, (premium_per_share / 2) + call_delta * price_change)
-            put_val  = max(0, (premium_per_share / 2) - abs(put_delta) * price_change)
+            price_change      = current_price - price_at_open
+            call_val  = max(0, (premium_per_share / 2) + call_delta * price_change)
+            put_val   = max(0, (premium_per_share / 2) - abs(put_delta) * price_change)
             current_value = (call_val + put_val) * contracts * 100
 
-        max_profit = total_cost * 3  # straddles target 200%+ on big moves
-        gross_pnl  = current_value - total_cost
-        pnl_pct    = (gross_pnl / total_cost * 100) if total_cost > 0 else 0
+        max_profit        = total_cost * 3
+        gross_pnl         = current_value - total_cost
+        pnl_pct           = (gross_pnl / total_cost * 100) if total_cost > 0 else 0
         profit_pct_of_max = (gross_pnl / max_profit) if max_profit > 0 else 0
 
         return {
@@ -548,7 +528,6 @@ def evaluate_alert_level(pnl_data):
         reasons.append(f"Ganancia {profit_pct_of_max*100:.0f}% del maximo — no dejes escapar")
         level = "URGENT"
 
-    # Stop loss: for credit strategies, a loss means the option gained value
     if strategy_type == "credit_option":
         if pnl_pct <= -(STOP_LOSS_PCT * 100):
             reasons.append(f"Stop loss alcanzado — perdida {pnl_pct:.1f}%")
@@ -608,8 +587,8 @@ def send_ntfy(title, message, priority="default", tags=None):
 
     url = f"{NTFY_BASE_URL}/{NTFY_TOPIC}"
     headers = {
-        "Title":    title.encode("utf-8"),
-        "Priority": priority,
+        "Title":        title.encode("utf-8"),
+        "Priority":     priority,
         "Content-Type": "text/plain; charset=utf-8",
     }
     if tags:
@@ -629,11 +608,11 @@ def send_ntfy(title, message, priority="default", tags=None):
 
 
 def send_alert_notification(position, pnl_data, alert_level, reasons):
-    ticker = position["ticker"]
+    ticker   = position["ticker"]
     strategy = position.get("strategy", "")
-    pnl    = pnl_data["gross_pnl"]
-    pct    = pnl_data["profit_pct_of_max"] * 100
-    dte    = pnl_data["dte"]
+    pnl      = pnl_data["gross_pnl"]
+    pct      = pnl_data["profit_pct_of_max"] * 100
+    dte      = pnl_data["dte"]
 
     level_titles = {
         "URGENT": f"URGENTE — {ticker}",
@@ -642,9 +621,9 @@ def send_alert_notification(position, pnl_data, alert_level, reasons):
     }
     priorities = {"URGENT": "urgent", "ACTION": "high", "WATCH": "default"}
 
-    title = level_titles.get(alert_level, ticker)
+    title       = level_titles.get(alert_level, ticker)
     reason_text = "\n".join(f"- {r}" for r in reasons)
-    message = (
+    message     = (
         f"{strategy} | ${ticker}\n"
         f"P&L: ${pnl:+.0f} ({pct:.0f}% del max) | {dte}d\n"
         f"{reason_text}"
@@ -873,7 +852,6 @@ def send_heartbeat(positions_data, timestamp):
     global _last_heartbeat_time
     _last_heartbeat_time = datetime.now()
 
-    # Solo notificar si hay posiciones que requieren atencion
     positions_with_alerts = [
         pd for pd in positions_data
         if pd["alert_level"] in ("WATCH", "ACTION", "URGENT")
