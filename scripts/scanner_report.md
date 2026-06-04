@@ -1,4 +1,5 @@
-# Scanner Report — 2026-06-02 12:00
+# Scanner Report — 2026-06-04 14:46
+**Tier usado:** Tier 1 — Stars (50 tickers)
 
 ## Contexto Macro
 **Verdict:** FAVORABLE — Strong macro conditions for options trading.
@@ -22,146 +23,175 @@
 Ninguna.
 
 
-## Tickers que pasaron filtros (12)
+## Tickers que pasaron filtros (14)
 
-### WAT — $370.23
+### DVA — $192.80
 
 **Technical:**
-- Trend 25d: BULLISH (+23.1%)
-- MAs: Above both | SMA50 RISING
-- RSI: 59.1
-- 52w: 68.6% (mid range)
-- Support: 7.9% away
-- Resistance: 4.6% away
-- Candle: RED CANDLE (BEARISH)
+- Trend 25d: BULLISH +24.3%
+- MAs: Above both | SMA50 FALLING
+- RSI: 50.3
+- 52w: N/A
+- Support: N/A
+- Resistance: N/A
+- Candle: N/A
 
 **Volatility:**
-- IV: 38.6% (P72 / Rank 0.51)
-- HV 30d: 59.6% | IV-HV: +11.4%
-- Beta: 1.36
-- Put/Call: 0.81
-- OI (ATM): 226
-- Liquidity: 1/5
+- IV: 37.3% (P38 / Rank 0.50)
+- HV: N/A
+- Beta: 0.82
+- Put/Call: 2.03
+- OI: N/A
+- Liquidity: N/A
 
 **Operational:**
-- Earnings: 57d
-- Volume: 17% of avg
+- Earnings: 62d
+- Volume: 48% of avg
 
 **Fundamental:**
-- PE: 48.9x
-- EPS growth: +109.0%
-- Debt/Equity: 0.37x
-- Profit margin: 11.9%
+- PE: 19.1x
+- EPS growth: +65.5%
+- Debt/Equity: 12.61x
+- Profit margin: 5.7%
 
-### ROK — $459.16
+### HOOD — $88.28
 
 **Technical:**
-- Trend 25d: BULLISH (+14.8%)
-- MAs: Above both | SMA50 RISING
-- RSI: 53.4
-- 52w: 100.0% (near high)
-- Support: 8.0% away
+- Trend 25d: BULLISH +21.1%
+- MAs: Mixed | SMA50 FALLING
+- RSI: 57.9
+- 52w: N/A
+- Support: N/A
 - Resistance: N/A
-- Candle: GREEN CANDLE (BULLISH)
+- Candle: N/A
 
 **Volatility:**
-- IV: 36.1% (P56 / Rank 0.55)
-- HV 30d: 38.5% | IV-HV: +12.2%
-- Beta: 1.73
-- Put/Call: 0.35
-- OI (ATM): 395
-- Liquidity: 2/5
+- IV: 71.6% (P60 / Rank 0.37)
+- HV: N/A
+- Beta: 2.16
+- Put/Call: 0.24
+- OI: N/A
+- Liquidity: N/A
 
 **Operational:**
-- Earnings: 65d
-- Volume: 18% of avg
+- Earnings: 55d
+- Volume: 101% of avg
+
+**Fundamental:**
+- PE: 45.5x
+- EPS growth: +33.3%
+- Debt/Equity: 1.40x
+- Profit margin: 41.1%
+
+### DOC — $19.42
+
+**Technical:**
+- Trend 25d: BULLISH +20.7%
+- MAs: Above both | SMA50 FALLING
+- RSI: 49.5
+- 52w: N/A
+- Support: N/A
+- Resistance: N/A
+- Candle: N/A
+
+**Volatility:**
+- IV: 31.7% (P25 / Rank 0.01)
+- HV: N/A
+- Beta: 0.99
+- Put/Call: 0.45
+- OI: N/A
+- Liquidity: N/A
+
+**Operational:**
+- Earnings: 49d
+- Volume: 33% of avg
+
+**Fundamental:**
+- PE: 60.1x
+- EPS growth: -53.1%
+- Debt/Equity: 1.18x
+- Profit margin: 7.7%
+
+### ELV — $410.71
+
+**Technical:**
+- Trend 25d: BULLISH +9.1%
+- MAs: Above both | SMA50 FALLING
+- RSI: 58.0
+- 52w: N/A
+- Support: N/A
+- Resistance: N/A
+- Candle: N/A
+
+**Volatility:**
+- IV: 39.4% (P43 / Rank 0.39)
+- HV: N/A
+- Beta: 0.62
+- Put/Call: 0.92
+- OI: N/A
+- Liquidity: N/A
+
+**Operational:**
+- Earnings: 42d
+- Volume: 52% of avg
+
+**Fundamental:**
+- PE: 16.7x
+- EPS growth: +24.0%
+- Debt/Equity: 0.72x
+- Profit margin: 2.6%
+
+### ROK — $462.64
+
+**Technical:**
+- Trend 25d: BULLISH +13.5%
+- MAs: Above both | SMA50 FALLING
+- RSI: 54.3
+- 52w: N/A
+- Support: N/A
+- Resistance: N/A
+- Candle: N/A
+
+**Volatility:**
+- IV: 34.6% (P47 / Rank 0.49)
+- HV: N/A
+- Beta: 1.73
+- Put/Call: 1.17
+- OI: N/A
+- Liquidity: N/A
+
+**Operational:**
+- Earnings: 63d
+- Volume: 37% of avg
 
 **Fundamental:**
 - PE: 46.9x
-- EPS growth: +50.5%
+- EPS growth: +50.4%
 - Debt/Equity: 1.13x
 - Profit margin: 12.4%
 
-### MNST — $88.26
+### ADM — $83.38
 
 **Technical:**
-- Trend 25d: BULLISH (+14.3%)
-- MAs: Above both | SMA50 RISING
-- RSI: 59.7
-- 52w: 96.8% (near high)
-- Support: 9.2% away
-- Resistance: 0.3% away
-- Candle: RED CANDLE (BEARISH)
+- Trend 25d: BULLISH +12.6%
+- MAs: Above both | SMA50 FALLING
+- RSI: 59.4
+- 52w: N/A
+- Support: N/A
+- Resistance: N/A
+- Candle: N/A
 
 **Volatility:**
-- IV: 30.9% (P62 / Rank 0.21)
-- HV 30d: 44.5% | IV-HV: +7.2%
-- Beta: 0.50
-- Put/Call: 1.05
-- OI (ATM): 7,146
-- Liquidity: 3/5
-
-**Operational:**
-- Earnings: 65d
-- Volume: 26% of avg
-
-**Fundamental:**
-- PE: 42.8x
-- EPS growth: +24.9%
-- Debt/Equity: 0.01x
-- Profit margin: 23.1%
-
-### ZBRA — $251.62
-
-**Technical:**
-- Trend 25d: BULLISH (+14.8%)
-- MAs: Above SMA50 | SMA50 RISING
-- RSI: 57.1
-- 52w: 36.8% (mid range)
-- Support: 3.6% away
-- Resistance: 4.2% away
-- Candle: DOJI (NEUTRAL)
-
-**Volatility:**
-- IV: 45.4% (P47 / Rank 0.45)
-- HV 30d: 50.9% | IV-HV: +21.4%
-- Beta: 1.63
-- Put/Call: 0.83
-- OI (ATM): 446
-- Liquidity: 2/5
-
-**Operational:**
-- Earnings: 63d
-- Volume: 24% of avg
-
-**Fundamental:**
-- PE: 29.4x
-- EPS growth: +150.4%
-- Debt/Equity: 0.82x
-- Profit margin: 7.5%
-
-### ADM — $82.13
-
-**Technical:**
-- Trend 25d: BULLISH (+13.6%)
-- MAs: Above both | SMA50 RISING
-- RSI: 56.5
-- 52w: 98.7% (near high)
-- Support: 6.1% away
-- Resistance: 0.3% away
-- Candle: RED CANDLE (BEARISH)
-
-**Volatility:**
-- IV: 35.9% (P76 / Rank 0.57)
-- HV 30d: 26.2% | IV-HV: +8.3%
+- IV: 34.8% (P67 / Rank 0.54)
+- HV: N/A
 - Beta: 0.57
-- Put/Call: 0.07
-- OI (ATM): 8,385
-- Liquidity: 3/5
+- Put/Call: 0.75
+- OI: N/A
+- Liquidity: N/A
 
 **Operational:**
-- Earnings: 63d
-- Volume: 27% of avg
+- Earnings: 61d
+- Volume: 40% of avg
 
 **Fundamental:**
 - PE: 35.7x
@@ -169,173 +199,115 @@ Ninguna.
 - Debt/Equity: 0.46x
 - Profit margin: 1.3%
 
-### SOLV — $76.19
+### UNH — $397.91
 
 **Technical:**
-- Trend 25d: BULLISH (+12.9%)
-- MAs: Above both | SMA50 RISING
-- RSI: 55.8
-- 52w: 57.9% (mid range)
-- Support: 0.6% away
-- Resistance: 0.9% away
-- Candle: GREEN CANDLE (BULLISH)
+- Trend 25d: BULLISH +7.4%
+- MAs: Above both | SMA50 FALLING
+- RSI: 49.1
+- 52w: N/A
+- Support: N/A
+- Resistance: N/A
+- Candle: N/A
 
 **Volatility:**
-- IV: 34.3% (P57 / Rank 0.27)
-- HV 30d: 23.4% | IV-HV: +0.7%
-- Beta: 0.73
-- Put/Call: 4.53
-- OI (ATM): 1,033
-- Liquidity: 2/5
+- IV: 30.3% (P6 / Rank 0.29)
+- HV: N/A
+- Beta: 0.57
+- Put/Call: 1.40
+- OI: N/A
+- Liquidity: N/A
 
 **Operational:**
-- Earnings: N/A
-- Volume: 24% of avg
+- Earnings: 54d
+- Volume: 105% of avg
 
 **Fundamental:**
-- PE: 9.2x
-- EPS growth: -13.8%
-- Debt/Equity: 1.06x
-- Profit margin: 17.3%
+- PE: 28.7x
+- EPS growth: +57.5%
+- Debt/Equity: 0.74x
+- Profit margin: 2.7%
 
-### ELV — $395.02
+### GWW — $1291.74
 
 **Technical:**
-- Trend 25d: BULLISH (+8.9%)
-- MAs: Above both | SMA50 RISING
-- RSI: 51.2
-- 52w: 94.2% (mid range)
-- Support: 1.8% away
-- Resistance: 1.8% away
-- Candle: RED CANDLE (BEARISH)
+- Trend 25d: BULLISH +11.4%
+- MAs: Above both | SMA50 FALLING
+- RSI: 52.9
+- 52w: N/A
+- Support: N/A
+- Resistance: N/A
+- Candle: N/A
 
 **Volatility:**
-- IV: 38.6% (P38 / Rank 0.36)
-- HV 30d: 28.9% | IV-HV: +12.5%
-- Beta: 0.62
-- Put/Call: 0.15
-- OI (ATM): 2,972
-- Liquidity: 2/5
+- IV: 25.2% (P59 / Rank 0.54)
+- HV: N/A
+- Beta: 1.02
+- Put/Call: 0.36
+- OI: N/A
+- Liquidity: N/A
 
 **Operational:**
-- Earnings: 44d
-- Volume: 17% of avg
+- Earnings: 61d
+- Volume: 52% of avg
 
 **Fundamental:**
-- PE: 16.7x
-- EPS growth: +23.9%
-- Debt/Equity: 0.72x
-- Profit margin: 2.6%
+- PE: 33.1x
+- EPS growth: +35.4%
+- Debt/Equity: 0.64x
+- Profit margin: 9.7%
 
-### DOC — $19.31
+### SNDK — $1790.00
 
 **Technical:**
-- Trend 25d: BULLISH (+20.9%)
-- MAs: Above both | SMA50 RISING
-- RSI: 43.8
-- 52w: 84.6% (mid range)
-- Support: 0.2% away
-- Resistance: 2.8% away
-- Candle: BULLISH ENGULFING (BULLISH)
+- Trend 25d: BULLISH +63.2%
+- MAs: Above both | SMA50 FALLING
+- RSI: 73.8
+- 52w: N/A
+- Support: N/A
+- Resistance: N/A
+- Candle: N/A
 
 **Volatility:**
-- IV: 37.2% (P25 / Rank 0.02)
-- HV 30d: 56.5% | IV-HV: +386.1%
-- Beta: 0.99
-- Put/Call: 0.44
-- OI (ATM): 20,698
-- Liquidity: 4/5
+- IV: 106.7% (P69 / Rank 0.71)
+- HV: N/A
+- Beta: 2.72
+- Put/Call: 1.71
+- OI: N/A
+- Liquidity: N/A
 
 **Operational:**
-- Earnings: 51d
-- Volume: 20% of avg
+- Earnings: 81d
+- Volume: 76% of avg
 
 **Fundamental:**
-- PE: 60.1x
-- EPS growth: -57.8%
-- Debt/Equity: 1.18x
-- Profit margin: 7.7%
+- PE: 61.1x
+- EPS growth: +507.0%
+- Debt/Equity: 0.02x
+- Profit margin: 34.2%
 
-### IQV — $181.66
-
-**Technical:**
-- Trend 25d: BULLISH (+14.3%)
-- MAs: Above SMA50 | SMA50 RISING
-- RSI: 56.5
-- 52w: 40.5% (mid range)
-- Support: 2.5% away
-- Resistance: 5.5% away
-- Candle: RED CANDLE (BEARISH)
-
-**Volatility:**
-- IV: 44.3% (P77 / Rank 0.54)
-- HV 30d: 53.0% | IV-HV: +8.6%
-- Beta: 1.22
-- Put/Call: 0.77
-- OI (ATM): 788
-- Liquidity: 2/5
-
-**Operational:**
-- Earnings: 49d
-- Volume: 23% of avg
-
-**Fundamental:**
-- PE: 22.6x
-- EPS growth: +76.3%
-- Debt/Equity: 2.55x
-- Profit margin: 8.3%
-
-### TSLA — $422.61
+### BEN — $31.93
 
 **Technical:**
-- Trend 25d: BULLISH (+12.4%)
-- MAs: Above both | SMA50 RISING
-- RSI: 45.6
-- 52w: 67.2% (mid range)
-- Support: 1.5% away
-- Resistance: 1.3% away
-- Candle: GREEN CANDLE (BULLISH)
+- Trend 25d: BULLISH +6.5%
+- MAs: Above both | SMA50 FALLING
+- RSI: 46.8
+- 52w: N/A
+- Support: N/A
+- Resistance: N/A
+- Candle: N/A
 
 **Volatility:**
-- IV: 51.2% (P26 / Rank 0.13)
-- HV 30d: 38.2% | IV-HV: +13.0%
-- Beta: 1.71
-- Put/Call: 0.41
-- OI (ATM): 5,738
-- Liquidity: 4/5
-
-**Operational:**
-- Earnings: 50d
-- Volume: 43% of avg
-
-**Fundamental:**
-- PE: 398.2x
-- EPS growth: +132.4%
-- Debt/Equity: 0.19x
-- Profit margin: 4.0%
-
-### BEN — $31.25
-
-**Technical:**
-- Trend 25d: BULLISH (+6.1%)
-- MAs: Above both | SMA50 RISING
-- RSI: 45.9
-- 52w: 91.0% (mid range)
-- Support: 1.5% away
-- Resistance: 3.5% away
-- Candle: GREEN CANDLE (BULLISH)
-
-**Volatility:**
-- IV: 37.0% (P52 / Rank 0.01)
-- HV 30d: 31.0% | IV-HV: +8.8%
+- IV: 46.5% (P58 / Rank 0.02)
+- HV: N/A
 - Beta: 1.57
-- Put/Call: 4.52
-- OI (ATM): 9,001
-- Liquidity: 3/5
+- Put/Call: 0.20
+- OI: N/A
+- Liquidity: N/A
 
 **Operational:**
 - Earnings: N/A
-- Volume: 24% of avg
+- Volume: 162% of avg
 
 **Fundamental:**
 - PE: 23.7x
@@ -343,231 +315,374 @@ Ninguna.
 - Debt/Equity: 0.23x
 - Profit margin: 8.1%
 
-### NVDA — $224.95
+### IVZ — $28.22
 
 **Technical:**
-- Trend 25d: BULLISH (+5.5%)
-- MAs: Above both | SMA50 RISING
-- RSI: 53.3
-- 52w: 89.0% (mid range)
-- Support: 12.6% away
-- Resistance: 4.8% away
-- Candle: SHOOTING STAR (BEARISH)
+- Trend 25d: BULLISH +8.5%
+- MAs: Above both | SMA50 FALLING
+- RSI: 55.4
+- 52w: N/A
+- Support: N/A
+- Resistance: N/A
+- Candle: N/A
 
 **Volatility:**
-- IV: 46.1% (P58 / Rank 0.42)
-- HV 30d: 42.2% | IV-HV: +11.2%
-- Beta: 2.27
-- Put/Call: 0.34
-- OI (ATM): 17,645
-- Liquidity: 4/5
+- IV: 44.8% (P67 / Rank 0.19)
+- HV: N/A
+- Beta: 1.60
+- Put/Call: 0.32
+- OI: N/A
+- Liquidity: N/A
 
 **Operational:**
-- Earnings: 85d
-- Volume: 69% of avg
+- Earnings: 54d
+- Volume: 41% of avg
 
 **Fundamental:**
-- PE: 32.3x
-- EPS growth: +93.8%
-- Debt/Equity: 0.07x
-- Profit margin: 63.0%
+- PE: -100000.0x
+- EPS growth: +302.1%
+- Debt/Equity: 0.15x
+- Profit margin: -3.7%
+
+### MNST — $88.65
+
+**Technical:**
+- Trend 25d: BULLISH +15.0%
+- MAs: Above both | SMA50 FALLING
+- RSI: 60.6
+- 52w: N/A
+- Support: N/A
+- Resistance: N/A
+- Candle: N/A
+
+**Volatility:**
+- IV: 26.0% (P30 / Rank 0.15)
+- HV: N/A
+- Beta: 0.50
+- Put/Call: 0.58
+- OI: N/A
+- Liquidity: N/A
+
+**Operational:**
+- Earnings: 63d
+- Volume: 49% of avg
+
+**Fundamental:**
+- PE: 42.8x
+- EPS growth: +24.9%
+- Debt/Equity: 0.01x
+- Profit margin: 23.1%
+
+### CVS — $94.44
+
+**Technical:**
+- Trend 25d: BULLISH +13.4%
+- MAs: Above both | SMA50 FALLING
+- RSI: 42.2
+- 52w: N/A
+- Support: N/A
+- Resistance: N/A
+- Candle: N/A
+
+**Volatility:**
+- IV: 33.4% (P51 / Rank 0.13)
+- HV: N/A
+- Beta: 0.60
+- Put/Call: 0.37
+- OI: N/A
+- Liquidity: N/A
+
+**Operational:**
+- Earnings: 56d
+- Volume: 84% of avg
+
+**Fundamental:**
+- PE: 40.2x
+- EPS growth: +267.1%
+- Debt/Equity: 1.01x
+- Profit margin: 0.7%
+
+### IQV — $185.52
+
+**Technical:**
+- Trend 25d: BULLISH +17.1%
+- MAs: Mixed | SMA50 FALLING
+- RSI: 64.1
+- 52w: N/A
+- Support: N/A
+- Resistance: N/A
+- Candle: N/A
+
+**Volatility:**
+- IV: 43.4% (P73 / Rank 0.52)
+- HV: N/A
+- Beta: 1.22
+- Put/Call: 1.08
+- OI: N/A
+- Liquidity: N/A
+
+**Operational:**
+- Earnings: 54d
+- Volume: 74% of avg
+
+**Fundamental:**
+- PE: 22.6x
+- EPS growth: +76.2%
+- Debt/Equity: 2.55x
+- Profit margin: 8.3%
 
 ## Option Selector — Strikes Recomendados
 
-# Option Selector — 2026-06-02 12:00
+# Option Selector — 2026-06-04 14:46
 DTE: 20-40 | Long Call Delta: 0.4-0.6 | Spread: long ~0.6/short ~0.3 | Max cost: $300
 
-## WAT — $370.23
+## DVA — $192.80
 
 **Criteria:**
-Trend: BULLISH (+23.1% 25d) | SMAs: Above both | RSI: 59.1
-IV: 38.6% (P72 / Rank 0.51) | HV: 59.6% | IV-HV: +11.4%
-Beta: 1.36 | P/C: 0.81 | OI: 226 | Earnings: 57d
+Trend: BULLISH (+24.3% 25d) | SMAs: Above both | RSI: 50.3
+IV: 37.3% (P38 / Rank 0.50) | HV: 73.2% | IV-HV: +23.5%
+Beta: 0.82 | P/C: 2.03 | OI: 248 | Earnings: 62d
 
 _No hay estructuras viables en rango DTE 20-40 / Delta._
 
-## ROK — $459.16
+## HOOD — $88.28
 
 **Criteria:**
-Trend: BULLISH (+14.8% 25d) | SMAs: Above both | RSI: 53.4
-IV: 36.1% (P56 / Rank 0.55) | HV: 38.5% | IV-HV: +12.2%
-Beta: 1.73 | P/C: 0.35 | OI: 395 | Earnings: 65d
+Trend: BULLISH (+21.1% 25d) | SMAs: Above SMA50 | RSI: 57.9
+IV: 71.6% (P60 / Rank 0.37) | HV: 79.7% | IV-HV: +1.8%
+Beta: 2.16 | P/C: 0.24 | OI: 5,476 | Earnings: 55d
 
-_No hay estructuras viables en rango DTE 20-40 / Delta._
-
-## MNST — $88.26
-
-**Criteria:**
-Trend: BULLISH (+14.3% 25d) | SMAs: Above both | RSI: 59.7
-IV: 30.9% (P62 / Rank 0.21) | HV: 44.5% | IV-HV: +7.2%
-Beta: 0.50 | P/C: 1.05 | OI: 7,146 | Earnings: 65d
-
-_No hay estructuras viables en rango DTE 20-40 / Delta._
-
-## ZBRA — $251.62
-
-**Criteria:**
-Trend: BULLISH (+14.8% 25d) | SMAs: Above SMA50 | RSI: 57.1
-IV: 45.4% (P47 / Rank 0.45) | HV: 50.9% | IV-HV: +21.4%
-Beta: 1.63 | P/C: 0.83 | OI: 446 | Earnings: 63d
-
-_No hay estructuras viables en rango DTE 20-40 / Delta._
-
-## ADM — $82.13
-
-**Criteria:**
-Trend: BULLISH (+13.6% 25d) | SMAs: Above both | RSI: 56.5
-IV: 35.9% (P76 / Rank 0.57) | HV: 26.2% | IV-HV: +8.3%
-Beta: 0.57 | P/C: 0.07 | OI: 8,385 | Earnings: 63d
-
-_No hay estructuras viables en rango DTE 20-40 / Delta._
-
-## SOLV — $76.19
-
-**Criteria:**
-Trend: BULLISH (+12.9% 25d) | SMAs: Above both | RSI: 55.8
-IV: 34.3% (P57 / Rank 0.27) | HV: 23.4% | IV-HV: +0.7%
-Beta: 0.73 | P/C: 4.53 | OI: 1,033 | Earnings: N/A
-
-_No hay estructuras viables en rango DTE 20-40 / Delta._
-
-## ELV — $395.02
-
-**Criteria:**
-Trend: BULLISH (+8.9% 25d) | SMAs: Above both | RSI: 51.2
-IV: 38.6% (P38 / Rank 0.36) | HV: 28.9% | IV-HV: +12.5%
-Beta: 0.62 | P/C: 0.15 | OI: 2,972 | Earnings: 44d
-
-_No hay estructuras viables en rango DTE 20-40 / Delta._
-
-## DOC — $19.31
-
-**Criteria:**
-Trend: BULLISH (+20.9% 25d) | SMAs: Above both | RSI: 43.8
-IV: 37.2% (P25 / Rank 0.02) | HV: 56.5% | IV-HV: +386.1%
-Beta: 0.99 | P/C: 0.44 | OI: 20,698 | Earnings: 51d
-
-_No hay estructuras viables en rango DTE 20-40 / Delta._
-
-## IQV — $181.66
-
-**Criteria:**
-Trend: BULLISH (+14.3% 25d) | SMAs: Above SMA50 | RSI: 56.5
-IV: 44.3% (P77 / Rank 0.54) | HV: 53.0% | IV-HV: +8.6%
-Beta: 1.22 | P/C: 0.77 | OI: 788 | Earnings: 49d
-
-_No hay estructuras viables en rango DTE 20-40 / Delta._
-
-## TSLA — $422.61
-
-**Criteria:**
-Trend: BULLISH (+12.4% 25d) | SMAs: Above both | RSI: 45.6
-IV: 51.2% (P26 / Rank 0.13) | HV: 38.2% | IV-HV: +13.0%
-Beta: 1.71 | P/C: 0.41 | OI: 5,738 | Earnings: 50d
-
-**Exp 2026-07-02 (30 DTE)**
+**Exp 2026-07-02 (28 DTE)**
 
 ### Long Call
 
 | Strike | Delta | Bid | Ask | Mid | Costo | θ/día | IV | Breakeven | +50% | +70% |
 |--------|-------|-----|-----|-----|-------|-------|----|-----------|------|------|
-| $415.0 ITM ★ | 0.579 | $26.15 | $26.85 | $26.50 | $2650 ⚠️ | -$37.17 | 47.2% | $441.50 (+4.5%) | +$1325 | +$1855 |
-| $420.0 ITM ★ | 0.544 | $23.70 | $24.25 | $23.98 | $2398 ⚠️ | -$37.62 | 47.1% | $443.98 (+5.1%) | +$1199 | +$1679 |
-| $425.0 ★ | 0.510 | $21.35 | $21.70 | $21.52 | $2152 ⚠️ | -$37.89 | 47.2% | $446.52 (+5.7%) | +$1076 | +$1506 |
-| $430.0 ★ | 0.475 | $19.20 | $19.60 | $19.40 | $1940 ⚠️ | -$37.90 | 47.3% | $449.40 (+6.3%) | +$970 | +$1358 |
+| $86.0 ITM ★ | 0.590 | $7.80 | $8.25 | $8.03 | $803 ⚠️ | -$12.06 | 71.2% | $94.03 (+6.5%) | +$401 | +$562 |
+| $87.0 ITM ★ | 0.567 | $7.30 | $7.60 | $7.45 | $745 ⚠️ | -$12.24 | 71.4% | $94.45 (+7.0%) | +$372 | +$522 |
+| $88.0 ITM ★ | 0.544 | $6.80 | $7.25 | $7.03 | $703 ⚠️ | -$12.34 | 71.4% | $95.03 (+7.7%) | +$352 | +$492 |
+| $89.0 ★ | 0.521 | $6.35 | $6.70 | $6.53 | $653 ⚠️ | -$12.37 | 71.2% | $95.53 (+8.2%) | +$326 | +$457 |
 
 ### Bull Call Spread
 
 | Compra/Vende | Δ long/short | Débito | Costo | Ganancia máx | R/R | Breakeven | +50% | +70% |
 |--------------|--------------|--------|-------|--------------|-----|-----------|------|------|
-| $425.0/$480.0 | 0.51/0.21 | $14.94 | $1494 ⚠️ | +$4006 | 2.68 | $439.94 (+4.1%) | +$2003 | +$2804 |
-| $425.0/$475.0 | 0.51/0.23 | $14.19 | $1419 ⚠️ | +$3581 | 2.52 | $439.19 (+3.9%) | +$1790 | +$2507 |
-| $420.0/$480.0 | 0.54/0.21 | $17.40 | $1740 ⚠️ | +$4260 | 2.45 | $437.40 (+3.5%) | +$2130 | +$2982 |
-| $425.0/$470.0 | 0.51/0.25 | $13.37 | $1337 ⚠️ | +$3163 | 2.37 | $438.37 (+3.7%) | +$1582 | +$2214 |
+| $89.0/$97.0 | 0.52/0.35 | $2.88 | $288 | +$512 | 1.78 | $91.88 (+4.1%) | +$256 | +$358 |
+| $89.0/$96.0 | 0.52/0.37 | $2.60 | $260 | +$440 | 1.69 | $91.60 (+3.8%) | +$220 | +$308 |
+| $89.0/$95.0 | 0.52/0.39 | $2.31 | $231 | +$369 | 1.60 | $91.31 (+3.4%) | +$184 | +$258 |
+| $88.0/$95.0 | 0.54/0.39 | $2.81 | $281 | +$419 | 1.49 | $90.81 (+2.9%) | +$210 | +$293 |
 
-**Mejor spread:** Compra $425.0 / Vende $480.0 | Débito $14.94 ($1494) | Ganancia máx +$4006 | R/R 2.68 | Breakeven $439.94 (+4.1%)
+**Mejor spread:** Compra $89.0 / Vende $97.0 | Débito $2.88 ($288) | Ganancia máx +$512 | R/R 1.78 | Breakeven $91.88 (+4.1%)
 
-## BEN — $31.25
+## DOC — $19.42
 
 **Criteria:**
-Trend: BULLISH (+6.1% 25d) | SMAs: Above both | RSI: 45.9
-IV: 37.0% (P52 / Rank 0.01) | HV: 31.0% | IV-HV: +8.8%
-Beta: 1.57 | P/C: 4.52 | OI: 9,001 | Earnings: N/A
+Trend: BULLISH (+20.7% 25d) | SMAs: Above both | RSI: 49.5
+IV: 31.7% (P25 / Rank 0.01) | HV: 55.7% | IV-HV: +386.1%
+Beta: 0.99 | P/C: 0.45 | OI: 3,735 | Earnings: 49d
 
 _No hay estructuras viables en rango DTE 20-40 / Delta._
 
-## NVDA — $224.95
+## ELV — $410.71
 
 **Criteria:**
-Trend: BULLISH (+5.5% 25d) | SMAs: Above both | RSI: 53.3
-IV: 46.1% (P58 / Rank 0.42) | HV: 42.2% | IV-HV: +11.2%
-Beta: 2.27 | P/C: 0.34 | OI: 17,645 | Earnings: 85d
+Trend: BULLISH (+9.1% 25d) | SMAs: Above both | RSI: 58.0
+IV: 39.4% (P43 / Rank 0.39) | HV: 32.2% | IV-HV: +12.5%
+Beta: 0.62 | P/C: 0.92 | OI: 991 | Earnings: 42d
 
-**Exp 2026-07-02 (30 DTE)**
+_No hay estructuras viables en rango DTE 20-40 / Delta._
+
+## ROK — $462.64
+
+**Criteria:**
+Trend: BULLISH (+13.5% 25d) | SMAs: Above both | RSI: 54.3
+IV: 34.6% (P47 / Rank 0.49) | HV: 38.3% | IV-HV: +12.2%
+Beta: 1.73 | P/C: 1.17 | OI: 397 | Earnings: 63d
+
+_No hay estructuras viables en rango DTE 20-40 / Delta._
+
+## ADM — $83.38
+
+**Criteria:**
+Trend: BULLISH (+12.6% 25d) | SMAs: Above both | RSI: 59.4
+IV: 34.8% (P67 / Rank 0.54) | HV: 26.2% | IV-HV: +8.3%
+Beta: 0.57 | P/C: 0.75 | OI: 1,435 | Earnings: 61d
+
+_No hay estructuras viables en rango DTE 20-40 / Delta._
+
+## UNH — $397.91
+
+**Criteria:**
+Trend: BULLISH (+7.4% 25d) | SMAs: Above both | RSI: 49.1
+IV: 30.3% (P6 / Rank 0.29) | HV: 27.2% | IV-HV: +18.2%
+Beta: 0.57 | P/C: 1.40 | OI: 561 | Earnings: 54d
+
+**Exp 2026-07-02 (28 DTE)**
 
 ### Long Call
 
 | Strike | Delta | Bid | Ask | Mid | Costo | θ/día | IV | Breakeven | +50% | +70% |
 |--------|-------|-----|-----|-----|-------|-------|----|-----------|------|------|
-| $220.0 ITM ★ | 0.599 | $13.60 | $13.80 | $13.70 | $1370 ⚠️ | -$17.94 | 43.2% | $233.70 (+3.9%) | +$685 | +$959 |
-| $225.0 ★ | 0.528 | $11.00 | $11.20 | $11.10 | $1110 ⚠️ | -$18.34 | 42.9% | $236.10 (+5.0%) | +$555 | +$777 |
-| $230.0 ★ | 0.457 | $8.85 | $9.00 | $8.93 | $893 ⚠️ | -$18.32 | 43.0% | $238.93 (+6.2%) | +$446 | +$625 |
-| $235.0 | 0.391 | $7.00 | $7.15 | $7.08 | $708 ⚠️ | -$17.84 | 43.3% | $242.08 (+7.6%) | +$354 | +$496 |
+| $395.0 ITM ★ | 0.552 | $13.40 | $14.35 | $13.88 | $1388 ⚠️ | -$21.87 | 28.1% | $408.88 (+2.8%) | +$694 | +$972 |
+| $400.0 ★ | 0.488 | $10.90 | $11.40 | $11.15 | $1115 ⚠️ | -$21.79 | 27.8% | $411.15 (+3.3%) | +$558 | +$780 |
+| $405.0 ★ | 0.424 | $8.80 | $9.50 | $9.15 | $915 ⚠️ | -$21.56 | 28.0% | $414.15 (+4.1%) | +$458 | +$640 |
+| $390.0 ITM | 0.616 | $15.60 | $16.95 | $16.27 | $1627 ⚠️ | -$21.06 | 28.1% | $406.27 (+2.1%) | +$814 | +$1139 |
 
 ### Bull Call Spread
 
 | Compra/Vende | Δ long/short | Débito | Costo | Ganancia máx | R/R | Breakeven | +50% | +70% |
 |--------------|--------------|--------|-------|--------------|-----|-----------|------|------|
-| $225.0/$250.0 | 0.53/0.23 | $7.65 | $765 ⚠️ | +$1735 | 2.27 | $232.65 (+3.4%) | +$868 | +$1214 |
-| $225.0/$245.0 | 0.53/0.27 | $6.68 | $668 ⚠️ | +$1332 | 1.99 | $231.68 (+3.0%) | +$666 | +$932 |
-| $220.0/$250.0 | 0.60/0.23 | $10.25 | $1025 ⚠️ | +$1975 | 1.93 | $230.25 (+2.4%) | +$988 | +$1382 |
-| $225.0/$240.0 | 0.53/0.33 | $5.52 | $552 ⚠️ | +$948 | 1.72 | $230.52 (+2.5%) | +$474 | +$664 |
+| $395.0/$425.0 | 0.55/0.21 | $10.35 | $1035 ⚠️ | +$1965 | 1.90 | $405.35 (+1.9%) | +$982 | +$1376 |
+| $390.0/$425.0 | 0.62/0.21 | $12.74 | $1274 ⚠️ | +$2226 | 1.75 | $402.74 (+1.2%) | +$1113 | +$1558 |
+| $395.0/$420.0 | 0.55/0.25 | $9.38 | $938 ⚠️ | +$1562 | 1.67 | $404.38 (+1.6%) | +$781 | +$1093 |
+| $390.0/$420.0 | 0.62/0.25 | $11.77 | $1177 ⚠️ | +$1823 | 1.55 | $401.77 (+1.0%) | +$912 | +$1276 |
 
-**Mejor spread:** Compra $225.0 / Vende $250.0 | Débito $7.65 ($765) | Ganancia máx +$1735 | R/R 2.27 | Breakeven $232.65 (+3.4%)
+**Mejor spread:** Compra $395.0 / Vende $425.0 | Débito $10.35 ($1035) | Ganancia máx +$1965 | R/R 1.90 | Breakeven $405.35 (+1.9%)
+
+## GWW — $1291.74
+
+**Criteria:**
+Trend: BULLISH (+11.4% 25d) | SMAs: Above both | RSI: 52.9
+IV: 25.2% (P59 / Rank 0.54) | HV: 23.9% | IV-HV: -0.4%
+Beta: 1.02 | P/C: 0.36 | OI: 679 | Earnings: 61d
+
+_No hay estructuras viables en rango DTE 20-40 / Delta._
+
+## SNDK — $1790.00
+
+**Criteria:**
+Trend: BULLISH (+63.2% 25d) | SMAs: Above both | RSI: 73.8
+IV: 106.7% (P69 / Rank 0.71) | HV: 93.3% | IV-HV: -22.2%
+Beta: 2.72 | P/C: 1.71 | OI: 234 | Earnings: 81d
+
+**Exp 2026-07-02 (28 DTE)**
+
+### Long Call
+
+| Strike | Delta | Bid | Ask | Mid | Costo | θ/día | IV | Breakeven | +50% | +70% |
+|--------|-------|-----|-----|-----|-------|-------|----|-----------|------|------|
+| $1740.0 ITM ★ | 0.596 | $220.00 | $234.90 | $227.45 | $22745 ⚠️ | -$360.54 | 105.2% | $1967.45 (+9.9%) | +$11372 | +$15921 |
+| $1750.0 ITM ★ | 0.588 | $216.20 | $229.90 | $223.05 | $22305 ⚠️ | -$361.91 | 105.1% | $1973.05 (+10.2%) | +$11152 | +$15614 |
+| $1760.0 ITM ★ | 0.581 | $212.70 | $225.10 | $218.90 | $21890 ⚠️ | -$363.01 | 105.0% | $1978.90 (+10.6%) | +$10945 | +$15323 |
+| $1765.0 ITM ★ | 0.577 | $207.80 | $222.70 | $215.25 | $21525 ⚠️ | -$363.45 | 104.9% | $1980.25 (+10.6%) | +$10762 | +$15067 |
+
+### Bull Call Spread
+
+| Compra/Vende | Δ long/short | Débito | Costo | Ganancia máx | R/R | Breakeven | +50% | +70% |
+|--------------|--------------|--------|-------|--------------|-----|-----------|------|------|
+| $1865.0/$2130.0 | 0.50/0.32 | $80.00 | $8000 ⚠️ | +$18500 | 2.31 | $1945.00 (+8.7%) | +$9250 | +$12950 |
+| $1865.0/$2120.0 | 0.50/0.33 | $77.30 | $7730 ⚠️ | +$17770 | 2.30 | $1942.30 (+8.5%) | +$8885 | +$12439 |
+| $1860.0/$2120.0 | 0.51/0.33 | $79.50 | $7950 ⚠️ | +$18050 | 2.27 | $1939.50 (+8.3%) | +$9025 | +$12635 |
+| $1855.0/$2120.0 | 0.51/0.33 | $81.45 | $8145 ⚠️ | +$18355 | 2.25 | $1936.45 (+8.2%) | +$9178 | +$12848 |
+
+**Mejor spread:** Compra $1865.0 / Vende $2130.0 | Débito $80.00 ($8000) | Ganancia máx +$18500 | R/R 2.31 | Breakeven $1945.00 (+8.7%)
+
+## BEN — $31.93
+
+**Criteria:**
+Trend: BULLISH (+6.5% 25d) | SMAs: Above both | RSI: 46.8
+IV: 46.5% (P58 / Rank 0.02) | HV: 34.3% | IV-HV: +8.8%
+Beta: 1.57 | P/C: 0.20 | OI: 1,921 | Earnings: N/A
+
+_No hay estructuras viables en rango DTE 20-40 / Delta._
+
+## IVZ — $28.22
+
+**Criteria:**
+Trend: BULLISH (+8.5% 25d) | SMAs: Above both | RSI: 55.4
+IV: 44.8% (P67 / Rank 0.19) | HV: 29.9% | IV-HV: +5.6%
+Beta: 1.60 | P/C: 0.32 | OI: 23,983 | Earnings: 54d
+
+_No hay estructuras viables en rango DTE 20-40 / Delta._
+
+## MNST — $88.65
+
+**Criteria:**
+Trend: BULLISH (+15.0% 25d) | SMAs: Above both | RSI: 60.6
+IV: 26.0% (P30 / Rank 0.15) | HV: 43.7% | IV-HV: +7.2%
+Beta: 0.50 | P/C: 0.58 | OI: 1,065 | Earnings: 63d
+
+_No hay estructuras viables en rango DTE 20-40 / Delta._
+
+## CVS — $94.44
+
+**Criteria:**
+Trend: BULLISH (+13.4% 25d) | SMAs: Above both | RSI: 42.2
+IV: 33.4% (P51 / Rank 0.13) | HV: 37.9% | IV-HV: +8.1%
+Beta: 0.60 | P/C: 0.37 | OI: 906 | Earnings: 56d
+
+**Exp 2026-07-02 (28 DTE)**
+
+### Long Call
+
+| Strike | Delta | Bid | Ask | Mid | Costo | θ/día | IV | Breakeven | +50% | +70% |
+|--------|-------|-----|-----|-----|-------|-------|----|-----------|------|------|
+| $93.0 ITM ★ | 0.586 | $4.00 | $4.30 | $4.15 | $415 ⚠️ | -$5.89 | 32.4% | $97.15 (+2.9%) | +$208 | +$290 |
+| $94.0 ITM ★ | 0.539 | $3.40 | $3.75 | $3.58 | $358 ⚠️ | -$5.96 | 32.2% | $97.58 (+3.3%) | +$179 | +$251 |
+| $95.0 ★ | 0.491 | $2.88 | $3.25 | $3.06 | $306 ⚠️ | -$5.91 | 31.8% | $98.06 (+3.8%) | +$153 | +$214 |
+| $96.0 ★ | 0.442 | $2.50 | $2.68 | $2.59 | $259 | -$5.75 | 31.2% | $98.59 (+4.4%) | +$130 | +$181 |
+
+### Bull Call Spread
+
+| Compra/Vende | Δ long/short | Débito | Costo | Ganancia máx | R/R | Breakeven | +50% | +70% |
+|--------------|--------------|--------|-------|--------------|-----|-----------|------|------|
+| $94.0/$101.0 | 0.54/0.22 | $2.54 | $254 | +$446 | 1.76 | $96.54 (+2.2%) | +$223 | +$312 |
+| $94.0/$100.0 | 0.54/0.26 | $2.33 | $233 | +$367 | 1.58 | $96.33 (+2.0%) | +$184 | +$257 |
+| $94.0/$99.0 | 0.54/0.31 | $2.03 | $203 | +$297 | 1.46 | $96.03 (+1.7%) | +$148 | +$208 |
+| $93.0/$100.0 | 0.59/0.26 | $2.90 | $290 | +$410 | 1.41 | $95.90 (+1.6%) | +$205 | +$287 |
+
+**Mejor spread:** Compra $94.0 / Vende $101.0 | Débito $2.54 ($254) | Ganancia máx +$446 | R/R 1.76 | Breakeven $96.54 (+2.2%)
+
+## IQV — $185.52
+
+**Criteria:**
+Trend: BULLISH (+17.1% 25d) | SMAs: Above SMA50 | RSI: 64.1
+IV: 43.4% (P73 / Rank 0.52) | HV: 53.5% | IV-HV: +8.6%
+Beta: 1.22 | P/C: 1.08 | OI: 390 | Earnings: 54d
+
+_No hay estructuras viables en rango DTE 20-40 / Delta._
 
 ---
-_Generated 2026-06-02 12:00 · option_selector.py_
+_Generated 2026-06-04 14:46 · option_selector.py_
 
-## Eliminados por Filtros Duros (38)
+## Eliminados por Filtros Duros (36)
 
-- **GNRC:** Low open interest (18)
-- **CNC:** Low open interest (52)
-- **CIEN:** IV percentile too high (P98) | Earnings in 2d — IV crush risk | Low open interest (35)
-- **AKAM:** IV percentile too high (P90) | Low open interest (69)
-- **COHR:** IV percentile too high (P92) | Low open interest (10)
+- **AKAM:** IV percentile too high (P87) | Low open interest (110)
+- **COHR:** IV percentile too high (P86) | Low open interest (126)
+- **ON:** IV percentile too high (P99) | Low open interest (32)
+- **INTC:** IV percentile too high (P96)
+- **F:** IV percentile too high (P96)
+- **AMD:** IV percentile too high (P98)
+- **DDOG:** IV percentile too high (P86) | Low open interest (53)
+- **ORCL:** IV percentile too high (P98) | Earnings in 6d — IV crush risk
+- **PANW:** IV percentile too high (P97)
 - **QCOM:** IV percentile too high (P100)
-- **GLW:** IV percentile too high (P98) | Low open interest (154)
-- **NXPI:** IV percentile too high (P100)
-- **LITE:** Low open interest (5)
-- **AMD:** IV percentile too high (P99)
-- **HUM:** Low open interest (17)
-- **ON:** IV percentile too high (P99) | Low open interest (102)
-- **SNDK:** Low open interest (130)
-- **SWKS:** IV percentile too high (P98)
-- **LRCX:** IV percentile too high (P84) | Low open interest (157)
-- **TXN:** IV percentile too high (P99) | Low open interest (39)
-- **CDNS:** IV percentile too high (P90) | Low open interest (25)
-- **MCHP:** IV percentile too high (P82) | Low open interest (33)
-- **FCX:** IV percentile too high (P96)
-- **AMAT:** IV percentile too high (P90) | Low open interest (98)
-- **JBL:** IV percentile too high (P100) | Earnings in 14d — IV crush risk | Low open interest (25)
-- **INTC:** IV percentile too high (P99)
-- **RVTY:** Low open interest (168)
-- **IRM:** Low open interest (16)
+- **GLW:** IV percentile too high (P97)
+- **CNC:** Low open interest (75)
+- **LRCX:** IV percentile too high (P81) | Low open interest (159)
+- **FCX:** IV percentile too high (P94)
+- **NOW:** IV percentile too high (P98)
+- **HPQ:** IV percentile too high (P98)
+- **TXN:** IV percentile too high (P98) | Low open interest (57)
+- **NXPI:** IV percentile too high (P98)
+- **GNRC:** Low open interest (25)
+- **APP:** Low open interest (168)
+- **TER:** IV percentile too high (P88) | Low open interest (139)
 - **ARES:** Low open interest (13)
-- **CAT:** IV percentile too high (P83) | Low open interest (46)
-- **IBKR:** Low open interest (23)
-- **ADI:** IV percentile too high (P98) | Low open interest (94)
-- **MU:** IV percentile too high (P100)
-- **STX:** IV percentile too high (P94) | Low open interest (42)
-- **WDC:** IV percentile too high (P81) | Low open interest (54)
-- **APP:** Low open interest (100)
-- **MPWR:** IV percentile too high (P97)
-- **F:** IV percentile too high (P100)
-- **NOW:** IV percentile too high (P99)
-- **CARR:** IV percentile too high (P80) | Low open interest (31)
-- **WDAY:** IV percentile too high (P95) | Low open interest (195)
-- **EL:** Low open interest (18)
+- **IBKR:** Low open interest (21)
+- **CSCO:** IV percentile too high (P97)
+- **CRWD:** IV percentile too high (P87) | Low open interest (65)
+- **MU:** IV percentile too high (P100) | Earnings in 20d — IV crush risk
+- **STX:** IV percentile too high (P92) | Low open interest (52)
+- **WDC:** Low open interest (129)
+- **ADI:** IV percentile too high (P98) | Low open interest (103)
+- **CAT:** Low open interest (51)
+- **SWKS:** IV percentile too high (P94)
+- **MCHP:** IV percentile too high (P92) | Low open interest (39)
+- **RVTY:** Low open interest (112)
+- **MPWR:** IV percentile too high (P97) | Low open interest (129)
+- **JBL:** IV percentile too high (P99) | Earnings in 13d — IV crush risk | Low open interest (45)
+- **VRSN:** IV percentile too high (P83)
 
 ---
-_Generado 2026-06-02 12:00 · Options Trading System_
+_Generado 2026-06-04 14:46 · Options Trading System_
