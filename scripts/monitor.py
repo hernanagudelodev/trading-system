@@ -1022,6 +1022,144 @@ def run_monitor(ask_ai=False):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# PAPER MONITOR
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_paper_monitor():
+    """
+    Monitor paper positions — console only, no push notifications.
+    Uses real Tastytrade prices for P&L calculation.
+    """
+    import psycopg2
+    from dotenv import load_dotenv
+    load_dotenv()
+
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    print(f"\n{'=' * 60}")
+    print(f"  PAPER MONITOR — {timestamp}")
+    market_status = get_market_status()
+    status_label  = {"open": "ABIERTO", "pre": "PRE-MARKET", "closed": "CERRADO"}
+    print(f"  Mercado: {status_label.get(market_status, '?')} | "
+          f"Intervalo: {get_interval()}min")
+    print(f"{'=' * 60}\n")
+
+    conn = psycopg2.connect(os.getenv("DATABASE_URL"))
+    cur  = conn.cursor()
+    cur.execute("""
+        SELECT id, ticker, strategy, strike_low, strike_high,
+               expiration, contracts, total_cost, premium_paid,
+               current_spread_value, gross_pnl, pnl_pct,
+               profit_pct_of_max, opened_at
+        FROM paper_positions
+        WHERE UPPER(status) = 'OPEN'
+        ORDER BY opened_at
+    """)
+    cols      = [d[0] for d in cur.description]
+    positions = [dict(zip(cols, row)) for row in cur.fetchall()]
+    cur.close()
+    conn.close()
+
+    if not positions:
+        print("  No hay paper positions abiertas.\n")
+        return
+
+    print(f"  Paper positions abiertas: {len(positions)}\n")
+
+    for pos in positions:
+        ticker      = pos["ticker"]
+        strike_low  = float(pos["strike_low"])
+        strike_high = float(pos["strike_high"])
+        total_cost  = float(pos["total_cost"])
+        premium     = float(pos["premium_paid"])
+        expiration  = pos["expiration"]
+        dte         = (expiration - date.today()).days
+
+        print(f"  Revisando {ticker} (paper)...", end=" ", flush=True)
+
+        spread_value = get_spread_value_tastytrade(ticker, strike_low, strike_high, expiration)
+
+        if spread_value is None:
+            # Use last known value if available
+            spread_value = float(pos["current_spread_value"] or 0)
+            print(f"usando último valor conocido: ${spread_value:.2f}")
+        else:
+            print(f"spread=${spread_value:.2f}")
+
+        spread_width  = strike_high - strike_low
+        strategy      = pos.get("strategy", "Bull Call Spread")
+        is_put_spread = strategy == "Bull Put Spread"
+
+        if is_put_spread:
+            net_credit     = abs(premium)
+            max_profit     = round(net_credit * 100, 2)
+            max_loss       = round((spread_width - net_credit) * 100, 2)
+            cost_to_close  = round(spread_value * 100, 2)
+            current_value  = cost_to_close
+            gross_pnl      = round(max_profit - cost_to_close, 2)
+            pnl_pct        = round(gross_pnl / max_profit * 100, 2) if max_profit else 0
+            profit_pct_max = round(gross_pnl / max_profit, 4) if max_profit else 0
+            strategy_type  = "credit_spread"
+        else:
+            max_profit     = round((spread_width - premium) * 100, 2)
+            current_value  = round(spread_value * 100, 2)
+            gross_pnl      = round(current_value - total_cost, 2)
+            pnl_pct        = round(gross_pnl / total_cost * 100, 2) if total_cost else 0
+            profit_pct_max = round(gross_pnl / max_profit, 4) if max_profit else 0
+            strategy_type  = "debit_spread"
+
+        # Alert level
+        pnl_data = {
+            "profit_pct_of_max": profit_pct_max,
+            "pnl_pct":           pnl_pct,
+            "dte":               dte,
+            "strategy_type":     strategy_type,
+        }
+        alert_level, reasons = evaluate_alert_level(pnl_data)
+        icon = level_icon(alert_level)
+
+        print(f"\n  {icon} {ticker} (PAPER) — {strategy} — {alert_level}")
+        print(f"  {'─' * 50}")
+        print(f"  Strike(s):     ${strike_low} / ${strike_high}")
+        print(f"  Expiracion:    {expiration} ({dte} dias)")
+        if is_put_spread:
+            print(f"  Crédito rec:   ${abs(premium):.2f} (max ganancia ${max_profit:.2f})")
+            print(f"  Costo cierre:  ${cost_to_close:.2f}")
+        else:
+            print(f"  Costo total:   ${total_cost:.2f}")
+        print(f"  Spread actual: ${spread_value:.2f}")
+        print(f"  Ganancia/Perd: ${gross_pnl:+.2f} ({pnl_pct:+.1f}%)")
+        print(f"  % del maximo:  {profit_pct_max*100:.1f}%")
+        print(f"  Ganancia max:  ${max_profit:.2f}")
+        print(f"\n  Alertas:")
+        for r in reasons:
+            print(f"    - {r}")
+        print()
+
+        # Update DB silently
+        conn2 = psycopg2.connect(os.getenv("DATABASE_URL"))
+        cur2  = conn2.cursor()
+        cur2.execute("""
+            UPDATE paper_positions SET
+                current_spread_value = %s,
+                current_value        = %s,
+                gross_pnl            = %s,
+                pnl_pct              = %s,
+                profit_pct_of_max    = %s,
+                last_synced_at       = NOW()
+            WHERE id = %s
+        """, (spread_value, current_value, gross_pnl, pnl_pct,
+              profit_pct_max, pos["id"]))
+        conn2.commit()
+        cur2.close()
+        conn2.close()
+
+    print(f"{'=' * 60}")
+    print(f"  Paper monitor completado — {timestamp}\n")
+    print(f"  NOTA: Paper positions son silenciosas — sin push notifications.\n")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # SCHEDULED RUN (Railway)
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1035,11 +1173,15 @@ def scheduled_run():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Monitor de posiciones")
-    parser.add_argument("--loop", action="store_true",
-                        help="Correr en loop adaptativo")
+    parser.add_argument("--loop",  action="store_true",
+                        help="Correr en loop adaptativo (posiciones reales)")
+    parser.add_argument("--paper", action="store_true",
+                        help="Monitorear paper positions (sin push notifications)")
     args = parser.parse_args()
 
-    if args.loop:
+    if args.paper:
+        run_paper_monitor()
+    elif args.loop:
         print(f"\n  Monitor en loop adaptativo")
         print(f"  Mercado abierto:  cada {INTERVAL_MARKET_OPEN}min")
         print(f"  Pre-market:       cada {INTERVAL_PRE_MARKET}min")

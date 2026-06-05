@@ -3,31 +3,19 @@ option_selector.py
 ==================
 Selects optimal option structures for tickers that passed hard filters.
 
-Evaluates TWO bullish strategies per ticker:
-    1. Long Call         → single strike, Delta 0.40-0.60
-    2. Bull Call Spread  → buy Delta ~0.60 + sell Delta ~0.30
+Strategy selection is driven by criteria.py → select_strategy():
+    IV < 30%   → Long Call (high Beta + momentum) or Bull Call Spread
+    30-60%     → Bull Call Spread
+    IV >= 60%  → Bull Put Spread (sell premium, time works FOR us)
 
 For each ticker:
     1. Fetches option chain from Tastytrade API
     2. Finds best expiration in DTE range (20-40 days)
     3. Captures Greeks + Quotes for all candidate strikes
-    4. Builds Long Call candidates (Delta 0.40-0.60)
-    5. Builds Bull Call Spread candidates (long ~0.60 / short ~0.30)
-    6. Returns compact markdown for AI interpretation
+    4. Builds strategy-appropriate candidates
+    5. Returns compact markdown for AI interpretation
 
 Called by scanner.py after passes_hard_filters().
-
-Usage:
-    from option_selector import get_options_for_tickers
-    markdown = get_options_for_tickers(session, tickers_dict)
-
-ROADMAP (future):
-    - Bearish path: Long Put + Bear Put Spread (when market_context bearish)
-    - Uncertain path: Long Straddle (when VIX high / no clear direction)
-
-Dependencies:
-    tastytrade SDK
-    Tastytrade session (passed in — no re-auth)
 """
 
 import asyncio
@@ -39,41 +27,46 @@ from datetime import date, datetime
 # CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════════════
 
-DTE_MIN          = 20    # minimum days to expiration
-DTE_MAX          = 40    # maximum days to expiration
+DTE_MIN = 20
+DTE_MAX = 40
 
-# Long Call delta range
+# Long Call / Bull Call Spread — call side
 DELTA_MIN        = 0.35
 DELTA_MAX        = 0.65
 DELTA_IDEAL_LOW  = 0.40
 DELTA_IDEAL_HIGH = 0.60
 
-# Bull Call Spread leg targets
-SPREAD_LONG_DELTA_TARGET  = 0.60   # buy leg — ITM-ish
-SPREAD_SHORT_DELTA_TARGET = 0.30   # sell leg — OTM
+SPREAD_LONG_DELTA_TARGET  = 0.60
+SPREAD_SHORT_DELTA_TARGET = 0.30
 SPREAD_LONG_DELTA_RANGE   = (0.50, 0.70)
 SPREAD_SHORT_DELTA_RANGE  = (0.20, 0.40)
 
-MAX_LONG_CALLS   = 4     # max long call strikes to show
-MAX_SPREADS      = 4     # max spreads to show
-MAX_COST         = 300   # max cost per position (risk limit) — flagged if exceeded
+# Bull Put Spread — put side
+# Short put: slightly OTM (Delta 0.25-0.45, absolute value)
+# Long put: further OTM (Delta 0.10-0.25, absolute value) — protection
+PUT_SHORT_DELTA_RANGE = (0.25, 0.45)   # sell this put
+PUT_LONG_DELTA_RANGE  = (0.10, 0.25)   # buy this put (lower strike)
+
+MAX_LONG_CALLS = 4
+MAX_SPREADS    = 4
+MAX_COST       = 300   # flagged if exceeded (for debit strategies)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ASYNC CORE — fetch option chain + Greeks for one ticker
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def _fetch_option_data(session, ticker, price):
+async def _fetch_option_data(session, ticker, price, strategy):
     """
     Fetch option chain with real-time Greeks for a single ticker.
-
-    Returns dict with 'long_calls' and 'spreads' lists, or empty structure.
+    strategy: 'Long Call' | 'Bull Call Spread' | 'Bull Put Spread'
     """
     from tastytrade.instruments import NestedOptionChain
     from tastytrade.dxfeed import Greeks, Quote
     from tastytrade import DXLinkStreamer
 
-    empty = {"long_calls": [], "spreads": [], "exp_date": None, "dte": None}
+    empty = {"long_calls": [], "spreads": [], "put_spreads": [],
+             "exp_date": None, "dte": None, "strategy": strategy}
 
     try:
         chains = await NestedOptionChain.get(session, ticker)
@@ -81,7 +74,7 @@ async def _fetch_option_data(session, ticker, price):
             return empty
         chain = chains[0]
 
-        # ── Find best expiration in DTE range ─────────────────────────────────
+        # Best expiration in DTE range (closest to 30d)
         target_exp = None
         best_diff  = 9999
         for exp in chain.expirations:
@@ -98,7 +91,7 @@ async def _fetch_option_data(session, ticker, price):
         dte_selected = target_exp.days_to_expiration
         exp_date     = target_exp.expiration_date
 
-        # ── Candidate strikes within ±25% of price ────────────────────────────
+        # Candidate strikes within ±25% of price
         price_low  = price * 0.75
         price_high = price * 1.25
         candidate_strikes = [
@@ -108,76 +101,86 @@ async def _fetch_option_data(session, ticker, price):
         if not candidate_strikes:
             return empty
 
-        call_symbols = [s.call_streamer_symbol for s in candidate_strikes]
+        # For Bull Put Spread we need put symbols; others need call symbols
+        if strategy == "Bull Put Spread":
+            symbols = [s.put_streamer_symbol for s in candidate_strikes]
+        else:
+            symbols = [s.call_streamer_symbol for s in candidate_strikes]
 
-        # ── Fetch Greeks + Quotes via DXLink ──────────────────────────────────
         greeks_map = {}
         quotes_map = {}
 
         async with DXLinkStreamer(session) as streamer:
-            await streamer.subscribe(Greeks, call_symbols)
-            await streamer.subscribe(Quote, call_symbols)
+            await streamer.subscribe(Greeks, symbols)
+            await streamer.subscribe(Quote, symbols)
 
-            for _ in call_symbols:
+            for _ in symbols:
                 try:
                     g = await asyncio.wait_for(streamer.get_event(Greeks), timeout=10)
                     greeks_map[g.event_symbol] = g
                 except asyncio.TimeoutError:
                     break
 
-            for _ in call_symbols:
+            for _ in symbols:
                 try:
                     q = await asyncio.wait_for(streamer.get_event(Quote), timeout=10)
                     quotes_map[q.event_symbol] = q
                 except asyncio.TimeoutError:
                     break
 
-        # ── Build a unified strike table ──────────────────────────────────────
+        # Build unified strike table
         strike_table = []
         for s in candidate_strikes:
-            sym = s.call_streamer_symbol
+            sym = s.put_streamer_symbol if strategy == "Bull Put Spread" \
+                  else s.call_streamer_symbol
             g   = greeks_map.get(sym)
             q   = quotes_map.get(sym)
             if g is None or g.delta is None:
                 continue
 
-            delta = float(g.delta)
+            delta        = float(g.delta)
             strike_price = float(s.strike_price)
-            theta = float(g.theta)      if g.theta      else None
-            vega  = float(g.vega)       if g.vega       else None
+            theta = float(g.theta)       if g.theta      else None
             iv    = float(g.volatility) * 100 if g.volatility else None
-            theo  = float(g.price)      if g.price      else None
-
-            bid = float(q.bid_price) if q and q.bid_price else 0.0
-            ask = float(q.ask_price) if q and q.ask_price else 0.0
-            mid = round((bid + ask) / 2, 2) if (bid and ask) else (theo or 0.0)
+            bid   = float(q.bid_price)   if q and q.bid_price else 0.0
+            ask   = float(q.ask_price)   if q and q.ask_price else 0.0
+            theo  = float(g.price)       if g.price      else None
+            mid   = round((bid + ask) / 2, 2) if (bid and ask) else (theo or 0.0)
             spread_pct = round((ask - bid) / ask * 100, 1) if ask > 0 else None
 
             strike_table.append({
-                "strike": strike_price,
-                "delta":  delta,
-                "theta":  theta,
-                "vega":   vega,
-                "iv":     iv,
-                "bid":    bid,
-                "ask":    ask,
-                "mid":    mid,
+                "strike":     strike_price,
+                "delta":      delta,
+                "theta":      theta,
+                "iv":         iv,
+                "bid":        bid,
+                "ask":        ask,
+                "mid":        mid,
                 "spread_pct": spread_pct,
             })
 
         strike_table.sort(key=lambda x: x["strike"])
 
-        # ── Build Long Call candidates ────────────────────────────────────────
-        long_calls = _build_long_calls(strike_table, price)
+        # Build strategy-specific candidates
+        long_calls  = []
+        spreads     = []
+        put_spreads = []
 
-        # ── Build Bull Call Spread candidates ─────────────────────────────────
-        spreads = _build_spreads(strike_table, price)
+        if strategy == "Long Call":
+            long_calls = _build_long_calls(strike_table, price)
+        elif strategy == "Bull Call Spread":
+            long_calls = _build_long_calls(strike_table, price)
+            spreads    = _build_call_spreads(strike_table, price)
+        elif strategy == "Bull Put Spread":
+            put_spreads = _build_put_spreads(strike_table, price)
 
         return {
-            "long_calls": long_calls,
-            "spreads":    spreads,
-            "exp_date":   exp_date,
-            "dte":        dte_selected,
+            "long_calls":  long_calls,
+            "spreads":     spreads,
+            "put_spreads": put_spreads,
+            "exp_date":    exp_date,
+            "dte":         dte_selected,
+            "strategy":    strategy,
         }
 
     except Exception as e:
@@ -190,7 +193,6 @@ async def _fetch_option_data(session, ticker, price):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _build_long_calls(strike_table, price):
-    """Build Long Call candidates with Delta 0.35-0.65."""
     results = []
     for s in strike_table:
         delta = s["delta"]
@@ -221,11 +223,9 @@ def _build_long_calls(strike_table, price):
             "profit_70":     profit_70,
             "ideal_delta":   ideal,
             "itm":           s["strike"] < price,
-            "spread_pct":    s["spread_pct"],
             "within_budget": premium_total <= MAX_COST,
         })
 
-    # Sort: ideal delta first, then lowest breakeven_pct
     results.sort(key=lambda x: (not x["ideal_delta"], x["breakeven_pct"]))
     return results[:MAX_LONG_CALLS]
 
@@ -234,33 +234,18 @@ def _build_long_calls(strike_table, price):
 # BULL CALL SPREAD BUILDER
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _build_spreads(strike_table, price):
-    """
-    Build Bull Call Spread candidates.
-
-    Long leg:  Delta in SPREAD_LONG_DELTA_RANGE (~0.60)
-    Short leg: Delta in SPREAD_SHORT_DELTA_RANGE (~0.30), strike above long
-
-    For each valid (long, short) pair:
-        net_debit   = long_mid - short_mid
-        max_profit  = (short_strike - long_strike) - net_debit
-        max_loss    = net_debit
-        breakeven   = long_strike + net_debit
-    """
-    long_candidates  = [s for s in strike_table
-                        if SPREAD_LONG_DELTA_RANGE[0] <= s["delta"] <= SPREAD_LONG_DELTA_RANGE[1]]
-    short_candidates = [s for s in strike_table
-                        if SPREAD_SHORT_DELTA_RANGE[0] <= s["delta"] <= SPREAD_SHORT_DELTA_RANGE[1]]
+def _build_call_spreads(strike_table, price):
+    long_cands  = [s for s in strike_table
+                   if SPREAD_LONG_DELTA_RANGE[0] <= s["delta"] <= SPREAD_LONG_DELTA_RANGE[1]]
+    short_cands = [s for s in strike_table
+                   if SPREAD_SHORT_DELTA_RANGE[0] <= s["delta"] <= SPREAD_SHORT_DELTA_RANGE[1]]
 
     spreads = []
-    for long_leg in long_candidates:
-        for short_leg in short_candidates:
-            # Short strike must be above long strike
+    for long_leg in long_cands:
+        for short_leg in short_cands:
             if short_leg["strike"] <= long_leg["strike"]:
                 continue
-
             spread_width = short_leg["strike"] - long_leg["strike"]
-            # Skip very wide spreads (cost control) and very narrow
             if spread_width < 1 or spread_width > price * 0.15:
                 continue
 
@@ -268,62 +253,111 @@ def _build_spreads(strike_table, price):
             if net_debit <= 0:
                 continue
 
-            max_profit = round((spread_width - net_debit) * 100, 0)
-            max_loss   = round(net_debit * 100, 0)
-            breakeven  = round(long_leg["strike"] + net_debit, 2)
+            max_profit    = round((spread_width - net_debit) * 100, 0)
+            max_loss      = round(net_debit * 100, 0)
+            breakeven     = round(long_leg["strike"] + net_debit, 2)
             breakeven_pct = round((breakeven - price) / price * 100, 2)
-            risk_reward = round(max_profit / max_loss, 2) if max_loss > 0 else 0
-
-            # Profit targets (50-70% of max profit)
-            profit_50 = round(max_profit * 0.50, 0)
-            profit_70 = round(max_profit * 0.70, 0)
+            rr            = round(max_profit / max_loss, 2) if max_loss > 0 else 0
 
             spreads.append({
                 "long_strike":   long_leg["strike"],
                 "short_strike":  short_leg["strike"],
                 "long_delta":    round(long_leg["delta"], 3),
                 "short_delta":   round(short_leg["delta"], 3),
-                "long_mid":      long_leg["mid"],
-                "short_mid":     short_leg["mid"],
-                "spread_width":  spread_width,
                 "net_debit":     net_debit,
                 "cost_total":    max_loss,
                 "max_profit":    max_profit,
                 "max_loss":      max_loss,
                 "breakeven":     breakeven,
                 "breakeven_pct": breakeven_pct,
-                "risk_reward":   risk_reward,
-                "profit_50":     profit_50,
-                "profit_70":     profit_70,
+                "risk_reward":   rr,
+                "profit_50":     round(max_profit * 0.50, 0),
+                "profit_70":     round(max_profit * 0.70, 0),
                 "within_budget": max_loss <= MAX_COST,
             })
 
-    # Sort: best risk/reward first among those within budget
     spreads.sort(key=lambda x: (not x["within_budget"], -x["risk_reward"]))
     return spreads[:MAX_SPREADS]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SYNC WRAPPER
+# BULL PUT SPREAD BUILDER
 # ══════════════════════════════════════════════════════════════════════════════
 
-def get_options_for_tickers(session, tickers_data):
-    """Synchronous entry point for scanner.py."""
-    try:
-        return asyncio.run(_get_options_async(session, tickers_data))
-    except Exception as e:
-        return f"option_selector error: {e}"
+def _build_put_spreads(strike_table, price):
+    """
+    Build Bull Put Spread candidates.
 
+    Structure:
+        Sell OTM put (higher strike, Delta 0.25-0.45 abs) — collect premium
+        Buy  OTM put (lower strike,  Delta 0.10-0.25 abs) — limit risk
 
-async def _get_options_async(session, tickers_data):
-    tasks = {
-        ticker: _fetch_option_data(session, ticker, data.get("price", 0))
-        for ticker, data in tickers_data.items()
-    }
-    results = {}
-    for ticker, coro in tasks.items():
-        results[ticker] = await coro
-    return _build_markdown(tickers_data, results)
+    Note: put deltas are negative. We use absolute values for comparison.
+    Profit = net credit received (if price stays above short put at expiry)
+    Max loss = spread width - net credit
+
+    We want:
+        - Short put slightly OTM (below current price)
+        - Long put further OTM (more below current price)
+        - Short strike > Long strike (both below price)
+    """
+    # For puts: delta is negative, abs(delta) is what we compare
+    # Puts with higher absolute delta = closer to ATM = higher strike
+    short_cands = [s for s in strike_table
+                   if PUT_SHORT_DELTA_RANGE[0] <= abs(s["delta"]) <= PUT_SHORT_DELTA_RANGE[1]
+                   and s["strike"] < price]  # must be OTM (below price)
+
+    long_cands  = [s for s in strike_table
+                   if PUT_LONG_DELTA_RANGE[0] <= abs(s["delta"]) <= PUT_LONG_DELTA_RANGE[1]
+                   and s["strike"] < price]  # further OTM
+
+    put_spreads = []
+    for short_leg in short_cands:
+        for long_leg in long_cands:
+            # Long put must have lower strike than short put
+            if long_leg["strike"] >= short_leg["strike"]:
+                continue
+
+            spread_width = short_leg["strike"] - long_leg["strike"]
+            if spread_width < 1 or spread_width > price * 0.12:
+                continue
+
+            # Net credit = what we receive for selling short - what we pay for long
+            net_credit = round(short_leg["mid"] - long_leg["mid"], 2)
+            if net_credit <= 0:
+                continue
+
+            max_profit  = round(net_credit * 100, 0)       # credit received
+            max_loss    = round((spread_width - net_credit) * 100, 0)
+            # Breakeven: short put strike - net credit
+            breakeven   = round(short_leg["strike"] - net_credit, 2)
+            # How far below current price is breakeven? (negative = below price)
+            be_pct      = round((breakeven - price) / price * 100, 2)
+            # R/R for credit spreads: max_profit / max_loss
+            rr          = round(max_profit / max_loss, 2) if max_loss > 0 else 0
+            # Probability of profit ≈ 1 - abs(short delta)
+            pop_approx  = round((1 - abs(short_leg["delta"])) * 100, 0)
+
+            put_spreads.append({
+                "short_strike":   short_leg["strike"],   # sell this (higher)
+                "long_strike":    long_leg["strike"],    # buy this (lower, protection)
+                "short_delta":    round(short_leg["delta"], 3),
+                "long_delta":     round(long_leg["delta"], 3),
+                "short_mid":      short_leg["mid"],
+                "long_mid":       long_leg["mid"],
+                "net_credit":     net_credit,
+                "max_profit":     max_profit,
+                "max_loss":       max_loss,
+                "breakeven":      breakeven,
+                "breakeven_pct":  be_pct,
+                "risk_reward":    rr,
+                "pop_approx":     pop_approx,
+                "stop_loss_2x":   round(net_credit * 2 * 100, 0),  # close if spread costs 2x credit
+            })
+
+    # Sort: best R/R first
+    put_spreads.sort(key=lambda x: -x["risk_reward"])
+    return put_spreads[:MAX_SPREADS]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -332,22 +366,20 @@ async def _get_options_async(session, tickers_data):
 
 def _build_markdown(tickers_data, options_results):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-    lines     = []
-
-    lines.append(f"# Option Selector — {timestamp}")
-    lines.append(f"DTE: {DTE_MIN}-{DTE_MAX} | Long Call Delta: {DELTA_IDEAL_LOW}-{DELTA_IDEAL_HIGH} | "
-                 f"Spread: long ~{SPREAD_LONG_DELTA_TARGET}/short ~{SPREAD_SHORT_DELTA_TARGET} | "
-                 f"Max cost: ${MAX_COST}")
-    lines.append("")
-
-    any_results = False
+    lines     = [
+        f"# Option Selector — {timestamp}",
+        f"DTE: {DTE_MIN}-{DTE_MAX} | Delta ranges auto-selected by strategy",
+        "",
+    ]
 
     for ticker, criteria in tickers_data.items():
-        data    = options_results.get(ticker, {})
-        long_calls = data.get("long_calls", [])
-        spreads    = data.get("spreads", [])
-        exp_date   = data.get("exp_date")
-        dte        = data.get("dte")
+        data        = options_results.get(ticker, {})
+        long_calls  = data.get("long_calls", [])
+        spreads     = data.get("spreads", [])
+        put_spreads = data.get("put_spreads", [])
+        exp_date    = data.get("exp_date")
+        dte         = data.get("dte")
+        strategy    = data.get("strategy", "Bull Call Spread")
 
         price = criteria.get("price", 0)
         vol   = criteria.get("volatility", {})
@@ -357,48 +389,46 @@ def _build_markdown(tickers_data, options_results):
         lines.append(f"## {ticker} — ${price:.2f}")
         lines.append("")
 
-        # ── Criteria summary ──────────────────────────────────────────────────
-        trend   = tech.get("trend_25d", {})
-        ma      = tech.get("moving_averages", {})
-        rsi     = tech.get("rsi")
-        iv      = vol.get("iv")
-        ivp     = vol.get("iv_percentile")
-        iv_rank = vol.get("iv_rank")
-        hv      = vol.get("hv_30d")
-        iv_hv   = vol.get("iv_hv_diff")
-        beta    = vol.get("beta")
-        pcr     = vol.get("put_call_ratio")
-        oi      = vol.get("open_interest")
+        # Criteria summary
+        trend     = tech.get("trend_25d", {})
+        ma        = tech.get("moving_averages", {})
+        rsi       = tech.get("rsi")
+        iv        = vol.get("iv")
+        ivp       = vol.get("iv_percentile")
+        iv_rank   = vol.get("iv_rank")
+        hv        = vol.get("hv_30d")
+        iv_hv     = vol.get("iv_hv_diff")
+        beta      = vol.get("beta")
+        pcr       = vol.get("put_call_ratio")
+        oi        = vol.get("open_interest")
         days_earn = earn.get("days_to_earnings")
 
-        lines.append("**Criteria:**")
         trend_str = f"{'BULLISH' if trend.get('is_bullish') else 'BEARISH'} ({trend.get('pct_change', 0):+.1f}% 25d)"
         sma_str   = 'Above both' if ma.get('above_sma50') and ma.get('above_sma200') else 'Above SMA50'
         rsi_str   = f"{rsi:.1f}" if rsi else "N/A"
-        lines.append(f"Trend: {trend_str} | SMAs: {sma_str} | RSI: {rsi_str}")
 
+        lines.append("**Criteria:**")
+        lines.append(f"Trend: {trend_str} | SMAs: {sma_str} | RSI: {rsi_str}")
         if all(x is not None for x in [iv, ivp, iv_rank, hv, iv_hv]):
             lines.append(f"IV: {iv:.1f}% (P{ivp:.0f} / Rank {iv_rank:.2f}) | HV: {hv:.1f}% | IV-HV: {iv_hv:+.1f}%")
-        else:
-            lines.append("IV: N/A (Tastytrade no devolvió métricas)")
-
-        beta_str = f"{beta:.2f}" if beta is not None else "N/A"
-        pcr_str  = f"{pcr:.2f}" if pcr is not None else "N/A"
-        oi_str   = f"{oi:,.0f}" if oi is not None else "N/A"
-        earn_str = f"{days_earn}d" if days_earn else "N/A"
+        beta_str  = f"{beta:.2f}"   if beta      is not None else "N/A"
+        pcr_str   = f"{pcr:.2f}"    if pcr       is not None else "N/A"
+        oi_str    = f"{oi:,.0f}"    if oi        is not None else "N/A"
+        earn_str  = f"{days_earn}d" if days_earn             else "N/A"
         lines.append(f"Beta: {beta_str} | P/C: {pcr_str} | OI: {oi_str} | Earnings: {earn_str}")
         lines.append("")
+        lines.append(f"**Estrategia recomendada: {strategy}**")
+        lines.append("")
 
-        if not long_calls and not spreads:
+        if not long_calls and not spreads and not put_spreads:
             lines.append("_No hay estructuras viables en rango DTE 20-40 / Delta._")
             lines.append("")
             continue
 
-        any_results = True
         lines.append(f"**Exp {exp_date} ({dte} DTE)**")
         lines.append("")
 
-        # ── LONG CALL table ───────────────────────────────────────────────────
+        # ── Long Call ─────────────────────────────────────────────────────────
         if long_calls:
             lines.append("### Long Call")
             lines.append("")
@@ -421,13 +451,14 @@ def _build_markdown(tickers_data, options_results):
                 )
             lines.append("")
 
-        # ── BULL CALL SPREAD table ────────────────────────────────────────────
+        # ── Bull Call Spread ──────────────────────────────────────────────────
         if spreads:
             lines.append("### Bull Call Spread")
             lines.append("")
             lines.append("| Compra/Vende | Δ long/short | Débito | Costo | Ganancia máx | R/R | Breakeven | +50% | +70% |")
             lines.append("|--------------|--------------|--------|-------|--------------|-----|-----------|------|------|")
-            for s in spreads:
+            best_idx = 0
+            for i, s in enumerate(spreads):
                 budget = "" if s["within_budget"] else " ⚠️"
                 lines.append(
                     f"| ${s['long_strike']:.1f}/${s['short_strike']:.1f} "
@@ -439,24 +470,75 @@ def _build_markdown(tickers_data, options_results):
                     f"| ${s['breakeven']:.2f} ({s['breakeven_pct']:+.1f}%) "
                     f"| +${s['profit_50']:.0f} | +${s['profit_70']:.0f} |"
                 )
+            best = spreads[best_idx]
             lines.append("")
-
-            # Best spread recommendation
-            best = spreads[0]
             lines.append(
-                f"**Mejor spread:** Compra ${best['long_strike']:.1f} / Vende ${best['short_strike']:.1f} | "
-                f"Débito ${best['net_debit']:.2f} (${best['cost_total']:.0f}) | "
-                f"Ganancia máx +${best['max_profit']:.0f} | "
-                f"R/R {best['risk_reward']:.2f} | "
-                f"Breakeven ${best['breakeven']:.2f} ({best['breakeven_pct']:+.1f}%)"
+                f"**Mejor spread:** Compra ${best['long_strike']:.1f} / Vende ${best['short_strike']:.1f} "
+                f"| Débito ${best['net_debit']:.2f} (${best['cost_total']:.0f}) "
+                f"| Ganancia máx +${best['max_profit']:.0f} "
+                f"| R/R {best['risk_reward']:.2f} "
+                f"| Breakeven ${best['breakeven']:.2f} ({best['breakeven_pct']:+.1f}%)"
             )
             lines.append("")
 
-    if not any_results:
-        lines.append("_No actionable structures found today._")
-        lines.append("")
+        # ── Bull Put Spread ───────────────────────────────────────────────────
+        if put_spreads:
+            lines.append("### Bull Put Spread (Credit Spread)")
+            lines.append("")
+            lines.append("_Vendes el put de strike alto, compras el de strike bajo. "
+                         "Cobras crédito desde el día 1. "
+                         "Ganas si el precio se mantiene sobre el breakeven._")
+            lines.append("")
+            lines.append("| Vende/Compra | Δ short/long | Crédito | Max Ganancia | Max Pérdida | R/R | Breakeven | POP | Stop 2x |")
+            lines.append("|-------------|--------------|---------|--------------|-------------|-----|-----------|-----|---------|")
+            for s in put_spreads:
+                lines.append(
+                    f"| ${s['short_strike']:.1f}/${s['long_strike']:.1f} "
+                    f"| {s['short_delta']:.2f}/{s['long_delta']:.2f} "
+                    f"| ${s['net_credit']:.2f} "
+                    f"| +${s['max_profit']:.0f} "
+                    f"| -${s['max_loss']:.0f} "
+                    f"| {s['risk_reward']:.2f} "
+                    f"| ${s['breakeven']:.2f} ({s['breakeven_pct']:+.1f}%) "
+                    f"| ~{s['pop_approx']:.0f}% "
+                    f"| ${s['stop_loss_2x']:.0f} |"
+                )
+            best = put_spreads[0]
+            lines.append("")
+            lines.append(
+                f"**Mejor spread:** Vende ${best['short_strike']:.1f} / Compra ${best['long_strike']:.1f} "
+                f"| Crédito ${best['net_credit']:.2f} (${best['max_profit']:.0f}) "
+                f"| Max pérdida -${best['max_loss']:.0f} "
+                f"| R/R {best['risk_reward']:.2f} "
+                f"| Breakeven ${best['breakeven']:.2f} ({best['breakeven_pct']:+.1f}%) "
+                f"| POP ~{best['pop_approx']:.0f}%"
+            )
+            lines.append("")
 
-    lines.append("---")
+    lines.append(f"---")
     lines.append(f"_Generated {timestamp} · option_selector.py_")
-
     return "\n".join(lines)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SYNC WRAPPER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_options_for_tickers(session, tickers_data):
+    """Synchronous entry point for scanner.py."""
+    try:
+        return asyncio.run(_get_options_async(session, tickers_data))
+    except Exception as e:
+        return f"option_selector error: {e}"
+
+
+async def _get_options_async(session, tickers_data):
+    from criteria import select_strategy
+
+    results = {}
+    for ticker, criteria in tickers_data.items():
+        strategy = select_strategy(criteria)
+        results[ticker] = await _fetch_option_data(session, ticker,
+                                                    criteria.get("price", 0),
+                                                    strategy)
+    return _build_markdown(tickers_data, results)

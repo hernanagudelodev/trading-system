@@ -13,6 +13,7 @@ Data sources:
 
 Scoring logic lives in:  scoring.py
 Hard filters live in:    passes_hard_filters() — bottom of this file
+Strategy selection:      select_strategy() — determines optimal strategy per ticker
 """
 
 import sys
@@ -29,26 +30,19 @@ warnings.filterwarnings("ignore")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TASTYTRADE SESSION — singleton to avoid re-authenticating per ticker
+# TASTYTRADE SESSION
 # ══════════════════════════════════════════════════════════════════════════════
 
 _tt_session = None
 
 def _get_tt_session():
-    """
-    Return a cached Tastytrade session, creating one if needed.
-    Uses asyncio.run() to stay compatible with synchronous callers.
-    """
     global _tt_session
     if _tt_session is not None:
         return _tt_session
-
-    client_secret   = os.getenv("TASTYTRADE_CLIENT_SECRET")
-    refresh_token   = os.getenv("TASTYTRADE_REFRESH_TOKEN")
-
+    client_secret = os.getenv("TASTYTRADE_CLIENT_SECRET")
+    refresh_token = os.getenv("TASTYTRADE_REFRESH_TOKEN")
     if not client_secret or not refresh_token:
         return None
-
     try:
         from tastytrade import Session as TTSession
         _tt_session = TTSession(client_secret, refresh_token)
@@ -58,21 +52,12 @@ def _get_tt_session():
 
 
 async def _fetch_market_metrics(symbols):
-    """
-    Async helper — fetch MarketMetricInfo for a list of symbols.
-    Creates a FRESH session inside this event loop to avoid the
-    "session bound to closed loop" problem when asyncio.run() is
-    called repeatedly.
-    Returns dict: {symbol: MarketMetricInfo}
-    """
     from tastytrade import Session as TTSession
     from tastytrade.metrics import get_market_metrics
-
     client_secret = os.getenv("TASTYTRADE_CLIENT_SECRET")
     refresh_token = os.getenv("TASTYTRADE_REFRESH_TOKEN")
     if not client_secret or not refresh_token:
         return {}
-
     try:
         session = TTSession(client_secret, refresh_token)
         metrics = await get_market_metrics(session, symbols)
@@ -83,10 +68,6 @@ async def _fetch_market_metrics(symbols):
 
 
 def _get_market_metrics_sync(symbols):
-    """
-    Synchronous wrapper around _fetch_market_metrics.
-    Safe to call from synchronous code.
-    """
     try:
         return asyncio.run(_fetch_market_metrics(symbols))
     except Exception:
@@ -123,7 +104,6 @@ def _nearest_expiration(expirations, target_days=30):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def get_price_history(ticker, retries=3, delay=3):
-    """Download 1 year of daily OHLCV data from yfinance."""
     import time
     data = pd.DataFrame()
     for attempt in range(retries):
@@ -144,7 +124,7 @@ def get_price_history(ticker, retries=3, delay=3):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TECHNICAL INDICATORS  (unchanged — still from yfinance price history)
+# TECHNICAL INDICATORS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def get_trend_25d(closes):
@@ -162,11 +142,9 @@ def get_trend_25d(closes):
 def get_moving_averages(closes):
     sma50_series  = closes.rolling(window=50).mean()
     sma200_series = closes.rolling(window=200).mean()
-
     sma50  = float(sma50_series.iloc[-1])
     sma200 = float(sma200_series.iloc[-1])
     price  = float(closes.iloc[-1])
-
     sma50_10d = float(sma50_series.iloc[-10])
     if sma50 > sma50_10d * 1.001:
         direction = "RISING"
@@ -174,13 +152,13 @@ def get_moving_averages(closes):
         direction = "FALLING"
     else:
         direction = "FLAT"
-
     return {
         "sma50":           round(sma50, 2),
         "sma200":          round(sma200, 2),
         "above_sma50":     price > sma50,
         "above_sma200":    price > sma200,
-        "sma50_direction": direction
+        "sma50_direction": direction,
+        "sma50_rising":    direction == "RISING",
     }
 
 
@@ -200,14 +178,12 @@ def get_52_week_position(closes, price):
     min_52w = float(closes.tail(252).min())
     rng     = max_52w - min_52w
     pos     = (price - min_52w) / rng * 100 if rng > 0 else 50.0
-
     if pos >= 95:
         tag = "near high"
     elif pos <= 10:
         tag = "near low"
     else:
         tag = "mid range"
-
     return {
         "max_52w":      round(max_52w, 2),
         "min_52w":      round(min_52w, 2),
@@ -221,7 +197,6 @@ def get_52_week_position(closes, price):
 def get_support_resistance(closes, price, window=5, zone_pct=0.02):
     prices = closes.values
     highs, lows = [], []
-
     for i in range(window, len(prices) - window):
         if all(prices[i] >= prices[i-j] for j in range(1, window+1)) and \
            all(prices[i] >= prices[i+j] for j in range(1, window+1)):
@@ -246,13 +221,10 @@ def get_support_resistance(closes, price, window=5, zone_pct=0.02):
 
     support_zones    = cluster(lows,  zone_pct)
     resistance_zones = cluster(highs, zone_pct)
-
     support    = max((z for z in support_zones    if z < price), default=None)
     resistance = min((z for z in resistance_zones if z > price), default=None)
-
     support_pct    = round((price - support)    / price * 100, 1) if support    else None
     resistance_pct = round((resistance - price) / price * 100, 1) if resistance else None
-
     return {
         "support":         round(support,    2) if support    else None,
         "resistance":      round(resistance, 2) if resistance else None,
@@ -276,75 +248,49 @@ def get_candlestick_pattern(data):
     o2, h2, l2, c2 = float(opens.iloc[-2]), float(highs.iloc[-2]), float(lows.iloc[-2]), float(closes.iloc[-2])
     o3, h3, l3, c3 = float(opens.iloc[-1]), float(highs.iloc[-1]), float(lows.iloc[-1]), float(closes.iloc[-1])
 
-    body3        = abs(c3 - o3)
-    range3       = h3 - l3
-    upper_wick3  = h3 - max(o3, c3)
-    lower_wick3  = min(o3, c3) - l3
+    body3       = abs(c3 - o3)
+    range3      = h3 - l3
+    upper_wick3 = h3 - max(o3, c3)
+    lower_wick3 = min(o3, c3) - l3
 
-    # 3-candle patterns
     if is_green(o1,c1) and is_red(o2,c2) and is_green(o3,c3) and c3 > c1:
-        return {"pattern": "MORNING STAR",      "signal": "BULLISH",  "sentiment": "BULLISH", "candles": 3}
-    if is_red(o1,c1)   and is_green(o2,c2) and is_red(o3,c3)   and c3 < c1:
-        return {"pattern": "EVENING STAR",      "signal": "BEARISH",  "sentiment": "BEARISH", "candles": 3}
+        return {"pattern": "MORNING STAR",       "signal": "BULLISH", "sentiment": "BULLISH", "candles": 3}
+    if is_red(o1,c1)   and is_green(o2,c2) and is_red(o3,c3) and c3 < c1:
+        return {"pattern": "EVENING STAR",       "signal": "BEARISH", "sentiment": "BEARISH", "candles": 3}
     if is_green(o1,c1) and is_green(o2,c2) and is_green(o3,c3):
         return {"pattern": "THREE WHITE SOLDIERS","signal": "BULLISH", "sentiment": "BULLISH", "candles": 3}
     if is_red(o1,c1)   and is_red(o2,c2)   and is_red(o3,c3):
-        return {"pattern": "THREE BLACK CROWS",  "signal": "BEARISH",  "sentiment": "BEARISH", "candles": 3}
-
-    # 2-candle patterns
-    body2  = abs(c2 - o2)
-    range2 = h2 - l2
+        return {"pattern": "THREE BLACK CROWS",  "signal": "BEARISH", "sentiment": "BEARISH", "candles": 3}
     if is_green(o2,c2) and is_red(o3,c3) and c3 < o2 and o3 > c2:
-        return {"pattern": "BEARISH ENGULFING",  "signal": "BEARISH",  "sentiment": "BEARISH", "candles": 2}
+        return {"pattern": "BEARISH ENGULFING",  "signal": "BEARISH", "sentiment": "BEARISH", "candles": 2}
     if is_red(o2,c2)   and is_green(o3,c3) and c3 > o2 and o3 < c2:
-        return {"pattern": "BULLISH ENGULFING",  "signal": "BULLISH",  "sentiment": "BULLISH", "candles": 2}
-
-    # 1-candle patterns
+        return {"pattern": "BULLISH ENGULFING",  "signal": "BULLISH", "sentiment": "BULLISH", "candles": 2}
     if is_green(o3,c3) and is_large(body3,range3) and upper_wick3 < body3*0.1 and lower_wick3 < body3*0.1:
-        return {"pattern": "MARUBOZU GREEN",    "signal": "BULLISH",  "sentiment": "BULLISH", "candles": 1}
+        return {"pattern": "MARUBOZU GREEN",     "signal": "BULLISH", "sentiment": "BULLISH", "candles": 1}
     if is_red(o3,c3)   and is_large(body3,range3) and upper_wick3 < body3*0.1 and lower_wick3 < body3*0.1:
-        return {"pattern": "MARUBOZU RED",      "signal": "BEARISH",  "sentiment": "BEARISH", "candles": 1}
+        return {"pattern": "MARUBOZU RED",       "signal": "BEARISH", "sentiment": "BEARISH", "candles": 1}
     if lower_wick3 > body3*2 and upper_wick3 < body3*0.5:
-        return {"pattern": "HAMMER",            "signal": "BULLISH",  "sentiment": "BULLISH", "candles": 1}
+        return {"pattern": "HAMMER",             "signal": "BULLISH", "sentiment": "BULLISH", "candles": 1}
     if upper_wick3 > body3*2 and lower_wick3 < body3*0.5:
-        return {"pattern": "SHOOTING STAR",     "signal": "BEARISH",  "sentiment": "BEARISH", "candles": 1}
+        return {"pattern": "SHOOTING STAR",      "signal": "BEARISH", "sentiment": "BEARISH", "candles": 1}
     if is_doji(body3, range3):
-        return {"pattern": "DOJI",              "signal": "NEUTRAL",  "sentiment": "NEUTRAL", "candles": 1}
+        return {"pattern": "DOJI",               "signal": "NEUTRAL", "sentiment": "NEUTRAL", "candles": 1}
     if is_green(o3, c3):
-        return {"pattern": "GREEN CANDLE",      "signal": "BULLISH",  "sentiment": "BULLISH", "candles": 1}
-    return     {"pattern": "RED CANDLE",        "signal": "BEARISH",  "sentiment": "BEARISH", "candles": 1}
+        return {"pattern": "GREEN CANDLE",       "signal": "BULLISH", "sentiment": "BULLISH", "candles": 1}
+    return     {"pattern": "RED CANDLE",         "signal": "BEARISH", "sentiment": "BEARISH", "candles": 1}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# VOLATILITY — Tastytrade API (replaces yfinance approximations)
+# VOLATILITY — Tastytrade API
 # ══════════════════════════════════════════════════════════════════════════════
 
 def get_historical_volatility(closes, period=30):
-    """HV 30d — still calculated from price history (no Tastytrade equivalent)."""
     returns = closes.pct_change().dropna()
     hv = returns.rolling(window=period).std().iloc[-1]
     return round(float(hv * (252 ** 0.5) * 100), 2)
 
 
 def get_volatility_from_tastytrade(ticker):
-    """
-    Fetch all volatility metrics from Tastytrade API in a single call.
-
-    Returns dict with:
-        iv              (float | None)  — IV index (current implied volatility)
-        iv_30d          (float | None)  — 30-day IV
-        iv_percentile   (float | None)  — IV percentile 0-100
-        iv_rank         (float | None)  — TW IV rank 0-1
-        iv_hv_diff      (float | None)  — IV minus HV (positive = IV expensive)
-        beta            (float | None)  — beta vs S&P 500
-        put_call_ratio  (float | None)  — put/call ratio
-        open_interest   (int   | None)  — total OI near ATM
-        earnings_date   (date  | None)  — next earnings date
-        pe              (float | None)  — P/E ratio
-        eps             (float | None)  — EPS
-        market_cap      (float | None)  — market cap
-        dividend_ex_date(date  | None)  — ex-dividend date
-    """
     metrics_map = _get_market_metrics_sync([ticker])
     m = metrics_map.get(ticker)
 
@@ -355,9 +301,9 @@ def get_volatility_from_tastytrade(ticker):
             "put_call_ratio": None, "open_interest": None,
             "earnings_date": None, "pe": None, "eps": None,
             "market_cap": None, "dividend_ex_date": None,
+            "liquidity_rating": None,
         }
 
-    # IV percentile comes as string "0.84" → convert to 0-100
     def pct_to_100(val):
         if val is None:
             return None
@@ -367,7 +313,6 @@ def get_volatility_from_tastytrade(ticker):
         except Exception:
             return None
 
-    # Safe float conversion — handles None, strings, and 0 correctly
     def safe_float(val, multiplier=1.0, decimals=2):
         if val is None:
             return None
@@ -376,52 +321,63 @@ def get_volatility_from_tastytrade(ticker):
         except (ValueError, TypeError):
             return None
 
-    # Earnings date
     earnings_date = None
-    if m.earnings and m.earnings.expected_report_date:
-        earnings_date = m.earnings.expected_report_date
+    try:
+        if hasattr(m, "earnings") and m.earnings and hasattr(m.earnings, "expected_report_date"):
+            earnings_date = m.earnings.expected_report_date
+    except Exception:
+        pass
+
+    iv_raw   = getattr(m, "implied_volatility_index",        None)
+    iv_30d   = getattr(m, "implied_volatility_30_day",       None)
+    iv_pct   = getattr(m, "implied_volatility_percentile",   None)
+    iv_rank  = getattr(m, "tw_implied_volatility_index_rank",None)
+    iv_hv    = getattr(m, "iv_hv_30_day_difference",         None)
+    beta_raw = getattr(m, "beta",                            None)
+    pe_raw   = getattr(m, "price_earnings_ratio",            None)
+    eps_raw  = getattr(m, "earnings_per_share",              None)
+    liq_raw  = getattr(m, "liquidity_rating",                None)
 
     return {
-        "iv":             safe_float(m.implied_volatility_index, 100, 2),
-        "iv_30d":         safe_float(m.implied_volatility_30_day, 1.0, 2),
-        "iv_percentile":  pct_to_100(m.implied_volatility_percentile),
-        "iv_rank":        safe_float(m.tw_implied_volatility_index_rank, 1.0, 3),
-        "iv_hv_diff":     safe_float(m.iv_hv_30_day_difference, 1.0, 2),
-        "beta":           safe_float(m.beta, 1.0, 2),
-        "put_call_ratio":  None,   # not in MarketMetrics — fetched from option chain if needed
-        "open_interest":   None,   # not in MarketMetrics — fetched from option chain if needed
+        "iv":             safe_float(iv_raw,  100.0),
+        "iv_30d":         safe_float(iv_30d),
+        "iv_percentile":  pct_to_100(iv_pct),
+        "iv_rank":        safe_float(iv_rank),
+        "iv_hv_diff":     safe_float(iv_hv),
+        "beta":           safe_float(beta_raw),
+        "put_call_ratio": None,
+        "open_interest":  None,
         "earnings_date":  earnings_date,
-        "pe":             safe_float(m.price_earnings_ratio, 1.0, 2),
-        "eps":            safe_float(m.earnings_per_share, 1.0, 4),
-        "market_cap":     safe_float(m.market_cap, 1.0, 0),
-        "dividend_ex_date": m.dividend_ex_date,
-        "liquidity_rating": m.liquidity_rating,
+        "pe":             safe_float(pe_raw),
+        "eps":            safe_float(eps_raw),
+        "market_cap":     None,
+        "dividend_ex_date": None,
+        "liquidity_rating": int(liq_raw) if liq_raw is not None else None,
     }
 
 
-# Kept for backtest compatibility (uses yfinance approximation)
+# Legacy for backtest
 def get_implied_volatility(ticker, price):
     old = _silence_stderr()
     try:
-        tk = yf.Ticker(ticker)
+        tk          = yf.Ticker(ticker)
         expirations = tk.options
         _restore_stderr(old)
         if not expirations:
             return {"iv": None, "expiration": None}
         best_exp = _nearest_expiration(expirations, target_days=30)
-        if not best_exp:
-            return {"iv": None, "expiration": None}
-        chain = tk.option_chain(best_exp)
-        calls = chain.calls[chain.calls["strike"] > 0]
-        idx = (calls["strike"] - price).abs().idxmin()
-        iv = float(calls.loc[idx, "impliedVolatility"]) * 100
-        return {"iv": round(iv, 2), "expiration": best_exp}
+        chain    = tk.option_chain(best_exp)
+        calls    = chain.calls.copy()
+        calls["dist"] = (calls["strike"] - price).abs()
+        atm5     = calls.nsmallest(5, "dist")
+        iv       = atm5["impliedVolatility"].dropna().mean()
+        return {"iv": round(float(iv) * 100, 2) if pd.notna(iv) else None,
+                "expiration": best_exp}
     except Exception:
         _restore_stderr(old)
         return {"iv": None, "expiration": None}
 
 
-# Kept for backtest compatibility
 def get_iv_percentile(closes, iv_current):
     if iv_current is None:
         return {"percentile": None}
@@ -434,7 +390,7 @@ def get_iv_percentile(closes, iv_current):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# EARNINGS, VOLUME, FUNDAMENTALS  (yfinance — unchanged)
+# EARNINGS, VOLUME, FUNDAMENTALS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def get_earnings_info(ticker):
@@ -444,26 +400,19 @@ def get_earnings_info(ticker):
         info = tk.info
         is_etf = info.get("quoteType", "") == "ETF"
         _restore_stderr(old)
-
         if is_etf:
             return {"days_to_earnings": None, "is_etf": True}
-
         calendar = tk.calendar
         if not calendar or "Earnings Date" not in calendar:
             return {"days_to_earnings": None, "is_etf": False}
-
         dates = calendar["Earnings Date"]
         if not dates:
             return {"days_to_earnings": None, "is_etf": False}
-
-        date = dates[0] if isinstance(dates, list) else dates
-        days = (date - datetime.date.today()).days
-
+        d    = dates[0] if isinstance(dates, list) else dates
+        days = (d - datetime.date.today()).days
         if days < 0 or days > 365:
             return {"days_to_earnings": None, "is_etf": False}
-
         return {"days_to_earnings": int(days), "is_etf": False}
-
     except Exception:
         _restore_stderr(old)
         return {"days_to_earnings": None, "is_etf": False}
@@ -487,26 +436,21 @@ def get_fundamentals(ticker):
         tk   = yf.Ticker(ticker)
         info = tk.info
         _restore_stderr(old)
-
         pe           = info.get("trailingPE") or info.get("forwardPE")
         eps_trailing = info.get("trailingEps")
         eps_forward  = info.get("forwardEps")
         de_raw       = info.get("debtToEquity")
         margin       = info.get("profitMargins")
-
-        eps_growth = None
+        eps_growth   = None
         if eps_trailing and eps_forward and eps_trailing != 0:
-            eps_growth = round(
-                (eps_forward - eps_trailing) / abs(eps_trailing) * 100, 2
-            )
-
+            eps_growth = round((eps_forward - eps_trailing) / abs(eps_trailing) * 100, 2)
         return {
             "pe":             round(float(pe), 2)           if pe           else None,
             "eps_trailing":   round(float(eps_trailing), 2) if eps_trailing else None,
             "eps_forward":    round(float(eps_forward), 2)  if eps_forward  else None,
             "eps_growth_pct": eps_growth,
             "debt_to_equity": round(float(de_raw) / 100, 2) if de_raw is not None else None,
-            "profit_margin_pct": round(float(margin) * 100, 2) if margin   else None
+            "profit_margin_pct": round(float(margin) * 100, 2) if margin else None
         }
     except Exception:
         _restore_stderr(old)
@@ -514,18 +458,6 @@ def get_fundamentals(ticker):
             "pe": None, "eps_trailing": None, "eps_forward": None,
             "eps_growth_pct": None, "debt_to_equity": None, "profit_margin_pct": None
         }
-
-
-def get_beta(ticker):
-    old = _silence_stderr()
-    try:
-        tk   = yf.Ticker(ticker)
-        beta = tk.info.get("beta")
-        _restore_stderr(old)
-        return round(float(beta), 2) if beta is not None else None
-    except Exception:
-        _restore_stderr(old)
-        return None
 
 
 def get_put_call_ratio(ticker, price):
@@ -567,64 +499,16 @@ def get_open_interest(ticker, price):
         return {"oi": None, "expiration": None}
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# HARD FILTERS — deterministic, no weights, no scoring
-# ══════════════════════════════════════════════════════════════════════════════
-
-def passes_hard_filters(criteria):
-    """
-    Apply 5 deterministic entry conditions.
-    Returns (passed: bool, reasons: list[str])
-
-    Filters:
-        1. Trend bearish          → eliminate
-        2. Below SMA50            → eliminate
-        3. IV percentile > 80%    → options too expensive for buyers
-        4. Earnings < 21 days     → IV crush risk
-        5. Open interest < 500    → insufficient liquidity
-    """
-    if criteria is None:
-        return False, ["No data"]
-
-    tech = criteria.get("technical", {})
-    vol  = criteria.get("volatility", {})
-    earn = criteria.get("earnings", {})
-
-    reasons = []
-
-    # 1. Trend
-    trend = tech.get("trend_25d", {})
-    if not trend.get("is_bullish", False):
-        reasons.append(f"Bearish trend ({trend.get('pct_change', 0):+.1f}% 25d)")
-
-    # 2. SMA50
-    ma = tech.get("moving_averages", {})
-    if not ma.get("above_sma50", False):
-        reasons.append("Below SMA50")
-
-    # 3. IV percentile
-    ivp = vol.get("iv_percentile")
-    if isinstance(ivp, dict):
-        ivp = ivp.get("percentile")
-    if ivp is not None and ivp > 80:
-        reasons.append(f"IV percentile too high (P{ivp:.0f})")
-
-    # 4. Earnings
-    days_to_earn = earn.get("days_to_earnings")
-    if days_to_earn is not None and days_to_earn < 21:
-        reasons.append(f"Earnings in {days_to_earn}d — IV crush risk")
-
-    # 5. Open interest
-    oi_data = vol.get("open_interest", {})
-    if isinstance(oi_data, dict):
-        oi = oi_data.get("oi")
-    else:
-        oi = oi_data
-    if oi is not None and oi < 200:
-        reasons.append(f"Low open interest ({oi:,})")
-
-    passed = len(reasons) == 0
-    return passed, reasons
+def get_beta(ticker):
+    old = _silence_stderr()
+    try:
+        tk   = yf.Ticker(ticker)
+        beta = tk.info.get("beta")
+        _restore_stderr(old)
+        return round(float(beta), 2) if beta is not None else None
+    except Exception:
+        _restore_stderr(old)
+        return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -634,27 +518,19 @@ def passes_hard_filters(criteria):
 def get_all_criteria(ticker):
     """
     Fetch and compute ALL criteria for a given ticker.
-
-    Volatility data comes from Tastytrade API (exact).
-    Technical, fundamental, earnings, volume from yfinance.
-
+    Volatility data from Tastytrade API. Technical/fundamental from yfinance.
     Returns structured dict or None if insufficient price data.
     """
     data = get_price_history(ticker)
-
     if data.empty or len(data) < 50:
         return None
 
     closes = data["Close"].squeeze()
     price  = float(closes.iloc[-1])
 
-    # ── Tastytrade volatility (single API call per ticker) ────────────────────
     tt_vol = get_volatility_from_tastytrade(ticker)
-
-    # ── Historical volatility (calculated locally) ────────────────────────────
     hv_value = get_historical_volatility(closes)
 
-    # ── Earnings: prefer Tastytrade date, fallback to yfinance ────────────────
     earnings_yf = get_earnings_info(ticker)
     if tt_vol.get("earnings_date"):
         days_to_earn = (tt_vol["earnings_date"] - datetime.date.today()).days
@@ -665,7 +541,6 @@ def get_all_criteria(ticker):
     else:
         earnings_info = earnings_yf
 
-    # ── Fundamentals: prefer Tastytrade PE/EPS, fill rest from yfinance ───────
     fund_yf = get_fundamentals(ticker)
     if tt_vol.get("pe") is not None:
         fund_yf["pe"] = tt_vol["pe"]
@@ -697,13 +572,125 @@ def get_all_criteria(ticker):
             "put_call_ratio":  get_put_call_ratio(ticker, price).get("pcr"),
             "open_interest":   get_open_interest(ticker, price).get("oi"),
             "liquidity_rating": tt_vol.get("liquidity_rating"),
-
-            # Legacy keys — kept for scoring.py / backtest compatibility
-            "implied":               {"iv": tt_vol["iv"], "expiration": None},
-            "iv_percentile_legacy":  {"percentile": tt_vol["iv_percentile"]},
+            # Legacy keys for scoring.py / backtest compatibility
+            "implied":              {"iv": tt_vol["iv"], "expiration": None},
+            "iv_percentile_legacy": {"percentile": tt_vol["iv_percentile"]},
         },
 
         "earnings":    earnings_info,
         "volume":      get_volume(data),
         "fundamental": fund_yf,
     }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STRATEGY SELECTION
+# ══════════════════════════════════════════════════════════════════════════════
+
+def select_strategy(criteria):
+    """
+    Determine optimal options strategy based on IV percentile and context.
+
+        IV < 30%    → Long Call (if Beta >1.5 + trend >10% + RSI <65)
+                    → Bull Call Spread (all other cases)
+        30-60%      → Bull Call Spread
+        IV >= 60%   → Bull Put Spread (sell expensive premium)
+
+    Returns: 'Long Call' | 'Bull Call Spread' | 'Bull Put Spread'
+    """
+    if criteria is None:
+        return "Bull Call Spread"
+
+    vol  = criteria.get("volatility", {})
+    tech = criteria.get("technical", {})
+
+    ivp = vol.get("iv_percentile")
+    if isinstance(ivp, dict):
+        ivp = ivp.get("percentile")
+
+    beta      = vol.get("beta") or 0
+    trend     = tech.get("trend_25d", {})
+    rsi       = tech.get("rsi") or 50
+    trend_pct = abs(trend.get("pct_change", 0))
+
+    if ivp is None:
+        return "Bull Call Spread"
+
+    if ivp >= 60:
+        return "Bull Put Spread"
+    elif ivp < 30:
+        if beta > 1.5 and trend_pct > 10 and rsi < 65:
+            return "Long Call"
+        return "Bull Call Spread"
+    else:
+        return "Bull Call Spread"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HARD FILTERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def passes_hard_filters(criteria):
+    """
+    Apply deterministic entry conditions.
+    Returns (passed: bool, reasons: list[str])
+
+    Filters:
+        1. Trend bearish       → eliminate
+        2. Below SMA50         → eliminate
+        3. IV percentile       → strategy-aware:
+           - Buying strategies (Long Call, Bull Call Spread): eliminate if IV > 80%
+           - Selling strategies (Bull Put Spread): eliminate only if IV > 95% (extreme)
+        4. Earnings < 21 days  → IV crush risk (all strategies)
+        5. Open interest < 200 → insufficient liquidity
+    """
+    if criteria is None:
+        return False, ["No data"]
+
+    tech = criteria.get("technical", {})
+    vol  = criteria.get("volatility", {})
+    earn = criteria.get("earnings", {})
+    reasons = []
+
+    # 1. Trend
+    trend = tech.get("trend_25d", {})
+    if not trend.get("is_bullish", False):
+        reasons.append(f"Bearish trend ({trend.get('pct_change', 0):+.1f}% 25d)")
+
+    # 2. SMA50
+    ma = tech.get("moving_averages", {})
+    if not ma.get("above_sma50", False):
+        reasons.append("Below SMA50")
+
+    # 3. IV percentile — strategy-aware
+    ivp = vol.get("iv_percentile")
+    if isinstance(ivp, dict):
+        ivp = ivp.get("percentile")
+
+    if ivp is not None:
+        strategy = select_strategy(criteria)
+        if strategy == "Bull Put Spread":
+            # For selling: only extreme IV is a problem
+            if ivp > 95:
+                reasons.append(f"IV percentile extreme (P{ivp:.0f}) — even selling is risky")
+        else:
+            # For buying: eliminate if IV > 80%
+            if ivp > 80:
+                reasons.append(f"IV percentile too high (P{ivp:.0f})")
+
+    # 4. Earnings
+    days_to_earn = earn.get("days_to_earnings")
+    if days_to_earn is not None and days_to_earn < 21:
+        reasons.append(f"Earnings in {days_to_earn}d — IV crush risk")
+
+    # 5. Open interest
+    oi_data = vol.get("open_interest", {})
+    if isinstance(oi_data, dict):
+        oi = oi_data.get("oi")
+    else:
+        oi = oi_data
+    if oi is not None and oi < 200:
+        reasons.append(f"Low open interest ({oi:,})")
+
+    passed = len(reasons) == 0
+    return passed, reasons
