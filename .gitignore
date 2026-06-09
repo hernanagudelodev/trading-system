@@ -8,3 +8,5 @@ trading_env/
 
 # Logs
 backtest_errors.log
+
+reports/
