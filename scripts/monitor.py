@@ -242,16 +242,23 @@ def _get_tt_session_monitor():
         return None
 
 
-async def _fetch_spread_value_async(ticker, strike_low, strike_high, expiration):
+async def _fetch_spread_value_async(ticker, strike_low, strike_high, expiration,
+                                    option_type="call", session=None):
     """
-    Fetch real market value of a Bull Call Spread from Tastytrade.
-    Returns net spread value per share (long_mid - short_mid), or None on failure.
+    Fetch real market value of a spread from Tastytrade.
+    option_type: 'call' for Bull Call Spread, 'put' for Bull Put Spread
+    session: pass existing session to avoid re-authenticating on every call.
+    Returns net spread value per share, or None on failure.
     """
     from tastytrade.instruments import NestedOptionChain
     from tastytrade.dxfeed import Quote
     from tastytrade import DXLinkStreamer
 
-    session = _get_tt_session_monitor()
+    if session is None:
+        session = _get_tt_session_monitor()
+    else:
+        # Always create a fresh session to avoid stale connections
+        session = _get_tt_session_monitor()
     if session is None:
         return None
 
@@ -281,11 +288,17 @@ async def _fetch_spread_value_async(ticker, strike_low, strike_high, expiration)
         if long_strike_obj is None or short_strike_obj is None:
             return None
 
-        long_sym  = long_strike_obj.call_streamer_symbol
-        short_sym = short_strike_obj.call_streamer_symbol
-        symbols   = [long_sym, short_sym]
+        # Use put or call streamer symbol based on strategy
+        if option_type == "put":
+            long_sym  = long_strike_obj.put_streamer_symbol
+            short_sym = short_strike_obj.put_streamer_symbol
+        else:
+            long_sym  = long_strike_obj.call_streamer_symbol
+            short_sym = short_strike_obj.call_streamer_symbol
 
+        symbols    = [long_sym, short_sym]
         quotes_map = {}
+
         async with DXLinkStreamer(session) as streamer:
             await streamer.subscribe(Quote, symbols)
             for _ in symbols:
@@ -308,7 +321,12 @@ async def _fetch_spread_value_async(ticker, strike_low, strike_high, expiration)
         long_mid  = (long_bid + long_ask) / 2   if (long_bid and long_ask)   else 0.0
         short_mid = (short_bid + short_ask) / 2 if (short_bid and short_ask) else 0.0
 
-        spread_value = round(long_mid - short_mid, 2)
+        if option_type == "put":
+            # Bull Put Spread value = short_put_mid - long_put_mid
+            spread_value = round(short_mid - long_mid, 2)
+        else:
+            spread_value = round(long_mid - short_mid, 2)
+
         return spread_value if spread_value > 0 else None
 
     except Exception as e:
@@ -316,10 +334,24 @@ async def _fetch_spread_value_async(ticker, strike_low, strike_high, expiration)
         return None
 
 
-def get_spread_value_tastytrade(ticker, strike_low, strike_high, expiration):
-    """Synchronous wrapper. Returns net spread value per share or None."""
+def get_spread_value_tastytrade(ticker, strike_low, strike_high, expiration,
+                                option_type="call", session=None):
+    """
+    Synchronous wrapper. Creates a fresh event loop for each call to avoid
+    'Event loop is closed' errors when called multiple times in sequence.
+    Session parameter kept for API compatibility but not used across calls.
+    """
     try:
-        return asyncio.run(_fetch_spread_value_async(ticker, strike_low, strike_high, expiration))
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            return loop.run_until_complete(
+                _fetch_spread_value_async(ticker, strike_low, strike_high,
+                                          expiration, option_type, None)
+            )
+        finally:
+            loop.close()
+            asyncio.set_event_loop(None)
     except Exception:
         return None
 
@@ -1066,6 +1098,9 @@ def run_paper_monitor():
 
     print(f"  Paper positions abiertas: {len(positions)}\n")
 
+    # Create ONE session — reused across all spread value fetches
+    tt_session = _get_tt_session_monitor()
+
     for pos in positions:
         ticker      = pos["ticker"]
         strike_low  = float(pos["strike_low"])
@@ -1077,7 +1112,14 @@ def run_paper_monitor():
 
         print(f"  Revisando {ticker} (paper)...", end=" ", flush=True)
 
-        spread_value = get_spread_value_tastytrade(ticker, strike_low, strike_high, expiration)
+        # Determine option type for spread value fetch
+        strategy     = pos.get("strategy", "Bull Call Spread")
+        opt_type     = "put" if strategy == "Bull Put Spread" else "call"
+        spread_value = get_spread_value_tastytrade(ticker, strike_low, strike_high,
+                                                   expiration, opt_type, tt_session)
+
+        # Small delay to avoid overwhelming DXLinkStreamer
+        time.sleep(0.5)
 
         if spread_value is None:
             # Use last known value if available

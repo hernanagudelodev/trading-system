@@ -1,22 +1,22 @@
 {
-  "timestamp": "2026-06-05 09:05",
+  "timestamp": "2026-06-09 09:08",
   "verdict": "FAVORABLE",
   "verdict_detail": "Strong macro conditions for options trading.",
   "vix": {
-    "current": 16.45,
+    "current": 17.61,
     "level": "CALM",
     "trend": "STABLE",
-    "avg_5d": 15.95,
-    "avg_10d": 16.07
+    "avg_5d": 17.9,
+    "avg_10d": 16.87
   },
   "spy": {
-    "price": 749.09,
+    "price": 744.16,
     "trend": "BULLISH",
-    "pct_25d": 3.95,
+    "pct_25d": 2.82,
     "sma_status": "ABOVE BOTH",
     "sma50_dir": "RISING",
-    "sma50": 713.74,
-    "sma200": 681.62
+    "sma50": 717.6,
+    "sma200": 682.67
   },
   "sectors": [
     {
