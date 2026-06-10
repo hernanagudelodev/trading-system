@@ -20,7 +20,6 @@ import os
 import sys
 import json
 import argparse
-import webbrowser
 from datetime import datetime
 
 from dotenv import load_dotenv
@@ -61,9 +60,21 @@ TIER1_MIN_CANDIDATES = 2   # expand to universe if fewer than this pass
 # Reports go to reports/ directory (one level up from scripts/)
 _BASE_DIR        = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REPORTS_DIR      = os.path.join(_BASE_DIR, "reports")
-MARKET_CONTEXT_JSON = os.path.join(REPORTS_DIR, "market_context.json")
-REPORT_MD_PATH      = os.path.join(REPORTS_DIR, "scanner_report.md")
-REPORT_HTML_PATH    = os.path.join(REPORTS_DIR, "scanner_report.html")
+MARKET_CONTEXT_JSON  = os.path.join(REPORTS_DIR, "market_context.json")
+REPORT_MD_PATH       = os.path.join(REPORTS_DIR, "scanner_report.md")
+REPORT_HTML_PATH     = os.path.join(REPORTS_DIR, "scanner_report.html")
+REPORT_AI_PATH       = os.path.join(REPORTS_DIR, "scanner_ai_summary.md")
+
+
+def _open_browser(path):
+    """Open in browser only when running locally — skip on Railway/server."""
+    if os.getenv("RAILWAY_ENVIRONMENT"):
+        return
+    try:
+        import webbrowser
+        webbrowser.open(f"file:///{path.replace(os.sep, '/')}")
+    except Exception:
+        pass
 
 # Sector map for concentration warnings
 TICKER_SECTOR = {
@@ -222,6 +233,156 @@ def check_sector_concentration(open_positions, passed_criteria):
 # ══════════════════════════════════════════════════════════════════════════════
 # REPORT GENERATORS
 # ══════════════════════════════════════════════════════════════════════════════
+
+def generate_ai_summary(market_ctx, open_positions, passed_criteria,
+                        options_md, tier_used):
+    """
+    Generate ultra-compact AI-friendly summary for Anthropic API consumption.
+    Target: ~50 lines max. No tables, no HTML, no eliminated tickers.
+    Saved to reports/scanner_ai_summary.md
+    """
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    lines     = [f"SCANNER AI SUMMARY — {timestamp}", f"Tier: {tier_used}", ""]
+
+    # ── Macro context ─────────────────────────────────────────────────────────
+    if market_ctx:
+        vix     = market_ctx.get("vix", {})
+        spy     = market_ctx.get("spy", {})
+        verdict = market_ctx.get("verdict", "N/A")
+        detail  = market_ctx.get("verdict_detail", "")
+        lines.append(
+            f"MACRO: {verdict} — {detail}"
+        )
+        lines.append(
+            f"VIX: {vix.get('current', 'N/A')} {vix.get('level', '')} "
+            f"{vix.get('trend', '')} | "
+            f"SPY: ${spy.get('price', 'N/A')} {spy.get('trend', '')} "
+            f"{spy.get('pct_25d', 0):+.1f}% 25d"
+        )
+
+        # Macro events
+        macro_events = market_ctx.get("macro_events", [])
+        if macro_events:
+            event_strs = [
+                f"{e['event'].split('—')[0].strip()} en {e['days_away']}d ({e['impact']})"
+                for e in macro_events
+            ]
+            lines.append(f"EVENTOS: {' | '.join(event_strs)}")
+
+        # Upcoming earnings risk
+        upcoming = market_ctx.get("upcoming_earnings", [])
+        if upcoming:
+            earn_strs = [f"{e['ticker']} ({e['sector']}) en {e['days_away']}d"
+                         for e in upcoming]
+            lines.append(f"EARNINGS RIESGO: {' | '.join(earn_strs)}")
+    else:
+        lines.append("MACRO: no disponible")
+
+    lines.append("")
+
+    # ── Candidates ────────────────────────────────────────────────────────────
+    if passed_criteria:
+        lines.append(f"CANDIDATOS ({len(passed_criteria)}):")
+
+        # Parse options_md to extract best spread per ticker
+        import re
+        best_spreads = {}
+        if options_md:
+            # Find "Mejor spread:" lines
+            for m in re.finditer(
+                r'\*\*Mejor spread:\*\*\s*(.+?)(?:\n|$)', options_md
+            ):
+                # Look back to find which ticker this belongs to
+                pos   = m.start()
+                chunk = options_md[:pos]
+                tm    = re.findall(r'^## ([A-Z]+) —', chunk, re.MULTILINE)
+                if tm:
+                    best_spreads[tm[-1]] = m.group(1).strip()
+
+            # Also find Bull Put Spread best
+            for m in re.finditer(
+                r'\*\*Mejor spread:\*\*\s*Vende (.+?)(?:\n|$)', options_md
+            ):
+                pos   = m.start()
+                chunk = options_md[:pos]
+                tm    = re.findall(r'^## ([A-Z]+) —', chunk, re.MULTILINE)
+                if tm:
+                    best_spreads[tm[-1]] = f"PUT: {m.group(0).replace('**Mejor spread:** ', '').strip()}"
+
+        for ticker, criteria in passed_criteria.items():
+            price = criteria.get("price", 0)
+            vol   = criteria.get("volatility", {})
+            tech  = criteria.get("technical", {})
+            earn  = criteria.get("earnings", {})
+
+            iv    = vol.get("iv")
+            ivp   = vol.get("iv_percentile")
+            rsi   = tech.get("rsi")
+            trend = tech.get("trend_25d", {})
+            beta  = vol.get("beta")
+            pcr   = vol.get("put_call_ratio")
+
+            from criteria import select_strategy
+            strategy = select_strategy(criteria)
+
+            trend_str = f"{trend.get('pct_change', 0):+.1f}%"
+            iv_str    = f"{iv:.1f}% P{ivp:.0f}" if iv and ivp else "N/A"
+            rsi_str   = f"{rsi:.1f}" if rsi else "N/A"
+            beta_str  = f"{beta:.2f}" if beta else "N/A"
+            pcr_str   = f"{pcr:.2f}" if pcr else "N/A"
+            earn_str  = f"{earn.get('days_to_earnings')}d" if earn.get('days_to_earnings') else "N/A"
+
+            lines.append(
+                f"\n{ticker} | {strategy} | ${price:.2f} | "
+                f"IV {iv_str} | RSI {rsi_str} | Trend {trend_str} | "
+                f"Beta {beta_str} | P/C {pcr_str} | Earn {earn_str}"
+            )
+
+            if ticker in best_spreads:
+                lines.append(f"  → {best_spreads[ticker]}")
+            else:
+                lines.append(f"  → Sin estructura viable")
+    else:
+        lines.append("CANDIDATOS: ninguno pasó los filtros hoy")
+
+    lines.append("")
+
+    # ── Open positions summary ────────────────────────────────────────────────
+    if open_positions:
+        lines.append(f"POSICIONES ABIERTAS ({len(open_positions)}):")
+        for p in open_positions:
+            exp    = str(p.get("expiration", ""))[:10]
+            cost   = float(p.get("total_cost") or 0)
+            pnl    = float(p.get("gross_pnl") or 0) if p.get("gross_pnl") else None
+            pmax   = float(p.get("profit_pct_of_max") or 0) * 100 if p.get("profit_pct_of_max") else None
+            strat  = p.get("strategy", "")
+            strat_short = "BCS" if "Call" in strat else "BPS"
+
+            pnl_str  = f"${pnl:+.0f}" if pnl is not None else "?"
+            pmax_str = f"{pmax:.0f}% max" if pmax is not None else ""
+            dte      = (datetime.strptime(exp, "%Y-%m-%d").date() -
+                        datetime.now().date()).days if exp else "?"
+
+            lines.append(
+                f"  {p['ticker']} {strat_short} "
+                f"${p.get('strike_low')}/{p.get('strike_high')} "
+                f"exp {exp} ({dte}d) | "
+                f"P&L {pnl_str} {pmax_str}"
+            )
+    else:
+        lines.append("POSICIONES ABIERTAS: ninguna")
+
+    lines.append("")
+    lines.append(f"---")
+    lines.append(f"Generated {timestamp}")
+
+    content = "\n".join(lines)
+    os.makedirs(REPORTS_DIR, exist_ok=True)
+    with open(REPORT_AI_PATH, "w", encoding="utf-8") as f:
+        f.write(content)
+    print(f"  AI summary → {REPORT_AI_PATH}")
+    return REPORT_AI_PATH
+
 
 def generate_markdown(market_ctx, open_positions, passed_criteria,
                       options_md, eliminated, tier_used):
@@ -488,17 +649,20 @@ def run_scan(tickers, expand_to_universe=False):
                                    options_md, eliminated, tier_used)
     html_path = generate_html(market_ctx, open_positions, passed_criteria,
                                eliminated, options_md, all_criteria, tier_used)
+    ai_path   = generate_ai_summary(market_ctx, open_positions, passed_criteria,
+                                     options_md, tier_used)
 
     print(f"\n{'=' * 65}")
     print(f"  SCAN COMPLETE — {tier_used}")
     print(f"  Passed:    {len(passed_criteria)} tickers")
     print(f"  Markdown:  {md_path}")
     print(f"  HTML:      {html_path}")
+    print(f"  AI:        {ai_path}")
     if failed:
         print(f"  Failed:    {', '.join(failed)}")
     print(f"{'=' * 65}\n")
 
-    webbrowser.open(f"file:///{html_path.replace(os.sep, '/')}")
+    _open_browser(html_path)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

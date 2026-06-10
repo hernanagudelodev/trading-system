@@ -3,40 +3,40 @@ market_context.py
 =================
 Daily macro analysis for the options trading system.
 
-Analyzes two levels:
-    1. General market  — VIX level/trend, SPY position vs SMAs and momentum
-    2. Sectors         — historical win rates from DB, which to prioritize today
+Analyzes:
+    1. VIX level and trend
+    2. SPY position vs SMAs and momentum
+    3. Upcoming macro events this week (NFP, FOMC, CPI — fixed calendar)
+    4. Upcoming earnings from sector watchlist (via Tastytrade API)
+    5. Sector context (historical win rates — informational only)
 
 Output:
-    - market_context_report.html  — visual dashboard, opens in browser automatically
-    - market_context.json         — structured raw data for scanner.py to consume
+    - reports/market_context_report.html  → visual dashboard
+    - reports/market_context.json         → structured data for scanner.py
 
 NO AI in this script — raw data only.
-The scanner reads market_context.json and passes everything to its AI
-for a single coherent interpretation.
+The AI interpretation happens once in scanner.py or auto_run.py.
 
 Usage:
     python market_context.py
 
 Dependencies:
-    yfinance    → market data
-    db.py       → historical win rates by sector
-    .env        → DATABASE_URL
+    yfinance        → market data
+    tastytrade API  → earnings dates per ticker
+    db.py           → historical win rates (backtest)
+    .env            → DATABASE_URL, TASTYTRADE_CLIENT_SECRET, TASTYTRADE_REFRESH_TOKEN
 """
 
 import os
 import sys
 import json
+import asyncio
 import warnings
 import datetime
 import io
-import webbrowser
 
 import yfinance as yf
-import pandas as pd
 from dotenv import load_dotenv
-
-from db import get_connection
 
 warnings.filterwarnings("ignore")
 load_dotenv()
@@ -46,18 +46,71 @@ load_dotenv()
 # CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════════════
 
-VIX_CALM        = 18
-VIX_ELEVATED    = 25
-VIX_FEAR        = 35
+VIX_CALM     = 18
+VIX_ELEVATED = 25
+VIX_FEAR     = 35
 
-SECTOR_WIN_RATE_PRIORITY = 58.0
-SECTOR_WIN_RATE_OK       = 54.0
-SECTOR_MIN_SIGNALS       = 5000
-MAX_TICKERS_PER_SECTOR   = 8
-
+# Reports directory (one level up from scripts/)
+_BASE_DIR   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_REPORTS    = os.path.join(_BASE_DIR, "reports")
+REPORT_PATH     = os.path.join(_REPORTS, "market_context_report.html")
+JSON_PATH       = os.path.join(_REPORTS, "market_context.json")
+AI_SUMMARY_PATH = os.path.join(_REPORTS, "market_context_ai.md")
 SP500_JSON  = os.path.join(os.path.dirname(__file__), "sp500_tickers.json")
-REPORT_PATH = os.path.join(os.path.dirname(__file__), "market_context_report.html")
-JSON_PATH   = os.path.join(os.path.dirname(__file__), "market_context.json")
+
+
+def _open_browser(path):
+    """Open in browser only when running locally — skip on Railway/server."""
+    if os.getenv("RAILWAY_ENVIRONMENT"):
+        return
+    try:
+        import webbrowser
+        webbrowser.open(f"file:///{path.replace(os.sep, '/')}")
+    except Exception:
+        pass
+
+# Sector earnings watchlist — barómetros por sector
+# These are NOT trade candidates — they're tracked for contagion risk
+EARNINGS_WATCHLIST = [
+    # Semiconductors — sector leaders whose earnings move the whole sector
+    "NVDA", "AVGO", "AMD", "TSM", "MU", "INTC",
+    # Mega-cap Tech — broad market impact
+    "AAPL", "MSFT", "GOOGL", "META", "AMZN",
+    # Financials
+    "JPM", "GS", "BAC",
+    # Consumer
+    "WMT", "COST", "HD",
+    # Health
+    "JNJ", "UNH", "LLY",
+    # Energy
+    "XOM", "CVX",
+]
+
+# Days ahead to look for earnings risk
+EARNINGS_RISK_DAYS = 10
+
+# Fixed macro calendar — recurring monthly events
+# NFP: first Friday of month
+# CPI: ~10th-12th of month (released for prior month)
+# FOMC: 8 meetings per year, roughly every 6 weeks
+MACRO_EVENTS_FIXED = {
+    "NFP":  "Primer viernes del mes — Non-Farm Payrolls. Fuerte impacto en tasas esperadas.",
+    "CPI":  "Semana del 10-12 del mes — Consumer Price Index. Determina política monetaria de la Fed.",
+    "FOMC": "Reunión Fed cada ~6 semanas. Decisión de tasas — mayor event risk del mercado.",
+    "PPI":  "Semana del 14-15 del mes — Producer Price Index. Indicador adelantado del CPI.",
+}
+
+# Known FOMC dates 2026
+FOMC_DATES_2026 = [
+    datetime.date(2026, 1, 27), datetime.date(2026, 1, 28),
+    datetime.date(2026, 3, 17), datetime.date(2026, 3, 18),
+    datetime.date(2026, 4, 28), datetime.date(2026, 4, 29),
+    datetime.date(2026, 6, 16), datetime.date(2026, 6, 17),
+    datetime.date(2026, 7, 28), datetime.date(2026, 7, 29),
+    datetime.date(2026, 9, 15), datetime.date(2026, 9, 16),
+    datetime.date(2026, 11, 3), datetime.date(2026, 11, 4),
+    datetime.date(2026, 12, 15), datetime.date(2026, 12, 16),
+]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -82,12 +135,13 @@ def _pct_change(series, n):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MARKET DATA
+# MARKET DATA — VIX & SPY
 # ══════════════════════════════════════════════════════════════════════════════
 
 def get_vix():
     old = _silence()
     try:
+        import yfinance as yf
         data = yf.download("^VIX", period="20d", interval="1d",
                            progress=False, auto_adjust=True)
         _restore(old)
@@ -122,6 +176,7 @@ def get_vix():
 def get_spy_context():
     old = _silence()
     try:
+        import yfinance as yf
         data = yf.download("SPY", period="1y", interval="1d",
                            progress=False, auto_adjust=True)
         _restore(old)
@@ -147,135 +202,299 @@ def get_spy_context():
             sma_status, sma_score = "BELOW BOTH", -2
 
         sma50_series = closes.rolling(50).mean()
-        sma50_dir, sma50_score = "FLAT", 0
-        if len(sma50_series.dropna()) >= 5:
-            sma50_5d = float(sma50_series.dropna().iloc[-5])
-            if sma50 > sma50_5d * 1.001:
-                sma50_dir, sma50_score = "RISING", 1
-            elif sma50 < sma50_5d * 0.999:
-                sma50_dir, sma50_score = "FALLING", -1
-
-        if pct_25d and pct_25d > 2:
-            trend, trend_score = "BULLISH", 1
-        elif pct_25d and pct_25d < -2:
-            trend, trend_score = "BEARISH", -1
+        sma50_10d    = float(sma50_series.iloc[-10])
+        if sma50 > sma50_10d * 1.001:
+            sma50_dir = "RISING"
+        elif sma50 < sma50_10d * 0.999:
+            sma50_dir = "FALLING"
         else:
-            trend, trend_score = "SIDEWAYS", 0
+            sma50_dir = "FLAT"
 
-        return {
-            "price":      round(price, 2),
-            "sma50":      round(sma50, 2),
-            "sma200":     round(sma200, 2) if sma200 else None,
-            "sma_status": sma_status,
-            "sma50_dir":  sma50_dir,
-            "trend":      trend,
-            "pct_25d":    round(pct_25d, 2) if pct_25d else None,
-            "score":      sma_score + sma50_score + trend_score,
-        }
+        trend = "BULLISH" if (above_50 and pct_25d and pct_25d > 0) else \
+                "BEARISH" if (not above_50 and pct_25d and pct_25d < 0) else "NEUTRAL"
+
+        spy_score = sma_score + (1 if pct_25d and pct_25d > 2 else
+                                  -1 if pct_25d and pct_25d < -2 else 0)
+
+        return {"price": round(price, 2), "sma50": round(sma50, 2),
+                "sma200": round(sma200, 2) if sma200 else None,
+                "pct_25d": round(pct_25d, 1) if pct_25d else None,
+                "sma_status": sma_status, "sma50_dir": sma50_dir,
+                "trend": trend, "score": spy_score,
+                "above_sma50": above_50, "above_sma200": above_200}
     except Exception:
         _restore(old)
         return None
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# MACRO CALENDAR — upcoming events this week
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_macro_events():
+    """
+    Detect upcoming macro events in the next 7 days based on fixed calendar.
+    Returns list of dicts with event name, days_away, and description.
+    """
+    today    = datetime.date.today()
+    events   = []
+    look_days = 7
+
+    for d in range(look_days + 1):
+        check = today + datetime.timedelta(days=d)
+        day   = check.day
+        weekday = check.weekday()  # 0=Monday, 4=Friday
+
+        # NFP — first Friday of the month
+        if weekday == 4 and day <= 7:
+            events.append({
+                "event":       "NFP — Non-Farm Payrolls",
+                "date":        str(check),
+                "days_away":   d,
+                "impact":      "HIGH",
+                "description": "Dato de empleo. Si supera estimados → Fed sin razón para bajar tasas → presión bajista en acciones."
+            })
+
+        # CPI — ~10th-12th of month (release for prior month)
+        if day in [10, 11, 12] and weekday not in [5, 6]:
+            events.append({
+                "event":       "CPI — Consumer Price Index",
+                "date":        str(check),
+                "days_away":   d,
+                "impact":      "HIGH",
+                "description": "Inflación al consumidor. Dato caliente → Fed sube tasas → mercado cae."
+            })
+
+        # PPI — ~14th-15th of month
+        if day in [14, 15] and weekday not in [5, 6]:
+            events.append({
+                "event":       "PPI — Producer Price Index",
+                "date":        str(check),
+                "days_away":   d,
+                "impact":      "MEDIUM",
+                "description": "Inflación al productor. Indicador adelantado del CPI."
+            })
+
+        # FOMC — from known dates list
+        if check in FOMC_DATES_2026:
+            events.append({
+                "event":       "FOMC — Fed Meeting",
+                "date":        str(check),
+                "days_away":   d,
+                "impact":      "VERY_HIGH",
+                "description": "Decisión de tasas de la Fed. Mayor event risk del año."
+            })
+
+    # Remove duplicates by event name
+    seen   = set()
+    unique = []
+    for e in events:
+        if e["event"] not in seen:
+            seen.add(e["event"])
+            unique.append(e)
+
+    return sorted(unique, key=lambda x: x["days_away"])
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EARNINGS WATCHLIST — via Tastytrade API
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def _fetch_earnings_async(tickers):
+    """Fetch earnings dates for watchlist tickers via Tastytrade."""
+    from tastytrade import Session
+    from tastytrade.metrics import get_market_metrics
+
+    client_secret = os.getenv("TASTYTRADE_CLIENT_SECRET")
+    refresh_token = os.getenv("TASTYTRADE_REFRESH_TOKEN")
+
+    try:
+        session = Session(client_secret, refresh_token)
+        metrics = await get_market_metrics(session, tickers)
+        return {m.symbol: m for m in metrics}
+    except Exception as e:
+        print(f"  Earnings fetch error: {e}")
+        return {}
+
+
+def get_upcoming_earnings():
+    """
+    Get earnings dates for sector watchlist tickers.
+    Returns list of tickers reporting in the next EARNINGS_RISK_DAYS days,
+    grouped by sector impact.
+    """
+    today    = datetime.date.today()
+    upcoming = []
+
+    try:
+        metrics_map = asyncio.run(_fetch_earnings_async(EARNINGS_WATCHLIST))
+    except Exception:
+        metrics_map = {}
+
+    TICKER_SECTOR_MAP = {
+        "NVDA": "Semiconductors", "AVGO": "Semiconductors",
+        "AMD":  "Semiconductors", "TSM":  "Semiconductors",
+        "MU":   "Semiconductors", "INTC": "Semiconductors",
+        "AAPL": "Mega-cap Tech",  "MSFT": "Mega-cap Tech",
+        "GOOGL":"Mega-cap Tech",  "META": "Mega-cap Tech",
+        "AMZN": "Mega-cap Tech",
+        "JPM":  "Financials",     "GS":   "Financials",   "BAC": "Financials",
+        "WMT":  "Consumer",       "COST": "Consumer",     "HD":  "Consumer",
+        "JNJ":  "Health",         "UNH":  "Health",       "LLY": "Health",
+        "XOM":  "Energy",         "CVX":  "Energy",
+    }
+
+    for ticker, m in metrics_map.items():
+        try:
+            earnings = getattr(m, "earnings", None)
+            if not earnings:
+                continue
+            exp_date = getattr(earnings, "expected_report_date", None)
+            if not exp_date:
+                continue
+            days_away = (exp_date - today).days
+            if 0 <= days_away <= EARNINGS_RISK_DAYS:
+                upcoming.append({
+                    "ticker":    ticker,
+                    "sector":    TICKER_SECTOR_MAP.get(ticker, "Other"),
+                    "date":      str(exp_date),
+                    "days_away": days_away,
+                    "warning":   f"⚠️ {ticker} ({TICKER_SECTOR_MAP.get(ticker, '?')}) reporta en {days_away}d — riesgo de contagio sectorial"
+                })
+        except Exception:
+            continue
+
+    return sorted(upcoming, key=lambda x: x["days_away"])
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTOR WIN RATES — from backtest DB (historical, informational only)
+# ══════════════════════════════════════════════════════════════════════════════
+
+SECTOR_WIN_RATE_PRIORITY = 58.0
+SECTOR_WIN_RATE_OK       = 54.0
+SECTOR_MIN_SIGNALS       = 5000
+
 def get_sector_win_rates():
-    conn = get_connection()
-    cur  = conn.cursor()
-    cur.execute("""
-        SELECT a.sector,
-               COUNT(*) AS total,
-               ROUND(AVG(CASE WHEN o.would_have_profited THEN 1.0 ELSE 0.0 END)*100,1) AS win_rate,
-               ROUND(AVG(o.pct_change_30d)::numeric,2) AS avg_return
-        FROM analysis a
-        JOIN outcomes o ON o.analysis_id = a.id
-        WHERE a.is_backtest = TRUE AND a.sector IS NOT NULL
-          AND o.would_have_profited IS NOT NULL
-        GROUP BY a.sector
-        HAVING COUNT(*) >= %s
-        ORDER BY win_rate DESC;
-    """, (SECTOR_MIN_SIGNALS,))
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
+    """
+    Query DB for historical win rates by sector.
+    NOTE: These are from the backtest — informational only, not predictive.
+    """
+    try:
+        from db import get_connection
+        conn = get_connection()
+        cur  = conn.cursor()
+        cur.execute("""
+            SELECT a.sector,
+                   COUNT(*) AS total,
+                   ROUND(AVG(CASE WHEN o.would_have_profited THEN 1.0 ELSE 0.0 END)*100, 1) AS win_rate,
+                   ROUND(AVG(o.pct_change_30d), 2) AS avg_return
+            FROM analysis a
+            JOIN outcomes o ON o.analysis_id = a.id
+            WHERE a.is_backtest = TRUE
+              AND a.sector IS NOT NULL
+              AND o.would_have_profited IS NOT NULL
+            GROUP BY a.sector
+            HAVING COUNT(*) >= %s
+            ORDER BY win_rate DESC;
+        """, (SECTOR_MIN_SIGNALS,))
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
 
-    sectors = []
-    for sector, total, win_rate, avg_return in rows:
-        wr = float(win_rate)
-        priority = "PRIORITY"   if wr >= SECTOR_WIN_RATE_PRIORITY else \
-                   "ACCEPTABLE" if wr >= SECTOR_WIN_RATE_OK       else "AVOID"
-        sectors.append({"sector": sector, "win_rate": wr,
-                        "avg_return": float(avg_return), "priority": priority})
-    return sectors
-
-
-def get_recommended_tickers(sectors, max_per_sector=MAX_TICKERS_PER_SECTOR):
-    if not os.path.exists(SP500_JSON):
+        sectors = []
+        for sector, total, win_rate, avg_return in rows:
+            if win_rate is None:
+                continue
+            wr       = float(win_rate)
+            priority = "PRIORITY"   if wr >= SECTOR_WIN_RATE_PRIORITY else \
+                       "ACCEPTABLE" if wr >= SECTOR_WIN_RATE_OK       else "AVOID"
+            sectors.append({
+                "sector":     sector,
+                "win_rate":   wr,
+                "avg_return": float(avg_return) if avg_return else 0.0,
+                "total":      int(total),
+                "priority":   priority,
+            })
+        return sectors
+    except Exception:
         return []
 
-    priority_sectors = [s["sector"] for s in sectors if s["priority"] == "PRIORITY"]
-    if not priority_sectors:
-        return []
 
-    conn = get_connection()
-    cur  = conn.cursor()
-    cur.execute("""
-        SELECT a.ticker, a.sector,
-               SUM(CASE WHEN a.verdict='VIABLE' THEN 1 ELSE 0 END) AS viable_count,
-               ROUND(AVG(CASE WHEN a.verdict='VIABLE' AND o.would_have_profited IS NOT NULL
-                   THEN CASE WHEN o.would_have_profited THEN 1.0 ELSE 0.0 END END)*100,1) AS accuracy
-        FROM analysis a
-        LEFT JOIN outcomes o ON o.analysis_id = a.id
-        WHERE a.is_backtest = TRUE AND a.sector = ANY(%s)
-        GROUP BY a.ticker, a.sector
-        HAVING SUM(CASE WHEN a.verdict='VIABLE' THEN 1 ELSE 0 END) >= 3
-        ORDER BY accuracy DESC NULLS LAST, viable_count DESC;
-    """, (priority_sectors,))
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
+# ══════════════════════════════════════════════════════════════════════════════
+# VERDICT — dynamic based on VIX + SPY + macro events
+# ══════════════════════════════════════════════════════════════════════════════
 
-    by_sector = {s: [] for s in priority_sectors}
-    for ticker, sector, viable, accuracy in rows:
-        if sector in by_sector and len(by_sector[sector]) < max_per_sector:
-            by_sector[sector].append(ticker)
+def get_verdict(vix, spy, macro_events, upcoming_earnings):
+    """
+    Dynamic verdict that considers VIX, SPY, AND upcoming macro events.
 
-    recommended = []
-    seen = set()
-    for sector in priority_sectors:
-        for t in by_sector.get(sector, []):
-            if t not in seen:
-                seen.add(t)
-                recommended.append(t)
-    return recommended
-
-
-def get_verdict(vix, spy):
+    Unlike the old version which only looked at VIX + SPY, this version
+    penalizes when there are high-impact macro events in the next 3 days.
+    """
     if vix is None or spy is None:
         return "INSUFFICIENT_DATA", "Could not retrieve market data."
-    if vix["current"] >= VIX_FEAR:
-        return "DO_NOT_TRADE", f"Extreme VIX ({vix['current']:.1f}) — market in panic."
-    if spy["sma_status"] == "BELOW BOTH" and vix["current"] > VIX_ELEVATED:
-        return "DO_NOT_TRADE", "SPY below SMA50 and SMA200 with elevated VIX."
 
-    total = vix["score"] + spy["score"]
-    if total >= 3:    return "FAVORABLE",   "Strong macro conditions for options trading."
-    elif total >= 1:  return "CAUTION",     "Mixed market — be selective."
-    elif total >= -1: return "CAUTION",     "Uncertain conditions — reduce position size."
-    else:             return "DO_NOT_TRADE", "Adverse macro conditions — wait."
+    if vix["current"] >= VIX_FEAR:
+        return "DO_NOT_TRADE", f"VIX extremo ({vix['current']:.1f}) — mercado en pánico."
+
+    if spy["sma_status"] == "BELOW BOTH" and vix["current"] > VIX_ELEVATED:
+        return "DO_NOT_TRADE", "SPY debajo de SMA50 y SMA200 con VIX elevado."
+
+    # Check for imminent high-impact macro events (next 3 days)
+    imminent_events = [e for e in macro_events
+                       if e["days_away"] <= 3 and e["impact"] in ("HIGH", "VERY_HIGH")]
+
+    # Check for imminent sector barómetro earnings (next 3 days)
+    imminent_earnings = [e for e in upcoming_earnings if e["days_away"] <= 3]
+
+    base_score = vix["score"] + spy["score"]
+
+    if imminent_events or imminent_earnings:
+        events_str = ", ".join([e["event"].split("—")[0].strip()
+                                for e in imminent_events[:2]])
+        earn_str   = ", ".join([e["ticker"] for e in imminent_earnings[:3]])
+        warnings   = []
+        if events_str:
+            warnings.append(f"evento macro inminente ({events_str})")
+        if earn_str:
+            warnings.append(f"earnings próximos ({earn_str})")
+
+        warning_text = " | ".join(warnings)
+
+        if base_score >= 3:
+            return "CAUTION", f"Macro favorable pero {warning_text} — ser selectivo."
+        else:
+            return "CAUTION", f"Condiciones mixtas con {warning_text} — reducir exposición."
+
+    # Normal verdict without imminent events
+    if base_score >= 3:
+        return "FAVORABLE", "Condiciones macro fuertes para trading de opciones."
+    elif base_score >= 1:
+        return "CAUTION", "Mercado mixto — ser selectivo."
+    elif base_score >= -1:
+        return "CAUTION", "Condiciones inciertas — reducir tamaño de posición."
+    else:
+        return "DO_NOT_TRADE", "Condiciones macro adversas — esperar."
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # JSON OUTPUT
 # ══════════════════════════════════════════════════════════════════════════════
 
-def save_json(vix, spy, sectors, verdict, detail, recommended):
+def save_json(vix, spy, sectors, verdict, detail,
+              macro_events, upcoming_earnings, recommended):
+
+    os.makedirs(_REPORTS, exist_ok=True)
+
     priority   = [s["sector"] for s in sectors if s["priority"] == "PRIORITY"]
     acceptable = [s["sector"] for s in sectors if s["priority"] == "ACCEPTABLE"]
     avoid      = [s["sector"] for s in sectors if s["priority"] == "AVOID"]
 
     data = {
-        "timestamp":           datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
-        "verdict":             verdict,
-        "verdict_detail":      detail,
+        "timestamp":          datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "verdict":            verdict,
+        "verdict_detail":     detail,
         "vix": {
             "current":  vix["current"]  if vix else None,
             "level":    vix["level"]    if vix else None,
@@ -292,14 +511,22 @@ def save_json(vix, spy, sectors, verdict, detail, recommended):
             "sma50":      spy["sma50"]      if spy else None,
             "sma200":     spy["sma200"]     if spy else None,
         },
+        # Macro events this week
+        "macro_events":       macro_events,
+        # Earnings from sector watchlist in next 10 days
+        "upcoming_earnings":  upcoming_earnings,
+        # Historical sector win rates (informational — from backtest)
         "sectors": [
-            {"sector": s["sector"], "win_rate": s["win_rate"],
-             "avg_return": s["avg_return"], "priority": s["priority"]}
+            {"sector":     s["sector"],
+             "win_rate":   s["win_rate"],
+             "avg_return": s["avg_return"],
+             "priority":   s["priority"],
+             "note":       "historical backtest data — informational only"}
             for s in sectors
         ],
-        "priority_sectors":    priority,
-        "acceptable_sectors":  acceptable,
-        "avoid_sectors":       avoid,
+        "priority_sectors":   priority,
+        "acceptable_sectors": acceptable,
+        "avoid_sectors":      avoid,
         "recommended_tickers": recommended,
     }
 
@@ -314,12 +541,13 @@ def save_json(vix, spy, sectors, verdict, detail, recommended):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def generate_html(data):
-    verdict     = data["verdict"]
-    vix         = data["vix"]
-    spy         = data["spy"]
-    sectors     = data["sectors"]
-    recommended = data["recommended_tickers"]
-    timestamp   = data["timestamp"]
+    verdict           = data["verdict"]
+    vix               = data["vix"]
+    spy               = data["spy"]
+    sectors           = data["sectors"]
+    macro_events      = data.get("macro_events", [])
+    upcoming_earnings = data.get("upcoming_earnings", [])
+    timestamp         = data["timestamp"]
 
     v_color = "#22c55e" if verdict == "FAVORABLE" else \
               "#f59e0b" if verdict == "CAUTION"   else "#ef4444"
@@ -336,14 +564,52 @@ def generate_html(data):
     spy_color = "#22c55e" if spy["trend"] == "BULLISH" else \
                 "#ef4444" if spy["trend"] == "BEARISH" else "#f59e0b"
     spy_pct   = f"{spy['pct_25d']:+.1f}%" if spy["pct_25d"] else "N/A"
-    sma200_str = f"${spy['sma200']:.0f}" if spy["sma200"] else "N/A"
 
-    # Sector rows
+    # Macro events HTML
+    macro_html = ""
+    if macro_events:
+        for e in macro_events:
+            impact_color = "#ef4444" if e["impact"] in ("HIGH", "VERY_HIGH") else "#f59e0b"
+            macro_html += f"""
+            <div style="background:#1a1a1a;border-radius:8px;padding:12px 14px;
+                        margin-bottom:8px;border-left:3px solid {impact_color};">
+                <div style="display:flex;justify-content:space-between;align-items:center;">
+                    <span style="color:#f9fafb;font-weight:700;font-size:13px;">
+                        {e['event']}
+                    </span>
+                    <span style="color:{impact_color};font-size:11px;font-weight:700;">
+                        en {e['days_away']}d — {e['date']}
+                    </span>
+                </div>
+                <div style="color:#6b7280;font-size:11px;margin-top:4px;line-height:1.5;">
+                    {e['description']}
+                </div>
+            </div>"""
+    else:
+        macro_html = '<div style="color:#22c55e;font-size:13px;">✅ Sin eventos macro de alto impacto esta semana</div>'
+
+    # Earnings HTML
+    earnings_html = ""
+    if upcoming_earnings:
+        for e in upcoming_earnings:
+            earnings_html += f"""
+            <div style="background:#1a1a1a;border-radius:8px;padding:10px 14px;
+                        margin-bottom:6px;border-left:3px solid #f59e0b;">
+                <div style="display:flex;justify-content:space-between;">
+                    <span style="color:#f9fafb;font-weight:700;">{e['ticker']}</span>
+                    <span style="color:#9ca3af;font-size:11px;">{e['sector']}</span>
+                    <span style="color:#f59e0b;font-size:11px;">en {e['days_away']}d — {e['date']}</span>
+                </div>
+            </div>"""
+    else:
+        earnings_html = '<div style="color:#22c55e;font-size:13px;">✅ Sin earnings de riesgo sectorial esta semana</div>'
+
+    # Sector rows HTML
     sector_rows = ""
     for s in sectors:
         c    = "#22c55e" if s["priority"] == "PRIORITY"   else \
                "#f59e0b" if s["priority"] == "ACCEPTABLE" else "#6b7280"
-        icon = "✅" if s["priority"] == "PRIORITY"   else \
+        icon = "✅" if s["priority"] == "PRIORITY" else \
                "⚠️" if s["priority"] == "ACCEPTABLE" else "❌"
         bar  = min(100, int(s["win_rate"]))
         sector_rows += f"""
@@ -363,181 +629,171 @@ def generate_html(data):
                         </span>
                     </div>
                 </td>
-                <td style="padding:10px 16px;color:#9ca3af;font-size:13px;">
-                    {s['avg_return']:+.2f}%
-                </td>
-                <td style="padding:10px 16px;">
-                    <span style="background:{c}22;color:{c};border-radius:4px;
-                                 padding:2px 8px;font-size:11px;font-weight:700;">
-                        {s['priority']}
-                    </span>
+                <td style="padding:10px 16px;color:#6b7280;font-size:12px;">
+                    {s['priority']}
                 </td>
             </tr>"""
 
-    # Ticker chips
-    chips = "".join(f"""
-        <span style="background:#1e2d1e;border:1px solid #22c55e44;color:#22c55e;
-                     border-radius:6px;padding:4px 10px;font-size:12px;
-                     font-weight:700;font-family:monospace;">{t}</span>"""
-        for t in recommended) or '<span style="color:#6b7280;">No tickers available</span>'
-
     html = f"""<!DOCTYPE html>
-<html lang="en">
+<html lang="es">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width,initial-scale=1.0">
     <title>Market Context — {timestamp}</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;700;900&display=swap" rel="stylesheet">
     <style>
         *{{box-sizing:border-box;margin:0;padding:0}}
-        body{{background:#0a0a0a;color:#f9fafb;font-family:'DM Sans',sans-serif;
-              min-height:100vh;padding:32px 24px}}
-        .wrap{{max-width:960px;margin:0 auto}}
+        body{{background:#0d1117;color:#f9fafb;
+             font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+             max-width:900px;margin:0 auto;padding:24px}}
         .card{{background:#111;border:1px solid #1e1e1e;border-radius:12px;
-               padding:24px;margin-bottom:20px}}
-        .label{{font-size:10px;font-weight:700;letter-spacing:3px;color:#6b7280;
-                text-transform:uppercase;margin-bottom:14px;padding-bottom:10px;
-                border-bottom:1px solid #1e1e1e}}
-        .big{{font-size:40px;font-weight:900;letter-spacing:-2px;line-height:1}}
+               padding:20px;margin-bottom:20px}}
+        .label{{font-size:11px;color:#4b5563;letter-spacing:3px;
+                text-transform:uppercase;margin-bottom:14px}}
+        .big{{font-size:42px;font-weight:900;letter-spacing:-2px}}
         table{{width:100%;border-collapse:collapse}}
-        th{{padding:8px 16px;text-align:left;color:#6b7280;font-size:10px;
-            letter-spacing:2px;border-bottom:1px solid #1e1e1e}}
+        th{{text-align:left;padding:8px 16px;font-size:10px;color:#4b5563;
+            letter-spacing:2px;text-transform:uppercase}}
     </style>
 </head>
 <body>
-<div class="wrap">
 
-    <!-- Header -->
-    <div style="display:flex;justify-content:space-between;align-items:center;
-                margin-bottom:28px;padding-bottom:20px;border-bottom:1px solid #1e1e1e;
-                flex-wrap:wrap;gap:16px;">
-        <div>
-            <div style="font-size:11px;color:#6b7280;letter-spacing:3px;
-                        text-transform:uppercase;margin-bottom:6px;">
-                Options Trading System
-            </div>
-            <h1 style="font-size:32px;font-weight:900;letter-spacing:-1.5px;">
-                Market Context
-            </h1>
-            <p style="color:#4b5563;font-size:13px;margin-top:4px;
-                      font-family:'DM Mono',monospace;">
-                {timestamp}
-            </p>
-        </div>
-        <div style="background:{v_bg};border:2px solid {v_color};
-                    border-radius:12px;padding:16px 28px;text-align:center;
-                    min-width:180px;">
-            <div style="font-size:28px;margin-bottom:4px;">{v_emoji}</div>
-            <div style="color:{v_color};font-weight:900;font-size:16px;
-                        letter-spacing:2px;">{verdict}</div>
-            <div style="color:{v_color}88;font-size:11px;margin-top:4px;
-                        max-width:160px;line-height:1.4;">
-                {data['verdict_detail']}
-            </div>
+<div style="display:flex;justify-content:space-between;align-items:center;
+            margin-bottom:32px;padding-bottom:24px;border-bottom:1px solid #1e1e1e;">
+    <div>
+        <h1 style="font-size:32px;font-weight:900;letter-spacing:-1.5px;">Market Context</h1>
+        <p style="color:#4b5563;font-size:13px;margin-top:4px;font-family:monospace;">{timestamp}</p>
+    </div>
+    <div style="background:{v_bg};border:2px solid {v_color};border-radius:12px;
+                padding:16px 28px;text-align:center;">
+        <div style="font-size:28px;margin-bottom:4px;">{v_emoji}</div>
+        <div style="color:{v_color};font-weight:900;font-size:16px;">{verdict}</div>
+        <div style="color:{v_color}88;font-size:11px;margin-top:4px;max-width:200px;line-height:1.4;">
+            {data['verdict_detail']}
         </div>
     </div>
-
-    <!-- VIX + SPY -->
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-bottom:20px;">
-
-        <div class="card" style="border-color:{vix_color}44;">
-            <div class="label">VIX — Volatility Index</div>
-            <div style="display:flex;align-items:flex-end;gap:16px;margin-bottom:16px;">
-                <div class="big" style="color:{vix_color};">{vix['current']:.1f}</div>
-                <div style="margin-bottom:4px;">
-                    <div style="color:{vix_color};font-weight:700;font-size:15px;">
-                        {vix['level']} {vix_arrow}
-                    </div>
-                    <div style="color:#6b7280;font-size:12px;margin-top:2px;
-                                font-family:'DM Mono',monospace;">
-                        5d: {vix['avg_5d']:.1f} &nbsp;|&nbsp; 10d: {vix['avg_10d']:.1f}
-                    </div>
-                </div>
-            </div>
-            <div style="background:#1a1a1a;border-radius:8px;padding:10px 14px;
-                        display:flex;justify-content:space-between;font-size:11px;
-                        font-family:'DM Mono',monospace;">
-                <span style="color:#22c55e;">CALM &lt;{VIX_CALM}</span>
-                <span style="color:#f59e0b;">ELEVATED &lt;{VIX_ELEVATED}</span>
-                <span style="color:#ef4444;">EXTREME &gt;{VIX_FEAR}</span>
-            </div>
-        </div>
-
-        <div class="card" style="border-color:{spy_color}44;">
-            <div class="label">SPY — Market Trend</div>
-            <div style="display:flex;align-items:flex-end;gap:16px;margin-bottom:16px;">
-                <div class="big" style="color:{spy_color};">{spy_pct}</div>
-                <div style="margin-bottom:4px;">
-                    <div style="color:{spy_color};font-weight:700;font-size:15px;">
-                        {spy['trend']} (25d)
-                    </div>
-                    <div style="color:#6b7280;font-size:12px;margin-top:2px;
-                                font-family:'DM Mono',monospace;">
-                        ${spy['price']:.2f}
-                    </div>
-                </div>
-            </div>
-            <div style="background:#1a1a1a;border-radius:8px;padding:10px 14px;
-                        display:flex;justify-content:space-between;font-size:11px;
-                        font-family:'DM Mono',monospace;color:#9ca3af;">
-                <span>SMA50: ${spy['sma50']:.0f} ({spy['sma50_dir']})</span>
-                <span>SMA200: {sma200_str}</span>
-                <span style="color:#f9fafb;font-weight:700;">{spy['sma_status']}</span>
-            </div>
-        </div>
-    </div>
-
-    <!-- Sectors -->
-    <div class="card" style="margin-bottom:20px;">
-        <div class="label">Sectors — Historical Win Rate (backtest DB)</div>
-        <table>
-            <thead>
-                <tr>
-                    <th>SECTOR</th>
-                    <th>WIN RATE</th>
-                    <th>AVG RETURN</th>
-                    <th>PRIORITY</th>
-                </tr>
-            </thead>
-            <tbody>{sector_rows}</tbody>
-        </table>
-    </div>
-
-    <!-- Recommended tickers -->
-    <div class="card">
-        <div class="label">
-            Recommended Tickers — {len(recommended)} from priority sectors
-        </div>
-        <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:20px;">
-            {chips}
-        </div>
-        <div style="background:#1a1a1a;border-radius:8px;padding:14px 16px;">
-            <div style="color:#4b5563;font-size:10px;letter-spacing:2px;
-                        text-transform:uppercase;margin-bottom:8px;">
-                Run scanner
-            </div>
-            <code style="color:#22c55e;font-size:13px;font-family:'DM Mono',monospace;">
-                python scanner.py --context
-            </code>
-        </div>
-    </div>
-
-    <div style="text-align:center;color:#374151;font-size:11px;
-                padding:24px 0;border-top:1px solid #1e1e1e;margin-top:8px;
-                font-family:'DM Mono',monospace;">
-        {timestamp} &nbsp;·&nbsp; Raw data only &nbsp;·&nbsp;
-        AI interpretation runs in scanner.py
-    </div>
-
 </div>
+
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-bottom:20px;">
+    <div class="card" style="border-color:{vix_color}44;">
+        <div class="label">VIX — Volatility Index</div>
+        <div class="big" style="color:{vix_color};">{vix['current']:.1f}</div>
+        <div style="color:{vix_color};font-weight:700;margin-top:8px;">
+            {vix['level']} {vix_arrow}
+        </div>
+        <div style="color:#6b7280;font-size:11px;margin-top:4px;font-family:monospace;">
+            5d: {vix['avg_5d']:.1f} | 10d: {vix['avg_10d']:.1f}
+        </div>
+    </div>
+    <div class="card" style="border-color:{spy_color}44;">
+        <div class="label">SPY — Market Trend (25d)</div>
+        <div class="big" style="color:{spy_color};">{spy_pct}</div>
+        <div style="color:{spy_color};font-weight:700;margin-top:8px;">{spy['trend']}</div>
+        <div style="color:#6b7280;font-size:11px;margin-top:4px;font-family:monospace;">
+            ${spy['price']:.2f} | SMA50: ${spy['sma50']:.0f} ({spy['sma50_dir']}) | {spy['sma_status']}
+        </div>
+    </div>
+</div>
+
+<div class="card" style="border-color:#ef444444;">
+    <div class="label">⚡ Eventos Macro Esta Semana</div>
+    {macro_html}
+</div>
+
+<div class="card" style="border-color:#f59e0b44;">
+    <div class="label">📅 Earnings de Riesgo Sectorial (próximos {EARNINGS_RISK_DAYS}d)</div>
+    {earnings_html}
+</div>
+
+<div class="card">
+    <div class="label">Sectores — Win Rate Histórico (backtest — solo referencia)</div>
+    <div style="color:#4b5563;font-size:11px;margin-bottom:12px;">
+        ⚠️ Estos datos vienen del backtest histórico. Son informativos, no predictivos.
+        El análisis real lo hace Claude al interpretar el scanner report.
+    </div>
+    <table>
+        <thead>
+            <tr>
+                <th>SECTOR</th>
+                <th>WIN RATE</th>
+                <th>PRIORIDAD</th>
+            </tr>
+        </thead>
+        <tbody>{sector_rows}</tbody>
+    </table>
+</div>
+
+<div style="text-align:center;color:#374151;font-size:11px;
+            padding:24px 0;border-top:1px solid #1e1e1e;font-family:monospace;">
+    {timestamp} · Market Context · Options Trading System
+</div>
+
 </body>
 </html>"""
 
+    os.makedirs(_REPORTS, exist_ok=True)
     with open(REPORT_PATH, "w", encoding="utf-8") as f:
         f.write(html)
 
     return REPORT_PATH
+
+
+def generate_ai_summary(data):
+    """
+    Generate ultra-compact AI-friendly market context summary.
+    Target: ~15 lines. Saved to reports/market_context_ai.md
+    """
+    verdict  = data["verdict"]
+    detail   = data["verdict_detail"]
+    vix      = data["vix"]
+    spy      = data["spy"]
+    events   = data.get("macro_events", [])
+    earnings = data.get("upcoming_earnings", [])
+    ts       = data["timestamp"]
+
+    lines = [f"MARKET CONTEXT — {ts}", ""]
+
+    lines.append(f"VERDICT: {verdict} — {detail}")
+    lines.append(
+        f"VIX: {vix['current']:.1f} {vix['level']} {vix['trend']} "
+        f"(5d avg: {vix['avg_5d']:.1f})"
+    )
+    lines.append(
+        f"SPY: ${spy['price']:.2f} | {spy['trend']} {spy['pct_25d']:+.1f}% 25d | "
+        f"{spy['sma_status']} | SMA50 {spy['sma50_dir']}"
+    )
+    lines.append("")
+
+    if events:
+        lines.append("MACRO EVENTS THIS WEEK:")
+        for e in events:
+            lines.append(
+                f"  [{e['impact']}] {e['event']} — en {e['days_away']}d ({e['date']})"
+            )
+            lines.append(f"  → {e['description']}")
+    else:
+        lines.append("MACRO EVENTS: ninguno de alto impacto esta semana ✅")
+
+    lines.append("")
+
+    if earnings:
+        lines.append("EARNINGS RISK (próximos 10d):")
+        for e in earnings:
+            lines.append(
+                f"  {e['ticker']} ({e['sector']}) — en {e['days_away']}d ({e['date']})"
+            )
+    else:
+        lines.append("EARNINGS RISK: ninguno en los próximos 10d ✅")
+
+    lines.append("")
+    lines.append(f"---")
+    lines.append(f"Generated {ts}")
+
+    content = "\n".join(lines)
+    os.makedirs(_REPORTS, exist_ok=True)
+    with open(AI_SUMMARY_PATH, "w", encoding="utf-8") as f:
+        f.write(content)
+
+    return AI_SUMMARY_PATH
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -545,32 +801,59 @@ def generate_html(data):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run():
-    vix     = get_vix()
-    spy     = get_spy_context()
+    print(f"\n  Fetching VIX...", end=" ", flush=True)
+    vix = get_vix()
+    print("OK" if vix else "FAILED")
+
+    print(f"  Fetching SPY...", end=" ", flush=True)
+    spy = get_spy_context()
+    print("OK" if spy else "FAILED")
+
+    print(f"  Checking macro calendar...", end=" ", flush=True)
+    macro_events = get_macro_events()
+    print(f"{len(macro_events)} event(s)")
+
+    print(f"  Fetching earnings watchlist...", end=" ", flush=True)
+    upcoming_earnings = get_upcoming_earnings()
+    print(f"{len(upcoming_earnings)} upcoming in {EARNINGS_RISK_DAYS}d")
+
+    print(f"  Fetching sector win rates...", end=" ", flush=True)
     sectors = get_sector_win_rates()
+    print(f"{len(sectors)} sectors")
 
-    verdict, detail = get_verdict(vix, spy)
-    recommended = get_recommended_tickers(sectors) if "DO_NOT_TRADE" not in verdict else []
+    verdict, detail = get_verdict(vix, spy, macro_events, upcoming_earnings)
 
-    data        = save_json(vix, spy, sectors, verdict, detail, recommended)
+    # Recommended tickers (legacy — from backtest context mode)
+    recommended = []
+
+    data        = save_json(vix, spy, sectors, verdict, detail,
+                            macro_events, upcoming_earnings, recommended)
     report_path = generate_html(data)
+    ai_path     = generate_ai_summary(data)
 
-    # Terminal summary
-    print(f"\n{'=' * 50}")
+    print(f"\n{'=' * 55}")
     print(f"  MARKET CONTEXT — {data['timestamp']}")
-    print(f"{'=' * 50}")
+    print(f"{'=' * 55}")
     print(f"  Verdict:  {verdict}")
+    print(f"  Detail:   {detail}")
     if vix:
         print(f"  VIX:      {vix['current']:.1f} ({vix['level']})")
     if spy:
         print(f"  SPY:      {spy['trend']} ({spy['pct_25d']:+.1f}% 25d)")
-    print(f"  Priority: {', '.join(data['priority_sectors']) or 'None'}")
-    print(f"  Tickers:  {len(recommended)} recommended")
+    if macro_events:
+        print(f"  ⚠️  Macro eventos esta semana:")
+        for e in macro_events:
+            print(f"      - {e['event']} en {e['days_away']}d ({e['impact']})")
+    if upcoming_earnings:
+        print(f"  ⚠️  Earnings de riesgo:")
+        for e in upcoming_earnings:
+            print(f"      - {e['ticker']} ({e['sector']}) en {e['days_away']}d")
     print(f"  Report:   {report_path}")
     print(f"  JSON:     {JSON_PATH}")
-    print(f"{'=' * 50}\n")
+    print(f"  AI:       {ai_path}")
+    print(f"{'=' * 55}\n")
 
-    webbrowser.open(f"file:///{report_path.replace(os.sep, '/')}")
+    _open_browser(report_path)
 
     return data
 
