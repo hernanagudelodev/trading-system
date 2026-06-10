@@ -877,6 +877,7 @@ def generate_html_report(positions_data, timestamp):
 </body>
 </html>"""
 
+    os.makedirs(os.path.dirname(REPORT_PATH), exist_ok=True)
     with open(REPORT_PATH, "w", encoding="utf-8") as f:
         f.write(html)
 
