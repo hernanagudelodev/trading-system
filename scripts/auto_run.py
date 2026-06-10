@@ -557,6 +557,144 @@ def save_log(market_ctx, analysis, results, run_time):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# WEEKLY SUMMARY
+# ══════════════════════════════════════════════════════════════════════════════
+
+def generate_weekly_summary():
+    """
+    Generate weekly summary of paper trading performance.
+    Called every Friday on the second run of the day.
+    Saves to reports/weekly_summary_YYYY-MM-DD.md and sends push.
+    """
+    try:
+        import psycopg2
+        conn = psycopg2.connect(os.getenv("DATABASE_URL"))
+        cur  = conn.cursor()
+
+        # Trades closed this week
+        cur.execute("""
+            SELECT ticker, strategy, strike_low, strike_high,
+                   gross_pnl, pnl_pct, close_reason, closed_at,
+                   opened_at
+            FROM paper_positions
+            WHERE UPPER(status) = 'CLOSED'
+              AND closed_at >= NOW() - INTERVAL '7 days'
+            ORDER BY closed_at DESC
+        """)
+        cols   = [d[0] for d in cur.description]
+        closed = [dict(zip(cols, row)) for row in cur.fetchall()]
+
+        # Currently open positions
+        cur.execute("""
+            SELECT ticker, strategy, strike_low, strike_high,
+                   expiration, gross_pnl, pnl_pct, profit_pct_of_max,
+                   opened_at
+            FROM paper_positions
+            WHERE UPPER(status) = 'OPEN'
+            ORDER BY opened_at
+        """)
+        cols = [d[0] for d in cur.description]
+        open_pos = [dict(zip(cols, row)) for row in cur.fetchall()]
+
+        cur.close()
+        conn.close()
+
+        # Calculate weekly P&L
+        total_pnl  = sum(float(p["gross_pnl"] or 0) for p in closed)
+        wins       = sum(1 for p in closed if float(p["gross_pnl"] or 0) > 0)
+        losses     = len(closed) - wins
+        win_rate   = round(wins / len(closed) * 100, 1) if closed else 0
+
+        timestamp  = datetime.now().strftime("%Y-%m-%d")
+        lines      = [
+            f"# Weekly Summary — {timestamp}",
+            f"",
+            f"## Resumen Semanal",
+            f"- Trades cerrados: {len(closed)}",
+            f"- Ganadores: {wins} | Perdedores: {losses}",
+            f"- Win rate: {win_rate}%",
+            f"- P&L neto semana: ${total_pnl:+.0f}",
+            f"",
+        ]
+
+        if closed:
+            lines.append("## Trades Cerrados Esta Semana")
+            lines.append("")
+            for p in closed:
+                pnl    = float(p["gross_pnl"] or 0)
+                reason = p["close_reason"] or "MANUAL"
+                sign   = "✅" if pnl >= 0 else "❌"
+                strat  = "BCS" if "Call" in (p["strategy"] or "") else "BPS"
+                lines.append(
+                    f"{sign} {p['ticker']} {strat} "
+                    f"${p['strike_low']}/{p['strike_high']} | "
+                    f"P&L ${pnl:+.0f} | {reason}"
+                )
+            lines.append("")
+
+        if open_pos:
+            lines.append("## Posiciones Abiertas")
+            lines.append("")
+            for p in open_pos:
+                pnl  = float(p["gross_pnl"] or 0) if p["gross_pnl"] else 0
+                pmax = float(p["profit_pct_of_max"] or 0) * 100 if p["profit_pct_of_max"] else 0
+                exp  = str(p["expiration"])[:10]
+                dte  = (datetime.strptime(exp, "%Y-%m-%d").date() -
+                        datetime.now().date()).days if exp else "?"
+                strat = "BCS" if "Call" in (p["strategy"] or "") else "BPS"
+                lines.append(
+                    f"- {p['ticker']} {strat} "
+                    f"${p['strike_low']}/{p['strike_high']} "
+                    f"({dte}d) | P&L ${pnl:+.0f} | {pmax:.0f}% max"
+                )
+            lines.append("")
+
+        lines.append(f"---")
+        lines.append(f"Generated {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+
+        content   = "\n".join(lines)
+        log_path  = os.path.join(_REPORTS_DIR, f"weekly_summary_{timestamp}.md")
+        os.makedirs(_REPORTS_DIR, exist_ok=True)
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write(content)
+
+        print(f"\n  Weekly summary saved: {log_path}")
+
+        # Push notification
+        push_lines = [
+            f"📊 Resumen semanal {timestamp}",
+            f"Cerrados: {len(closed)} | Win rate: {win_rate}%",
+            f"P&L neto: ${total_pnl:+.0f}",
+        ]
+        if closed:
+            push_lines.append("")
+            for p in closed[:5]:  # max 5 in push
+                pnl  = float(p["gross_pnl"] or 0)
+                sign = "✅" if pnl >= 0 else "❌"
+                push_lines.append(f"{sign} {p['ticker']}: ${pnl:+.0f}")
+
+        push_lines.append(f"\nAbiertas: {len(open_pos)}")
+
+        send_ntfy(
+            title=f"Resumen semanal | P&L ${total_pnl:+.0f} | {win_rate}% win",
+            message="\n".join(push_lines),
+            priority="default"
+        )
+
+        return log_path
+
+    except Exception as e:
+        print(f"  Weekly summary error: {e}")
+        return None
+
+
+def is_friday_afternoon():
+    """True on Fridays after 2pm ET (19:00 UTC)."""
+    now = datetime.utcnow()
+    return now.weekday() == 4 and now.hour >= 19
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # MARKET HOURS CHECK
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -581,42 +719,71 @@ def main():
         print("  Weekend — skipping run")
         return
 
-    # Step 1 — Market context
-    market_ctx = run_market_context()
+    # Wrap entire run in try/except to catch failures and notify
+    try:
+        # Step 1 — Market context
+        print("\n  [1/6] Running market_context.py...")
+        market_ctx = run_market_context()
 
-    # Step 2 — Scanner
-    scanner_report = run_scanner()
+        # Step 2 — Scanner
+        print("\n  [2/6] Running scanner --universe...")
+        scanner_report = run_scanner()
 
-    # Step 3 — Paper sync (auto-closes stop loss / target)
-    run_paper_sync()
+        # Step 3 — Paper sync (auto-closes stop loss / target)
+        print("\n  [3/6] Running paper_sync...")
+        run_paper_sync()
 
-    # Step 4 — Get current DB state
-    print("\n  [5/6] Reading DB state...")
-    db_state = get_current_state()
-    print(f"  Open positions: {len(db_state['open'])} | "
-          f"Recent closed: {len(db_state['recently_closed'])}")
+        # Step 4 — Get current DB state
+        print("\n  [4/6] Reading DB state...")
+        db_state = get_current_state()
+        print(f"  Open positions: {len(db_state['open'])} | "
+              f"Recent closed: {len(db_state['recently_closed'])}")
 
-    # Step 5 — Claude analysis
-    analysis = run_claude_analysis(market_ctx, scanner_report, db_state)
+        # Step 5 — Claude analysis
+        print("\n  [5/6] Calling Anthropic API...")
+        analysis = run_claude_analysis(market_ctx, scanner_report, db_state)
 
-    # Step 6 — Execute recommendations
-    print("\n  [6/6] Executing recommendations...")
-    results = execute_recommendations(analysis)
+        # Step 6 — Execute recommendations
+        print("\n  [6/6] Executing recommendations...")
+        results = execute_recommendations(analysis)
 
-    run_time = time.time() - start_time
+        run_time = time.time() - start_time
 
-    # Summary push notification
-    send_run_summary(market_ctx, analysis, results, run_time)
+        # Summary push notification
+        send_run_summary(market_ctx, analysis, results, run_time)
 
-    # Save log
-    save_log(market_ctx, analysis, results, run_time)
+        # Save log
+        save_log(market_ctx, analysis, results, run_time)
 
-    print(f"\n{'=' * 55}")
-    print(f"  AUTO RUN COMPLETE — {run_time:.0f}s")
-    print(f"  Opened: {len(results['opened'])} | "
-          f"Closed: {len(results['closed'])} | "
-          f"Errors: {len(results['errors'])}")
-    print(f"{'=' * 55}\n")
+        # Weekly summary — only on Fridays afternoon run
+        if is_friday_afternoon():
+            print("\n  Generating weekly summary...")
+            generate_weekly_summary()
+
+        print(f"\n{'=' * 55}")
+        print(f"  AUTO RUN COMPLETE — {run_time:.0f}s")
+        print(f"  Opened: {len(results['opened'])} | "
+              f"Closed: {len(results['closed'])} | "
+              f"Errors: {len(results['errors'])}")
+        print(f"{'=' * 55}\n")
+
+    except Exception as e:
+        run_time = time.time() - start_time
+        error_msg = str(e)
+        print(f"\n  FATAL ERROR: {error_msg}")
+        traceback.print_exc()
+
+        # Send failure alert
+        send_ntfy(
+            title="🚨 Auto-run FALLÓ",
+            message=(
+                f"Error en auto-run {timestamp}\n"
+                f"Error: {error_msg[:200]}\n"
+                f"Tiempo: {run_time:.0f}s\n"
+                f"Revisar logs en Railway."
+            ),
+            priority="urgent"
+        )
 
 
 if __name__ == "__main__":
