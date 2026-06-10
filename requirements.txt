@@ -6,3 +6,12 @@ anthropic
 requests
 schedule
 pytz
+tastytrade
+anthropic
+yfinance
+psycopg2-binary
+python-dotenv
+requests
+pandas
+numpy
+schedule
