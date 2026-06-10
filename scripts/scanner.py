@@ -58,9 +58,12 @@ TIER1_STARS = [
 
 TIER1_MIN_CANDIDATES = 2   # expand to universe if fewer than this pass
 
-MARKET_CONTEXT_JSON = os.path.join(os.path.dirname(__file__), "market_context.json")
-REPORT_MD_PATH      = os.path.join(os.path.dirname(__file__), "scanner_report.md")
-REPORT_HTML_PATH    = os.path.join(os.path.dirname(__file__), "scanner_report.html")
+# Reports go to reports/ directory (one level up from scripts/)
+_BASE_DIR        = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPORTS_DIR      = os.path.join(_BASE_DIR, "reports")
+MARKET_CONTEXT_JSON = os.path.join(REPORTS_DIR, "market_context.json")
+REPORT_MD_PATH      = os.path.join(REPORTS_DIR, "scanner_report.md")
+REPORT_HTML_PATH    = os.path.join(REPORTS_DIR, "scanner_report.html")
 
 # Sector map for concentration warnings
 TICKER_SECTOR = {

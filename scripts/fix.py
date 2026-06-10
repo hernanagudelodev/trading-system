@@ -11,9 +11,9 @@ cur.execute("""
         gross_pnl            = NULL,
         pnl_pct              = NULL,
         profit_pct_of_max    = NULL
-    WHERE id = 8
+    WHERE id = 11
 """)
 conn.commit()
-print('OK')
+print('OK — GEN limpiado')
 cur.close()
 conn.close()

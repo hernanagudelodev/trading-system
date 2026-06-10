@@ -5,21 +5,29 @@ Position and account tracker — syncs with Tastytrade API.
 Also supports paper trading for strategy validation.
 
 Commands — Real positions:
-    python trade.py --sync          # sync positions + save account snapshot
-    python trade.py --list          # show open positions from DB
-    python trade.py --account       # show account balance history
-    python trade.py --history       # show closed positions P&L history
+    python trade.py --sync
+    python trade.py --list
+    python trade.py --account
+    python trade.py --history
 
 Commands — Paper trading:
-    python trade.py --paper-buy CVS --strike-low 94 --strike-high 101 --expiration 2026-07-02 --debit 2.62
-    python trade.py --paper-sync    # update P&L of all open paper positions with real TT prices
-    python trade.py --paper-list    # show open paper positions
-    python trade.py --paper-history # show closed paper positions with P&L
-    python trade.py --paper-close CVS  # manually close a paper position
+    python trade.py --paper-buy CVS --strike-low 94 --strike-high 101 \
+        --expiration 2026-07-02 --debit 2.62 \
+        --context '{"ivp":27,"iv_rank":0.36,"rsi":50.6,"trend":17.1,"beta":0.6,"pcr":0.09,"vix":16.45,"spy_trend":4.0,"macro":"FAVORABLE"}' \
+        --rationale "CVS mostró tendencia +17.1% con RSI 50.6 saludable..."
+    python trade.py --paper-sync
+    python trade.py --paper-list
+    python trade.py --paper-history
+    python trade.py --paper-close CVS
+
+For real trades, context is saved via:
+    python trade.py --save-context --position-id 5 \
+        --context '{"ivp":27,...}' --rationale "..."
 """
 
 import os
 import sys
+import json
 import asyncio
 from datetime import datetime, date
 from dotenv import load_dotenv
@@ -232,7 +240,6 @@ def ensure_tables():
         ADD COLUMN IF NOT EXISTS option_type             VARCHAR(10)
     """)
 
-    # Paper positions table — identical structure to positions but separate
     cur.execute("""
         CREATE TABLE IF NOT EXISTS paper_positions (
             id                  SERIAL PRIMARY KEY,
@@ -246,28 +253,62 @@ def ensure_tables():
             total_cost          DECIMAL(10,2),
             price_at_open       DECIMAL(10,2),
             opened_at           TIMESTAMP       DEFAULT NOW(),
-
-            -- Current value (updated by --paper-sync)
             current_spread_value DECIMAL(10,2),
             current_value        DECIMAL(10,2),
             gross_pnl            DECIMAL(10,2),
             pnl_pct              DECIMAL(10,4),
             profit_pct_of_max    DECIMAL(10,4),
             last_synced_at       TIMESTAMP,
-
-            -- Exit
             premium_received    DECIMAL(10,2),
             total_received      DECIMAL(10,2),
             closed_at           TIMESTAMP,
             price_at_close      DECIMAL(10,2),
-
-            -- Status
             status              VARCHAR(20)     DEFAULT 'OPEN',
             close_reason        VARCHAR(50),
-
-            -- Context
             notes               TEXT,
             created_at          TIMESTAMP       DEFAULT NOW()
+        )
+    """)
+
+    # trade_context — snapshot of market conditions at entry
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS trade_context (
+            id                  SERIAL PRIMARY KEY,
+
+            -- Link to real or paper position (one of the two, not both)
+            position_id         INTEGER REFERENCES positions(id),
+            paper_position_id   INTEGER REFERENCES paper_positions(id),
+
+            -- Stock criteria at signal moment
+            price_at_signal     DECIMAL(10,2),
+            trend_25d_pct       DECIMAL(6,2),
+            rsi                 DECIMAL(6,2),
+            above_sma50         BOOLEAN,
+            sma50_rising        BOOLEAN,
+            candle_pattern      VARCHAR(30),
+
+            -- Volatility
+            iv                  DECIMAL(6,2),
+            iv_percentile       DECIMAL(6,2),
+            iv_rank             DECIMAL(6,4),
+            hv_30d              DECIMAL(6,2),
+            beta                DECIMAL(6,2),
+            put_call_ratio      DECIMAL(6,3),
+            open_interest       INTEGER,
+
+            -- Strategy
+            strategy_selected   VARCHAR(30),
+            strategy_reason     VARCHAR(20),
+
+            -- Macro context at entry
+            vix                 DECIMAL(6,2),
+            spy_trend_25d       DECIMAL(6,2),
+            macro_verdict       VARCHAR(20),
+
+            -- Claude qualitative analysis
+            claude_rationale    TEXT,
+
+            created_at          TIMESTAMP DEFAULT NOW()
         )
     """)
 
@@ -437,11 +478,87 @@ def close_position_in_db(db_pos_id, tt_pos, close_reason="Closed in Tastytrade")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PAPER TRADING — get real spread value from Tastytrade
+# TRADE CONTEXT — save market snapshot at entry
+# ══════════════════════════════════════════════════════════════════════════════
+
+def save_trade_context(position_id=None, paper_position_id=None,
+                       context_json=None, rationale=None):
+    """
+    Save market conditions snapshot at the moment of trade entry.
+
+    context_json: dict or JSON string with keys:
+        price, trend, rsi, above_sma50, sma50_rising, candle,
+        iv, ivp, iv_rank, hv, beta, pcr, oi,
+        strategy, strategy_reason,
+        vix, spy_trend, macro
+
+    rationale: Claude's qualitative analysis (free text paragraph)
+    """
+    if position_id is None and paper_position_id is None:
+        print("  ERROR: must provide position_id or paper_position_id")
+        return None
+
+    if context_json is None:
+        context_json = {}
+    if isinstance(context_json, str):
+        try:
+            context_json = json.loads(context_json)
+        except Exception:
+            print("  WARNING: could not parse context JSON")
+            context_json = {}
+
+    conn = get_db_connection()
+    cur  = conn.cursor()
+    cur.execute("""
+        INSERT INTO trade_context (
+            position_id, paper_position_id,
+            price_at_signal, trend_25d_pct, rsi, above_sma50, sma50_rising, candle_pattern,
+            iv, iv_percentile, iv_rank, hv_30d, beta, put_call_ratio, open_interest,
+            strategy_selected, strategy_reason,
+            vix, spy_trend_25d, macro_verdict,
+            claude_rationale
+        ) VALUES (
+            %s, %s,
+            %s, %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s, %s, %s,
+            %s, %s,
+            %s, %s, %s,
+            %s
+        ) RETURNING id
+    """, (
+        position_id, paper_position_id,
+        context_json.get("price"),
+        context_json.get("trend"),
+        context_json.get("rsi"),
+        context_json.get("above_sma50"),
+        context_json.get("sma50_rising"),
+        context_json.get("candle"),
+        context_json.get("iv"),
+        context_json.get("ivp"),
+        context_json.get("iv_rank"),
+        context_json.get("hv"),
+        context_json.get("beta"),
+        context_json.get("pcr"),
+        context_json.get("oi"),
+        context_json.get("strategy"),
+        context_json.get("strategy_reason"),
+        context_json.get("vix"),
+        context_json.get("spy_trend"),
+        context_json.get("macro"),
+        rationale,
+    ))
+    ctx_id = cur.fetchone()[0]
+    conn.commit()
+    cur.close()
+    conn.close()
+    return ctx_id
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAPER TRADING — spread value fetch
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def _fetch_paper_spread_value(ticker, strike_low, strike_high, expiration):
-    """Fetch real market value of a spread from Tastytrade for paper P&L."""
     from tastytrade import Session, DXLinkStreamer
     from tastytrade.instruments import NestedOptionChain
     from tastytrade.dxfeed import Quote
@@ -513,11 +630,106 @@ def fetch_paper_spread_value(ticker, strike_low, strike_high, expiration):
 # PAPER TRADING — commands
 # ══════════════════════════════════════════════════════════════════════════════
 
-def cmd_paper_buy(ticker, strike_low, strike_high, expiration_str, debit, notes=None):
+def _read_context_from_reports(ticker):
     """
-    Register a new paper spread position.
-    Debit > 0  → Bull Call Spread (pay to enter)
-    Debit < 0  → Bull Put Spread  (receive credit to enter)
+    Read market context and scanner criteria for a ticker from the
+    generated report files (market_context.json + scanner_report.md).
+
+    Returns dict with all available fields, or {} if files not found.
+    """
+    import re
+
+    base_dir      = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    ctx_path      = os.path.join(base_dir, "reports", "market_context.json")
+    scanner_path  = os.path.join(base_dir, "reports", "scanner_report.md")
+    context       = {}
+
+    # ── market_context.json ───────────────────────────────────────────────────
+    if os.path.exists(ctx_path):
+        try:
+            with open(ctx_path) as f:
+                mctx = json.load(f)
+            vix = mctx.get("vix", {})
+            spy = mctx.get("spy", {})
+            context["vix"]        = vix.get("current")
+            context["spy_trend"]  = spy.get("pct_25d")
+            context["macro"]      = mctx.get("verdict")
+        except Exception:
+            pass
+
+    # ── scanner_report.md ─────────────────────────────────────────────────────
+    if os.path.exists(scanner_path):
+        try:
+            with open(scanner_path, encoding="utf-8") as f:
+                content = f.read()
+
+            # Find the section for this ticker
+            pattern = rf"### {re.escape(ticker)} — \$([0-9.]+)(.*?)(?=### [A-Z]|\Z)"
+            match   = re.search(pattern, content, re.DOTALL)
+
+            if match:
+                price_str    = match.group(1)
+                section      = match.group(2)
+                context["price"] = float(price_str)
+
+                # Trend
+                m = re.search(r"Trend 25d:.*?(BULLISH|BEARISH).*?([+-]?\d+\.?\d*)%", section)
+                if m:
+                    context["trend"] = float(m.group(2)) * (1 if m.group(1) == "BULLISH" else -1)
+
+                # RSI
+                m = re.search(r"RSI:\s*([0-9.]+)", section)
+                if m:
+                    context["rsi"] = float(m.group(1))
+
+                # SMA
+                context["above_sma50"]  = "Above" in section and "SMA50" in section
+                context["sma50_rising"] = "RISING" in section
+
+                # Candle
+                m = re.search(r"Candle:\s*(.+)", section)
+                if m:
+                    context["candle"] = m.group(1).strip()
+
+                # IV
+                m = re.search(r"IV:\s*([0-9.]+)%\s*\(P([0-9.]+)\s*/\s*Rank\s*([0-9.]+)\)", section)
+                if m:
+                    context["iv"]      = float(m.group(1))
+                    context["ivp"]     = float(m.group(2))
+                    context["iv_rank"] = float(m.group(3))
+
+                # HV
+                m = re.search(r"HV 30d:\s*([0-9.]+)%", section)
+                if m:
+                    context["hv"] = float(m.group(1))
+
+                # Beta
+                m = re.search(r"Beta:\s*([0-9.]+)", section)
+                if m:
+                    context["beta"] = float(m.group(1))
+
+                # Put/Call
+                m = re.search(r"Put/Call:\s*([0-9.]+)", section)
+                if m:
+                    context["pcr"] = float(m.group(1))
+
+                # OI
+                m = re.search(r"OI \(ATM\):\s*([\d,]+)", section)
+                if m:
+                    context["oi"] = int(m.group(1).replace(",", ""))
+
+        except Exception as e:
+            print(f"  WARNING: could not parse scanner report for {ticker}: {e}")
+
+    return context
+
+
+def cmd_paper_buy(ticker, strike_low, strike_high, expiration_str, debit,
+                  notes=None, context_json=None, rationale=None):
+    """
+    Register a new paper spread position and save trade context.
+    Debit > 0 → Bull Call Spread
+    Debit < 0 → Bull Put Spread (credit received)
     """
     ensure_tables()
 
@@ -580,7 +792,29 @@ def cmd_paper_buy(ticker, strike_low, strike_high, expiration_str, debit, notes=
         print(f"\n  ✅ Paper position opened ({strategy}):")
         print(f"     {ticker} Bull Call Spread ${strike_low}/${strike_high}")
         print(f"     Exp: {expiration} | Debit: ${debit:.2f} | Cost: ${total_cost:.2f} | Max profit: ${max_profit:.2f}")
-    print(f"     DB id: {pos_id}\n")
+    print(f"     DB id: {pos_id}")
+
+    # Auto-read context from reports if not provided
+    if context_json is None:
+        context_json = _read_context_from_reports(ticker)
+        if context_json:
+            print(f"     Context auto-loaded from reports ✅")
+
+    # Add strategy info to context
+    if isinstance(context_json, dict):
+        context_json["strategy"] = strategy
+        context_json["strategy_reason"] = "IV_HIGH" if debit < 0 else "IV_LOW"
+
+    # Save trade context
+    if context_json or rationale:
+        ctx_id = save_trade_context(
+            paper_position_id=pos_id,
+            context_json=context_json,
+            rationale=rationale
+        )
+        if ctx_id:
+            print(f"     Context saved (id: {ctx_id}) ✅")
+    print()
 
 
 def cmd_paper_sync():
@@ -611,14 +845,16 @@ def cmd_paper_sync():
     print(f"  Open paper positions: {len(positions)}\n")
 
     for pos in positions:
-        ticker     = pos["ticker"]
-        strike_low = float(pos["strike_low"])
+        ticker      = pos["ticker"]
+        strike_low  = float(pos["strike_low"])
         strike_high = float(pos["strike_high"])
-        total_cost = float(pos["total_cost"])
-        premium    = float(pos["premium_paid"])
-        contracts  = int(pos["contracts"])
-        expiration = pos["expiration"]
-        dte        = (expiration - date.today()).days
+        total_cost  = float(pos["total_cost"])
+        premium     = float(pos["premium_paid"])
+        contracts   = int(pos["contracts"])
+        expiration  = pos["expiration"]
+        strategy    = pos.get("strategy", "Bull Call Spread")
+        is_put      = strategy == "Bull Put Spread"
+        dte         = (expiration - date.today()).days
 
         print(f"  {ticker} ${strike_low}/{strike_high} (DTE: {dte})...", end=" ", flush=True)
 
@@ -628,24 +864,17 @@ def cmd_paper_sync():
             print("no data")
             continue
 
-        spread_width   = strike_high - strike_low
-        strategy       = pos.get("strategy", "Bull Call Spread")
-        is_put_spread  = strategy == "Bull Put Spread"
+        spread_width = strike_high - strike_low
 
-        if is_put_spread:
-            # Credit spread: premium_paid is negative (credit received)
+        if is_put:
             net_credit    = abs(premium)
             max_profit    = round(net_credit * contracts * 100, 2)
-            max_loss      = round((spread_width - net_credit) * contracts * 100, 2)
-            # P&L: if spread_value went down (good) we profit
-            # gross_pnl = credit_received - cost_to_close_now
-            cost_to_close  = round(spread_value * contracts * 100, 2)
-            current_value  = cost_to_close
-            gross_pnl      = round(max_profit - cost_to_close, 2)
-            pnl_pct        = round(gross_pnl / max_profit * 100, 2) if max_profit else 0
+            cost_to_close = round(spread_value * contracts * 100, 2)
+            current_value = cost_to_close
+            gross_pnl     = round(max_profit - cost_to_close, 2)
+            pnl_pct       = round(gross_pnl / max_profit * 100, 2) if max_profit else 0
             profit_pct_max = round(gross_pnl / max_profit, 4) if max_profit else 0
         else:
-            # Debit spread: normal calculation
             max_profit     = round((spread_width - premium) * contracts * 100, 2)
             current_value  = round(spread_value * contracts * 100, 2)
             gross_pnl      = round(current_value - total_cost, 2)
@@ -654,18 +883,15 @@ def cmd_paper_sync():
 
         print(f"spread=${spread_value:.2f} | P&L ${gross_pnl:+.2f} ({pnl_pct:+.1f}%)")
 
-        # Auto-close rules
         close_reason = None
         if dte <= 7:
             close_reason = "TIME_EXPIRED"
-        elif is_put_spread:
-            # Credit spread: close if cost to close exceeds 2x credit received
+        elif is_put:
             if spread_value >= abs(premium) * 2:
                 close_reason = "STOP_LOSS"
             elif profit_pct_max >= 0.70:
                 close_reason = "TARGET_REACHED"
         else:
-            # Debit spread: close if loss > 65% or profit > 70%
             if profit_pct_max >= 0.70:
                 close_reason = "TARGET_REACHED"
             elif pnl_pct <= -65.0:
@@ -678,31 +904,19 @@ def cmd_paper_sync():
             print(f"    → AUTO-CLOSE: {close_reason}")
             cur.execute("""
                 UPDATE paper_positions SET
-                    current_spread_value = %s,
-                    current_value        = %s,
-                    gross_pnl            = %s,
-                    pnl_pct              = %s,
-                    profit_pct_of_max    = %s,
-                    last_synced_at       = NOW(),
-                    status               = 'CLOSED',
-                    closed_at            = NOW(),
-                    premium_received     = %s,
-                    total_received       = %s,
-                    close_reason         = %s
+                    current_spread_value = %s, current_value = %s,
+                    gross_pnl = %s, pnl_pct = %s, profit_pct_of_max = %s,
+                    last_synced_at = NOW(), status = 'CLOSED', closed_at = NOW(),
+                    premium_received = %s, total_received = %s, close_reason = %s
                 WHERE id = %s
-            """, (
-                spread_value, current_value, gross_pnl, pnl_pct, profit_pct_max,
-                spread_value, current_value, close_reason, pos["id"]
-            ))
+            """, (spread_value, current_value, gross_pnl, pnl_pct, profit_pct_max,
+                  spread_value, current_value, close_reason, pos["id"]))
         else:
             cur.execute("""
                 UPDATE paper_positions SET
-                    current_spread_value = %s,
-                    current_value        = %s,
-                    gross_pnl            = %s,
-                    pnl_pct              = %s,
-                    profit_pct_of_max    = %s,
-                    last_synced_at       = NOW()
+                    current_spread_value = %s, current_value = %s,
+                    gross_pnl = %s, pnl_pct = %s, profit_pct_of_max = %s,
+                    last_synced_at = NOW()
                 WHERE id = %s
             """, (spread_value, current_value, gross_pnl, pnl_pct,
                   profit_pct_max, pos["id"]))
@@ -716,9 +930,7 @@ def cmd_paper_sync():
 
 
 def cmd_paper_list():
-    """Show open paper positions with current P&L."""
     ensure_tables()
-
     conn = get_db_connection()
     cur  = conn.cursor()
     cur.execute("""
@@ -751,16 +963,13 @@ def cmd_paper_list():
         synced  = str(r["last_synced_at"])[:16] if r["last_synced_at"] else "never"
         spread  = f"${r['strike_low']}/{r['strike_high']}"
         sign    = "+" if pnl >= 0 else ""
-
         print(f"  {r['id']:<4} {r['ticker']:<6} {spread:<14} {exp:<12} "
               f"${cost:>6.0f} {sign}${pnl:>6.0f} {pmax:>6.1f}% {synced}")
     print()
 
 
 def cmd_paper_history():
-    """Show closed paper positions with final P&L and close reason."""
     ensure_tables()
-
     conn = get_db_connection()
     cur  = conn.cursor()
     cur.execute("""
@@ -780,7 +989,7 @@ def cmd_paper_history():
     if not rows:
         return
 
-    wins   = sum(1 for r in rows if float(r["gross_pnl"] or 0) > 0)
+    wins = sum(1 for r in rows if float(r["gross_pnl"] or 0) > 0)
     losses = len(rows) - wins
 
     for r in rows:
@@ -791,13 +1000,10 @@ def cmd_paper_history():
         closed  = str(r["closed_at"])[:10] if r["closed_at"] else "N/A"
         reason  = r["close_reason"] or "MANUAL"
         sign    = "✅" if pnl >= 0 else "❌"
-
         print(f"  {sign} #{r['id']} {r['ticker']} "
               f"${r['strike_low']}/{r['strike_high']} | "
-              f"Cost ${cost:.0f} | "
-              f"P&L ${pnl:+.0f} ({pnl_pct:+.1f}%) | "
-              f"{pmax:.0f}% of max | "
-              f"{reason} | {closed}")
+              f"Cost ${cost:.0f} | P&L ${pnl:+.0f} ({pnl_pct:+.1f}%) | "
+              f"{pmax:.0f}% of max | {reason} | {closed}")
 
     print(f"\n  Summary: {wins} wins / {losses} losses / {len(rows)} total")
     if rows:
@@ -807,9 +1013,7 @@ def cmd_paper_history():
 
 
 def cmd_paper_close(ticker):
-    """Manually close an open paper position."""
     ensure_tables()
-
     conn = get_db_connection()
     cur  = conn.cursor()
     cur.execute("""
@@ -817,8 +1021,7 @@ def cmd_paper_close(ticker):
                total_cost, premium_paid, contracts
         FROM paper_positions
         WHERE UPPER(status) = 'OPEN' AND ticker = %s
-        ORDER BY opened_at DESC
-        LIMIT 1
+        ORDER BY opened_at DESC LIMIT 1
     """, (ticker.upper(),))
     row = cur.fetchone()
 
@@ -829,33 +1032,25 @@ def cmd_paper_close(ticker):
         return
 
     pos_id, ticker, sl, sh, exp, total_cost, premium, contracts = row
-
-    # Get current real price
     spread_value = fetch_paper_spread_value(ticker, float(sl), float(sh), exp)
     if spread_value is None:
         spread_value = 0.0
 
-    total_cost    = float(total_cost)
-    current_value = round(spread_value * int(contracts) * 100, 2)
-    gross_pnl     = round(current_value - total_cost, 2)
-    pnl_pct       = round(gross_pnl / total_cost * 100, 2) if total_cost else 0
-    spread_width  = float(sh) - float(sl)
-    max_profit    = round((spread_width - float(premium)) * int(contracts) * 100, 2)
+    total_cost     = float(total_cost)
+    current_value  = round(spread_value * int(contracts) * 100, 2)
+    gross_pnl      = round(current_value - total_cost, 2)
+    pnl_pct        = round(gross_pnl / total_cost * 100, 2) if total_cost else 0
+    spread_width   = float(sh) - float(sl)
+    max_profit     = round((spread_width - float(premium)) * int(contracts) * 100, 2)
     profit_pct_max = round(gross_pnl / max_profit, 4) if max_profit else 0
 
     cur.execute("""
         UPDATE paper_positions SET
-            status               = 'CLOSED',
-            closed_at            = NOW(),
-            current_spread_value = %s,
-            current_value        = %s,
-            premium_received     = %s,
-            total_received       = %s,
-            gross_pnl            = %s,
-            pnl_pct              = %s,
-            profit_pct_of_max    = %s,
-            close_reason         = 'MANUAL',
-            last_synced_at       = NOW()
+            status = 'CLOSED', closed_at = NOW(),
+            current_spread_value = %s, current_value = %s,
+            premium_received = %s, total_received = %s,
+            gross_pnl = %s, pnl_pct = %s, profit_pct_of_max = %s,
+            close_reason = 'MANUAL', last_synced_at = NOW()
         WHERE id = %s
     """, (spread_value, current_value, spread_value, current_value,
           gross_pnl, pnl_pct, profit_pct_max, pos_id))
@@ -927,6 +1122,9 @@ def run_sync():
                   f"Net debit: ${spread['premium_paid']:.2f} | "
                   f"Total cost: ${spread['total_cost']:.2f}")
             print(f"    DB id: {pos_id}")
+            print(f"  ⚠️  Guarda el contexto:")
+            print(f"      python trade.py --save-context --position-id {pos_id} "
+                  f"--ticker {spread['ticker']} --rationale \"...\"")
             new_count += 1
 
     for tt_pos in singles:
@@ -936,6 +1134,9 @@ def run_sync():
             print(f"    {tt_pos['ticker']} {tt_pos['option_type']} "
                   f"${tt_pos['strike']} exp {tt_pos['expiration']}")
             print(f"    DB id: {pos_id}")
+            print(f"  ⚠️  Guarda el contexto:")
+            print(f"      python trade.py --save-context --position-id {pos_id} "
+                  f"--ticker {tt_pos['ticker']} --rationale \"...\"")
             new_count += 1
 
     tt_all_symbols = {p["symbol"] for p in tt_positions}
@@ -992,8 +1193,7 @@ def cmd_account():
         SELECT snapshot_at, net_liquidating_value, derivative_buying_power,
                pending_cash, long_derivative_value
         FROM account_snapshots
-        ORDER BY snapshot_at DESC
-        LIMIT 30
+        ORDER BY snapshot_at DESC LIMIT 30
     """)
     rows = cur.fetchall()
     cur.close()
@@ -1022,8 +1222,7 @@ def cmd_history():
                close_reason, closed_at
         FROM positions
         WHERE UPPER(status) = 'CLOSED'
-        ORDER BY closed_at DESC
-        LIMIT 20
+        ORDER BY closed_at DESC LIMIT 20
     """)
     rows = cur.fetchall()
     cur.close()
@@ -1044,6 +1243,27 @@ def cmd_history():
     print()
 
 
+def cmd_save_context(position_id, context_json, rationale, ticker=None):
+    """Save context for an existing real position."""
+    ensure_tables()
+
+    # Auto-read from reports if no context provided and ticker is known
+    if context_json is None and ticker:
+        context_json = _read_context_from_reports(ticker)
+        if context_json:
+            print(f"  Context auto-loaded from reports for {ticker} ✅")
+
+    ctx_id = save_trade_context(
+        position_id=position_id,
+        context_json=context_json,
+        rationale=rationale
+    )
+    if ctx_id:
+        print(f"\n  ✅ Context saved for position #{position_id} (context id: {ctx_id})\n")
+    else:
+        print(f"\n  ❌ Failed to save context\n")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1052,26 +1272,32 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Trade sync with Tastytrade + paper trading")
 
-    # Real trading
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--sync",         action="store_true")
-    group.add_argument("--list",         action="store_true")
-    group.add_argument("--account",      action="store_true")
-    group.add_argument("--history",      action="store_true")
+    group.add_argument("--sync",          action="store_true")
+    group.add_argument("--list",          action="store_true")
+    group.add_argument("--account",       action="store_true")
+    group.add_argument("--history",       action="store_true")
+    group.add_argument("--paper-buy",     metavar="TICKER")
+    group.add_argument("--paper-sync",    action="store_true")
+    group.add_argument("--paper-list",    action="store_true")
+    group.add_argument("--paper-history", action="store_true")
+    group.add_argument("--paper-close",   metavar="TICKER")
+    group.add_argument("--save-context",  action="store_true",
+                       help="Save trade context for an existing real position")
 
-    # Paper trading
-    group.add_argument("--paper-buy",    metavar="TICKER")
-    group.add_argument("--paper-sync",   action="store_true")
-    group.add_argument("--paper-list",   action="store_true")
-    group.add_argument("--paper-history",action="store_true")
-    group.add_argument("--paper-close",  metavar="TICKER")
-
-    # Paper buy arguments
-    parser.add_argument("--strike-low",  type=float)
-    parser.add_argument("--strike-high", type=float)
-    parser.add_argument("--expiration",  type=str, help="YYYY-MM-DD")
-    parser.add_argument("--debit",       type=float)
-    parser.add_argument("--notes",       type=str, default=None)
+    parser.add_argument("--strike-low",   type=float)
+    parser.add_argument("--strike-high",  type=float)
+    parser.add_argument("--expiration",   type=str, help="YYYY-MM-DD")
+    parser.add_argument("--debit",        type=float)
+    parser.add_argument("--notes",        type=str, default=None)
+    parser.add_argument("--context",      type=str, default=None,
+                        help='JSON string with market criteria (optional — auto-read from reports)')
+    parser.add_argument("--rationale",    type=str, default=None,
+                        help="Claude's qualitative analysis paragraph")
+    parser.add_argument("--position-id",  type=int, default=None,
+                        help="DB position id (for --save-context)")
+    parser.add_argument("--ticker",       type=str, default=None,
+                        help="Ticker symbol (for --save-context auto-context)")
 
     args = parser.parse_args()
 
@@ -1087,8 +1313,11 @@ if __name__ == "__main__":
         if not all([args.strike_low, args.strike_high, args.expiration, args.debit]):
             print("  ERROR: --paper-buy requires --strike-low --strike-high --expiration --debit")
         else:
-            cmd_paper_buy(args.paper_buy, args.strike_low, args.strike_high,
-                          args.expiration, args.debit, args.notes)
+            cmd_paper_buy(
+                args.paper_buy, args.strike_low, args.strike_high,
+                args.expiration, args.debit, args.notes,
+                args.context, args.rationale
+            )
     elif args.paper_sync:
         cmd_paper_sync()
     elif args.paper_list:
@@ -1097,3 +1326,8 @@ if __name__ == "__main__":
         cmd_paper_history()
     elif args.paper_close:
         cmd_paper_close(args.paper_close)
+    elif args.save_context:
+        if not args.position_id:
+            print("  ERROR: --save-context requires --position-id")
+        else:
+            cmd_save_context(args.position_id, args.context, args.rationale, args.ticker)

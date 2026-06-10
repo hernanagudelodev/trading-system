@@ -91,7 +91,8 @@ HEARTBEAT_INTERVAL_MIN = 60
 _last_heartbeat_time = None
 _market_close_sent   = False
 
-REPORT_PATH = os.path.join(os.path.dirname(__file__), "monitor_report.html")
+REPORT_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           "reports", "monitor_report.html")
 
 AI_MODEL      = "claude-sonnet-4-20250514"
 AI_MAX_TOKENS = 1000
@@ -1122,8 +1123,17 @@ def run_paper_monitor():
         time.sleep(0.5)
 
         if spread_value is None:
-            # Use last known value if available
-            spread_value = float(pos["current_spread_value"] or 0)
+            last_known = float(pos["current_spread_value"] or 0)
+            if last_known <= 0:
+                print(f"sin datos reales — omitiendo")
+                print(f"\n  [--] {ticker} (PAPER) — {strategy} — SIN DATOS")
+                print(f"  {'─' * 50}")
+                print(f"  Strike(s):     ${strike_low} / ${strike_high}")
+                print(f"  Expiracion:    {expiration} ({dte} dias)")
+                print(f"  No se pudo obtener precio real del spread.")
+                print()
+                continue
+            spread_value = last_known
             print(f"usando último valor conocido: ${spread_value:.2f}")
         else:
             print(f"spread=${spread_value:.2f}")
