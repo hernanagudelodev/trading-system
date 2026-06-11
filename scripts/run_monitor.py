@@ -111,8 +111,8 @@ def run_auto():
     print(f"{'═' * 55}\n")
 
     try:
+        os.environ["AUTO_RUN_SLOT"] = slot
         import auto_run
-        # Reload to avoid stale state between runs
         import importlib
         importlib.reload(auto_run)
         auto_run.main()

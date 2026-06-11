@@ -510,50 +510,161 @@ def send_run_summary(market_ctx, analysis, results, run_time):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SAVE LOG
+# SAVE LOG — file + DB
 # ══════════════════════════════════════════════════════════════════════════════
 
-def save_log(market_ctx, analysis, results, run_time):
-    """Save run log to reports/."""
-    os.makedirs(_REPORTS_DIR, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H%M")
-    log_path  = os.path.join(_REPORTS_DIR, f"auto_run_{timestamp}.log")
+def _ensure_log_table():
+    """Create auto_run_logs table if it doesn't exist."""
+    try:
+        import psycopg2
+        conn = psycopg2.connect(os.getenv("DATABASE_URL"))
+        cur  = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS auto_run_logs (
+                id           SERIAL PRIMARY KEY,
+                run_at       TIMESTAMP DEFAULT NOW(),
+                slot         VARCHAR(20),
+                verdict      VARCHAR(20),
+                vix          DECIMAL(6,2),
+                opened       INTEGER DEFAULT 0,
+                closed       INTEGER DEFAULT 0,
+                errors       INTEGER DEFAULT 0,
+                summary      TEXT,
+                no_trade_reason TEXT,
+                full_log     TEXT,
+                run_time_sec INTEGER
+            )
+        """)
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"  Log table error: {e}")
 
-    verdict = market_ctx.get("verdict", "N/A") if market_ctx else "N/A"
 
-    with open(log_path, "w", encoding="utf-8") as f:
-        f.write(f"AUTO RUN — {datetime.now().strftime('%Y-%m-%d %H:%M')}\n")
-        f.write(f"{'=' * 50}\n\n")
-        f.write(f"Verdict: {verdict}\n")
-        f.write(f"Run time: {run_time:.0f}s\n\n")
+def _save_log_to_db(market_ctx, analysis, results, run_time, slot="unknown"):
+    """Save run log to auto_run_logs table in PostgreSQL."""
+    try:
+        import psycopg2
+        _ensure_log_table()
 
-        if analysis:
-            f.write(f"ANALYSIS SUMMARY:\n{analysis.get('analysis_summary', 'N/A')}\n\n")
+        verdict = market_ctx.get("verdict", "N/A") if market_ctx else "N/A"
+        vix     = market_ctx["vix"]["current"] if market_ctx else None
+        summary = analysis.get("analysis_summary", "") if analysis else ""
+        no_trade = analysis.get("no_trade_reason", "") if analysis else ""
 
-        f.write(f"OPENED ({len(results['opened'])}):\n")
+        # Build full log text
+        lines = [f"AUTO RUN — {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+                 f"Slot: {slot} | Verdict: {verdict} | Run time: {run_time:.0f}s",
+                 ""]
+
+        if summary:
+            lines += [f"ANALYSIS:\n{summary}", ""]
+
+        lines.append(f"OPENED ({len(results['opened'])}):")
         for t in results["opened"]:
-            f.write(f"  {t['ticker']} {t['strategy']} {t['strikes']} debit={t['debit']}\n")
+            lines.append(f"  {t['ticker']} {t['strategy']} {t['strikes']} debit={t['debit']}")
 
-        f.write(f"\nCLOSED ({len(results['closed'])}):\n")
+        lines.append(f"\nCLOSED ({len(results['closed'])}):")
         for c in results["closed"]:
-            f.write(f"  {c['ticker']}: {c['reason']}\n")
+            lines.append(f"  {c['ticker']}: {c['reason']}")
 
         if results["errors"]:
-            f.write(f"\nERRORS:\n")
+            lines.append(f"\nERRORS:")
             for e in results["errors"]:
-                f.write(f"  {e}\n")
+                lines.append(f"  {e}")
 
         if analysis and analysis.get("new_trades"):
-            f.write(f"\nFULL TRADE RATIONALE:\n")
+            lines.append(f"\nTRADE RATIONALE:")
             for t in analysis["new_trades"]:
-                f.write(f"\n{t['ticker']} ${t.get('strike_low')}/{t.get('strike_high')}:\n")
-                f.write(f"{t.get('rationale', 'N/A')}\n")
+                lines.append(f"\n{t['ticker']} ${t.get('strike_low')}/{t.get('strike_high')}:")
+                lines.append(t.get("rationale", "N/A"))
 
-        if analysis and analysis.get("no_trade_reason"):
-            f.write(f"\nNO TRADE REASON:\n{analysis['no_trade_reason']}\n")
+        if no_trade:
+            lines.append(f"\nNO TRADE REASON:\n{no_trade}")
 
-    print(f"\n  Log saved: {log_path}")
-    return log_path
+        full_log = "\n".join(lines)
+
+        conn = psycopg2.connect(os.getenv("DATABASE_URL"))
+        cur  = conn.cursor()
+        cur.execute("""
+            INSERT INTO auto_run_logs
+                (slot, verdict, vix, opened, closed, errors,
+                 summary, no_trade_reason, full_log, run_time_sec)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
+        """, (
+            slot,
+            verdict,
+            vix,
+            len(results["opened"]),
+            len(results["closed"]),
+            len(results["errors"]),
+            summary[:1000] if summary else "",
+            no_trade[:500] if no_trade else "",
+            full_log,
+            int(run_time),
+        ))
+        log_id = cur.fetchone()[0]
+        conn.commit()
+        cur.close()
+        conn.close()
+        print(f"  Log saved to DB (id={log_id})")
+        return log_id
+    except Exception as e:
+        print(f"  DB log error: {e}")
+        return None
+
+
+def save_log(market_ctx, analysis, results, run_time, slot="unknown"):
+    """Save run log to DB (persistent) + file (local)."""
+
+    # Always save to DB — persists across Railway deploys
+    _save_log_to_db(market_ctx, analysis, results, run_time, slot)
+
+    # Also save to file locally (useful for local runs)
+    try:
+        os.makedirs(_REPORTS_DIR, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H%M")
+        log_path  = os.path.join(_REPORTS_DIR, f"auto_run_{timestamp}.log")
+        verdict   = market_ctx.get("verdict", "N/A") if market_ctx else "N/A"
+
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write(f"AUTO RUN — {datetime.now().strftime('%Y-%m-%d %H:%M')}\n")
+            f.write(f"{'=' * 50}\n\n")
+            f.write(f"Verdict: {verdict}\n")
+            f.write(f"Run time: {run_time:.0f}s\n\n")
+
+            if analysis:
+                f.write(f"ANALYSIS SUMMARY:\n{analysis.get('analysis_summary', 'N/A')}\n\n")
+
+            f.write(f"OPENED ({len(results['opened'])}):\n")
+            for t in results["opened"]:
+                f.write(f"  {t['ticker']} {t['strategy']} {t['strikes']} debit={t['debit']}\n")
+
+            f.write(f"\nCLOSED ({len(results['closed'])}):\n")
+            for c in results["closed"]:
+                f.write(f"  {c['ticker']}: {c['reason']}\n")
+
+            if results["errors"]:
+                f.write(f"\nERRORS:\n")
+                for e in results["errors"]:
+                    f.write(f"  {e}\n")
+
+            if analysis and analysis.get("new_trades"):
+                f.write(f"\nFULL TRADE RATIONALE:\n")
+                for t in analysis["new_trades"]:
+                    f.write(f"\n{t['ticker']} ${t.get('strike_low')}/{t.get('strike_high')}:\n")
+                    f.write(f"{t.get('rationale', 'N/A')}\n")
+
+            if analysis and analysis.get("no_trade_reason"):
+                f.write(f"\nNO TRADE REASON:\n{analysis['no_trade_reason']}\n")
+
+        print(f"  Log saved: {log_path}")
+        return log_path
+    except Exception as e:
+        print(f"  File log error: {e}")
+        return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -752,8 +863,9 @@ def main():
         # Summary push notification
         send_run_summary(market_ctx, analysis, results, run_time)
 
-        # Save log
-        save_log(market_ctx, analysis, results, run_time)
+        # Save log to DB + file
+        save_log(market_ctx, analysis, results, run_time,
+                 slot=os.getenv("AUTO_RUN_SLOT", "manual"))
 
         # Weekly summary — only on Fridays afternoon run
         if is_friday_afternoon():
