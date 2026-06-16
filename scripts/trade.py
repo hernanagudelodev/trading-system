@@ -609,9 +609,17 @@ async def _fetch_paper_spread_value(ticker, strike_low, strike_high, expiration,
 
         async with DXLinkStreamer(session) as streamer:
             await streamer.subscribe(Quote, symbols)
-            for _ in symbols:
+            # Recolecta hasta tener AMBOS quotes o agotar un presupuesto total.
+            # No abandona por un solo evento lento (clave en alta volatilidad/FOMC).
+            loop     = asyncio.get_running_loop()
+            deadline = loop.time() + 12
+            while len(quotes_map) < len(symbols):
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    break
                 try:
-                    q = await asyncio.wait_for(streamer.get_event(Quote), timeout=10)
+                    q = await asyncio.wait_for(streamer.get_event(Quote),
+                                               timeout=remaining)
                     quotes_map[q.event_symbol] = q
                 except asyncio.TimeoutError:
                     break
@@ -638,12 +646,25 @@ async def _fetch_paper_spread_value(ticker, strike_low, strike_high, expiration,
 
 
 def fetch_paper_spread_value(ticker, strike_low, strike_high, expiration,
-                              option_type="call"):
-    try:
-        return asyncio.run(_fetch_paper_spread_value(ticker, strike_low, strike_high,
-                                                      expiration, option_type))
-    except Exception:
-        return None
+                              option_type="call", retries=3, delay=2):
+    """
+    Wrapper síncrono con reintentos. Cada intento usa un event loop y una
+    sesión Tastytrade nuevos (evita conexiones obsoletas). Reintenta cuando
+    el streamer no entrega quotes a tiempo (típico en alta volatilidad/FOMC).
+    Devuelve el valor del spread, o None si fallan todos los intentos.
+    """
+    import time
+    for attempt in range(retries):
+        try:
+            val = asyncio.run(_fetch_paper_spread_value(
+                ticker, strike_low, strike_high, expiration, option_type))
+            if val is not None:
+                return val
+        except Exception:
+            pass
+        if attempt < retries - 1:
+            time.sleep(delay)
+    return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
