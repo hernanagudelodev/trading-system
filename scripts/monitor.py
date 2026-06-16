@@ -1123,6 +1123,7 @@ def run_paper_monitor():
         # Small delay to avoid overwhelming DXLinkStreamer
         time.sleep(0.5)
 
+        price_fresh = True
         if spread_value is None:
             last_known = float(pos["current_spread_value"] or 0)
             if last_known <= 0:
@@ -1135,7 +1136,8 @@ def run_paper_monitor():
                 print()
                 continue
             spread_value = last_known
-            print(f"usando último valor conocido: ${spread_value:.2f}")
+            price_fresh  = False
+            print(f"usando último valor conocido: ${spread_value:.2f} (NO se cerrará con precio viejo)")
         else:
             print(f"spread=${spread_value:.2f}")
 
@@ -1189,9 +1191,47 @@ def run_paper_monitor():
             print(f"    - {r}")
         print()
 
-        # Update DB silently
+        # ── Cierre determinista — el worker es el ÚNICO dueño de stops de paper ─
+        # Usa las mismas constantes canónicas que el monitor real (sin inventar
+        # un cuarto criterio): stop escalonado por DTE, target 70%, DTE mínimo.
+        close_reason = None
+        if price_fresh:
+            if dte is not None and dte <= MIN_DTE:
+                close_reason = "TIME_EXPIRED"
+            elif profit_pct_max >= TAKE_PROFIT_MAX_PCT:
+                close_reason = "TARGET_REACHED"
+            elif pnl_pct <= -(get_stop_loss_pct(dte) * 100):
+                close_reason = "STOP_LOSS"
+
         conn2 = psycopg2.connect(os.getenv("DATABASE_URL"))
         cur2  = conn2.cursor()
+
+        if close_reason:
+            print(f"  → AUTO-CIERRE (paper): {close_reason}")
+            cur2.execute("""
+                UPDATE paper_positions SET
+                    current_spread_value = %s, current_value = %s,
+                    gross_pnl = %s, pnl_pct = %s, profit_pct_of_max = %s,
+                    premium_received = %s, total_received = %s,
+                    status = 'CLOSED', closed_at = NOW(),
+                    close_reason = %s, last_synced_at = NOW()
+                WHERE id = %s AND UPPER(status) = 'OPEN'
+            """, (spread_value, current_value, gross_pnl, pnl_pct, profit_pct_max,
+                  spread_value, current_value, close_reason, pos["id"]))
+            conn2.commit()
+            cur2.close()
+            conn2.close()
+            # Paper normalmente es silencioso; un cierre SÍ amerita aviso.
+            send_ntfy(
+                title=f"Paper auto-cierre: {ticker} ({close_reason})",
+                message=(f"{ticker} {strategy} ${strike_low}/{strike_high}\n"
+                         f"P&L ${gross_pnl:+.2f} ({pnl_pct:+.1f}%) | DTE {dte}\n"
+                         f"Motivo: {close_reason}"),
+                priority="default",
+            )
+            continue
+
+        # Sin cierre — solo actualizar P&L (silencioso)
         cur2.execute("""
             UPDATE paper_positions SET
                 current_spread_value = %s,
@@ -1218,6 +1258,11 @@ def run_paper_monitor():
 
 def scheduled_run():
     run_monitor(ask_ai=False)
+    # El worker ahora también vigila y cierra paper intradía (stops deterministas)
+    try:
+        run_paper_monitor()
+    except Exception as e:
+        print(f"  paper monitor error: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -926,43 +926,19 @@ def cmd_paper_sync():
 
         print(f"spread=${spread_value:.2f} | P&L ${gross_pnl:+.2f} ({pnl_pct:+.1f}%)")
 
-        close_reason = None
-        if dte <= 7:
-            close_reason = "TIME_EXPIRED"
-        elif is_put:
-            if spread_value >= abs(premium) * 2:
-                close_reason = "STOP_LOSS"
-            elif profit_pct_max >= 0.70:
-                close_reason = "TARGET_REACHED"
-        else:
-            if profit_pct_max >= 0.70:
-                close_reason = "TARGET_REACHED"
-            elif pnl_pct <= -65.0:
-                close_reason = "STOP_LOSS"
-
+        # NOTA: el cierre por stop/target/DTE lo hace AHORA el worker
+        # (run_paper_monitor, intradía). Aquí solo se actualiza P&L para el
+        # reporte del auto_run — para no tener dos procesos cerrando la misma fila.
         conn = get_db_connection()
         cur  = conn.cursor()
-
-        if close_reason:
-            print(f"    → AUTO-CLOSE: {close_reason}")
-            cur.execute("""
-                UPDATE paper_positions SET
-                    current_spread_value = %s, current_value = %s,
-                    gross_pnl = %s, pnl_pct = %s, profit_pct_of_max = %s,
-                    last_synced_at = NOW(), status = 'CLOSED', closed_at = NOW(),
-                    premium_received = %s, total_received = %s, close_reason = %s
-                WHERE id = %s
-            """, (spread_value, current_value, gross_pnl, pnl_pct, profit_pct_max,
-                  spread_value, current_value, close_reason, pos["id"]))
-        else:
-            cur.execute("""
-                UPDATE paper_positions SET
-                    current_spread_value = %s, current_value = %s,
-                    gross_pnl = %s, pnl_pct = %s, profit_pct_of_max = %s,
-                    last_synced_at = NOW()
-                WHERE id = %s
-            """, (spread_value, current_value, gross_pnl, pnl_pct,
-                  profit_pct_max, pos["id"]))
+        cur.execute("""
+            UPDATE paper_positions SET
+                current_spread_value = %s, current_value = %s,
+                gross_pnl = %s, pnl_pct = %s, profit_pct_of_max = %s,
+                last_synced_at = NOW()
+            WHERE id = %s
+        """, (spread_value, current_value, gross_pnl, pnl_pct,
+              profit_pct_max, pos["id"]))
 
         conn.commit()
         cur.close()
@@ -1078,11 +1054,18 @@ def cmd_paper_close(ticker):
     is_put = strategy == "Bull Put Spread"
     opt_type = "put" if is_put else "call"
 
-    spread_value = fetch_paper_spread_value(ticker, float(sl), float(sh), exp, opt_type)
+    # Opción C: reintenta fuerte; si no consigue precio real, NO cierra.
+    # Nunca inventa $0.00 (eso falseaba el P&L — caso GS del 16-jun).
+    spread_value = fetch_paper_spread_value(ticker, float(sl), float(sh), exp, opt_type,
+                                            retries=4, delay=3)
     if spread_value is None:
-        spread_value = 0.0
-        print(f"  WARNING: no se pudo obtener precio real para {ticker} "
-              f"({opt_type}) — usando $0.00")
+        print(f"\n  ⛔ NO se cerró {ticker}: no se pudo obtener precio real del "
+              f"spread tras varios intentos.")
+        print(f"     La posición sigue ABIERTA. Reintentá con el mercado abierto, "
+              f"o cerrá con un precio conocido.\n")
+        cur.close()
+        conn.close()
+        return
 
     total_cost   = float(total_cost)
     premium      = float(premium)
