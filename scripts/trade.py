@@ -558,7 +558,12 @@ def save_trade_context(position_id=None, paper_position_id=None,
 # PAPER TRADING — spread value fetch
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def _fetch_paper_spread_value(ticker, strike_low, strike_high, expiration):
+async def _fetch_paper_spread_value(ticker, strike_low, strike_high, expiration,
+                                    option_type="call"):
+    """
+    Fetch real spread value from Tastytrade.
+    option_type: 'call' for Bull Call Spread, 'put' for Bull Put Spread
+    """
     from tastytrade import Session, DXLinkStreamer
     from tastytrade.instruments import NestedOptionChain
     from tastytrade.dxfeed import Quote
@@ -592,7 +597,14 @@ async def _fetch_paper_spread_value(ticker, strike_low, strike_high, expiration)
         if not long_obj or not short_obj:
             return None
 
-        symbols    = [long_obj.call_streamer_symbol, short_obj.call_streamer_symbol]
+        if option_type == "put":
+            long_sym  = long_obj.put_streamer_symbol
+            short_sym = short_obj.put_streamer_symbol
+        else:
+            long_sym  = long_obj.call_streamer_symbol
+            short_sym = short_obj.call_streamer_symbol
+
+        symbols    = [long_sym, short_sym]
         quotes_map = {}
 
         async with DXLinkStreamer(session) as streamer:
@@ -604,14 +616,20 @@ async def _fetch_paper_spread_value(ticker, strike_low, strike_high, expiration)
                 except asyncio.TimeoutError:
                     break
 
-        lq = quotes_map.get(long_obj.call_streamer_symbol)
-        sq = quotes_map.get(short_obj.call_streamer_symbol)
+        lq = quotes_map.get(long_sym)
+        sq = quotes_map.get(short_sym)
         if not lq or not sq:
             return None
 
         long_mid  = (float(lq.bid_price or 0) + float(lq.ask_price or 0)) / 2
         short_mid = (float(sq.bid_price or 0) + float(sq.ask_price or 0)) / 2
-        spread_val = round(long_mid - short_mid, 2)
+
+        if option_type == "put":
+            # Bull Put Spread value = short_put_mid - long_put_mid
+            spread_val = round(short_mid - long_mid, 2)
+        else:
+            spread_val = round(long_mid - short_mid, 2)
+
         return spread_val if spread_val > 0 else 0.0
 
     except Exception as e:
@@ -619,9 +637,11 @@ async def _fetch_paper_spread_value(ticker, strike_low, strike_high, expiration)
         return None
 
 
-def fetch_paper_spread_value(ticker, strike_low, strike_high, expiration):
+def fetch_paper_spread_value(ticker, strike_low, strike_high, expiration,
+                              option_type="call"):
     try:
-        return asyncio.run(_fetch_paper_spread_value(ticker, strike_low, strike_high, expiration))
+        return asyncio.run(_fetch_paper_spread_value(ticker, strike_low, strike_high,
+                                                      expiration, option_type))
     except Exception:
         return None
 
@@ -858,7 +878,9 @@ def cmd_paper_sync():
 
         print(f"  {ticker} ${strike_low}/{strike_high} (DTE: {dte})...", end=" ", flush=True)
 
-        spread_value = fetch_paper_spread_value(ticker, strike_low, strike_high, expiration)
+        opt_type = "put" if is_put else "call"
+        spread_value = fetch_paper_spread_value(ticker, strike_low, strike_high,
+                                                 expiration, opt_type)
 
         if spread_value is None:
             print("no data")
@@ -1017,7 +1039,7 @@ def cmd_paper_close(ticker):
     conn = get_db_connection()
     cur  = conn.cursor()
     cur.execute("""
-        SELECT id, ticker, strike_low, strike_high, expiration,
+        SELECT id, ticker, strategy, strike_low, strike_high, expiration,
                total_cost, premium_paid, contracts
         FROM paper_positions
         WHERE UPPER(status) = 'OPEN' AND ticker = %s
@@ -1031,18 +1053,35 @@ def cmd_paper_close(ticker):
         conn.close()
         return
 
-    pos_id, ticker, sl, sh, exp, total_cost, premium, contracts = row
-    spread_value = fetch_paper_spread_value(ticker, float(sl), float(sh), exp)
+    pos_id, ticker, strategy, sl, sh, exp, total_cost, premium, contracts = row
+    is_put = strategy == "Bull Put Spread"
+    opt_type = "put" if is_put else "call"
+
+    spread_value = fetch_paper_spread_value(ticker, float(sl), float(sh), exp, opt_type)
     if spread_value is None:
         spread_value = 0.0
+        print(f"  WARNING: no se pudo obtener precio real para {ticker} "
+              f"({opt_type}) — usando $0.00")
 
-    total_cost     = float(total_cost)
-    current_value  = round(spread_value * int(contracts) * 100, 2)
-    gross_pnl      = round(current_value - total_cost, 2)
-    pnl_pct        = round(gross_pnl / total_cost * 100, 2) if total_cost else 0
-    spread_width   = float(sh) - float(sl)
-    max_profit     = round((spread_width - float(premium)) * int(contracts) * 100, 2)
-    profit_pct_max = round(gross_pnl / max_profit, 4) if max_profit else 0
+    total_cost   = float(total_cost)
+    premium      = float(premium)
+    contracts    = int(contracts)
+    spread_width = float(sh) - float(sl)
+
+    if is_put:
+        net_credit     = abs(premium)
+        max_profit     = round(net_credit * contracts * 100, 2)
+        cost_to_close  = round(spread_value * contracts * 100, 2)
+        current_value  = cost_to_close
+        gross_pnl      = round(max_profit - cost_to_close, 2)
+        pnl_pct        = round(gross_pnl / max_profit * 100, 2) if max_profit else 0
+        profit_pct_max = round(gross_pnl / max_profit, 4) if max_profit else 0
+    else:
+        max_profit     = round((spread_width - premium) * contracts * 100, 2)
+        current_value  = round(spread_value * contracts * 100, 2)
+        gross_pnl      = round(current_value - total_cost, 2)
+        pnl_pct        = round(gross_pnl / total_cost * 100, 2) if total_cost else 0
+        profit_pct_max = round(gross_pnl / max_profit, 4) if max_profit else 0
 
     cur.execute("""
         UPDATE paper_positions SET
@@ -1061,7 +1100,8 @@ def cmd_paper_close(ticker):
 
     sign = "✅" if gross_pnl >= 0 else "❌"
     print(f"\n  {sign} Paper position closed:")
-    print(f"     {ticker} ${sl}/{sh} | P&L ${gross_pnl:+.2f} ({pnl_pct:+.1f}%)\n")
+    print(f"     {ticker} ({strategy}) ${sl}/{sh} | "
+          f"spread=${spread_value:.2f} | P&L ${gross_pnl:+.2f} ({pnl_pct:+.1f}%)\n")
 
 
 # ══════════════════════════════════════════════════════════════════════════════

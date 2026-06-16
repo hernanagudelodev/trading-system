@@ -49,7 +49,14 @@ PUT_LONG_DELTA_RANGE  = (0.10, 0.25)   # buy this put (lower strike)
 
 MAX_LONG_CALLS = 4
 MAX_SPREADS    = 4
-MAX_COST       = 300   # flagged if exceeded (for debit strategies)
+
+# ── Gates de riesgo / calidad — RECHAZAN, no solo advierten ───────────────────
+# Pérdida máxima por trade ≤ X% del capital. Atado a env var para escalar solo.
+CAPITAL          = float(os.getenv("ACCOUNT_NLV", "14100"))   # net liquidating value
+MAX_RISK_PCT     = 0.03                       # 3% del capital
+MAX_RISK_DOLLARS = CAPITAL * MAX_RISK_PCT     # ~$423 con $14,100
+MIN_RR_DEBIT     = 1.0                         # Bull Call Spread / Long Call: R/R mínimo
+MIN_POP_CREDIT   = 60                          # Bull Put Spread: POP mínimo (%)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -203,6 +210,11 @@ def _build_long_calls(strike_table, price):
         breakeven     = round(s["strike"] + mid, 2)
         breakeven_pct = round((breakeven - price) / price * 100, 2)
         premium_total = round(mid * 100, 0)
+
+        # Gate de riesgo: la prima ES la pérdida máxima de un Long Call
+        if premium_total > MAX_RISK_DOLLARS:
+            continue
+
         profit_50     = round(mid * 0.50 * 100, 0)
         profit_70     = round(mid * 0.70 * 100, 0)
         ideal         = DELTA_IDEAL_LOW <= delta <= DELTA_IDEAL_HIGH
@@ -223,7 +235,7 @@ def _build_long_calls(strike_table, price):
             "profit_70":     profit_70,
             "ideal_delta":   ideal,
             "itm":           s["strike"] < price,
-            "within_budget": premium_total <= MAX_COST,
+            "within_budget": True,
         })
 
     results.sort(key=lambda x: (not x["ideal_delta"], x["breakeven_pct"]))
@@ -259,6 +271,12 @@ def _build_call_spreads(strike_table, price):
             breakeven_pct = round((breakeven - price) / price * 100, 2)
             rr            = round(max_profit / max_loss, 2) if max_loss > 0 else 0
 
+            # Gates: riesgo ≤ tope y R/R mínimo (débito)
+            if max_loss > MAX_RISK_DOLLARS:
+                continue
+            if rr < MIN_RR_DEBIT:
+                continue
+
             spreads.append({
                 "long_strike":   long_leg["strike"],
                 "short_strike":  short_leg["strike"],
@@ -273,7 +291,7 @@ def _build_call_spreads(strike_table, price):
                 "risk_reward":   rr,
                 "profit_50":     round(max_profit * 0.50, 0),
                 "profit_70":     round(max_profit * 0.70, 0),
-                "within_budget": max_loss <= MAX_COST,
+                "within_budget": True,
             })
 
     spreads.sort(key=lambda x: (not x["within_budget"], -x["risk_reward"]))
@@ -337,6 +355,12 @@ def _build_put_spreads(strike_table, price):
             rr          = round(max_profit / max_loss, 2) if max_loss > 0 else 0
             # Probability of profit ≈ 1 - abs(short delta)
             pop_approx  = round((1 - abs(short_leg["delta"])) * 100, 0)
+
+            # Gates: riesgo ≤ tope y POP mínimo (crédito)
+            if max_loss > MAX_RISK_DOLLARS:
+                continue
+            if pop_approx < MIN_POP_CREDIT:
+                continue
 
             put_spreads.append({
                 "short_strike":   short_leg["strike"],   # sell this (higher)
@@ -421,7 +445,7 @@ def _build_markdown(tickers_data, options_results):
         lines.append("")
 
         if not long_calls and not spreads and not put_spreads:
-            lines.append("_No hay estructuras viables en rango DTE 20-40 / Delta._")
+            lines.append("_No hay estructuras viables (DTE 20-40 / Delta / riesgo ≤3% / R-R / POP)._")
             lines.append("")
             continue
 

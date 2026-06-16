@@ -286,8 +286,8 @@ Empieza tu respuesta directamente con el carácter {{
 Reglas:
 - debit positivo = Bull Call Spread (pagas), negativo = Bull Put Spread (cobras crédito)
 - Solo recomendar trades con señal clara y contexto favorable
-- Si hay evento macro HIGH/VERY_HIGH en menos de 2 días, ser muy conservador
-- No abrir trades en sectores con earnings de riesgo en menos de 7 días
+- Si hay evento macro VERY_HIGH en 2 días o menos, NO abrir ninguna posición nueva (regla dura: el sistema descarta cualquier apertura igual). Los cierres sí están permitidos.
+- No abrir trades con earnings del subyacente en menos de 21 días (riesgo de IV crush)
 - Máximo {MAX_NEW_TRADES_PER_RUN} trades nuevos por run
 - Si no hay nada convincente, devolver new_trades vacío y explicar en no_trade_reason
 
@@ -815,6 +815,62 @@ def is_market_day():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# DATA QUALITY GUARD
+# ══════════════════════════════════════════════════════════════════════════════
+
+def assess_data_quality(market_ctx, scanner_report):
+    """
+    Detecta degradación silenciosa ANTES de llamar a la IA.
+    Devuelve (ok: bool, level: str, reason: str).
+      level = 'abort' (feed roto, no operar) | 'warn' (raro pero válido) | 'ok'
+
+    Casos 'abort':
+      - market_context devolvió None (macro no disponible)
+      - scanner devolvió None/vacío
+      - >80% de los candidatos tienen IV N/A (feed Tastytrade caído)
+    """
+    import re
+
+    if market_ctx is None:
+        return False, "abort", "market_context devolvió None — macro no disponible"
+
+    if not scanner_report or not scanner_report.strip():
+        return False, "abort", "scanner devolvió None/vacío"
+
+    iv_vals = re.findall(r"\|\s*IV\s+(N/A|[0-9.]+%)", scanner_report)
+    total   = len(iv_vals)
+    iv_na   = sum(1 for v in iv_vals if v == "N/A")
+
+    if total == 0:
+        return True, "warn", "0 candidatos pasaron filtros (posible mercado débil)"
+
+    na_frac = iv_na / total
+    if total >= 5 and na_frac > 0.8:
+        return False, "abort", (
+            f"IV N/A en {iv_na}/{total} candidatos ({na_frac:.0%}) — "
+            f"feed Tastytrade caído, NO es condición de mercado"
+        )
+
+    return True, "ok", f"datos OK ({iv_na}/{total} con IV N/A)"
+
+
+def event_block_active(market_ctx, max_days=2):
+    """
+    Compuerta dura de evento macro.
+    Devuelve (blocked: bool, event: dict|None).
+    Bloquea aperturas si hay un evento VERY_HIGH a <= max_days días.
+    HIGH/MEDIUM NO bloquean (decisión: solo VERY_HIGH).
+    """
+    if not market_ctx:
+        return False, None
+    for e in market_ctx.get("macro_events", []):
+        days = e.get("days_away")
+        if e.get("impact") == "VERY_HIGH" and days is not None and days <= max_days:
+            return True, e
+    return False, None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -840,6 +896,39 @@ def main():
         print("\n  [2/6] Running scanner --universe...")
         scanner_report = run_scanner()
 
+        # ── GUARDA DE CALIDAD DE DATOS ──────────────────────────────────────
+        # Aborta ANTES de la IA si la macro/scanner fallaron o si la IV viene
+        # N/A en casi todo el universo (feed Tastytrade caído). Convierte un
+        # fallo silencioso ("no trades") en un fallo ruidoso (push urgent).
+        ok, level, reason = assess_data_quality(market_ctx, scanner_report)
+        print(f"\n  [guard] {level.upper()}: {reason}")
+
+        if not ok:  # level == 'abort'
+            run_time = time.time() - start_time
+            send_ntfy(
+                title="🚨 Auto-run ABORTADO — datos inválidos",
+                message=(
+                    f"Run {timestamp} abortado ANTES de la IA.\n"
+                    f"{reason}\n"
+                    f"No se llamó a Claude ni se tocó ninguna posición.\n"
+                    f"Revisar Tastytrade/credenciales en Railway."
+                ),
+                priority="urgent",
+            )
+            save_log(
+                market_ctx, None,
+                {"opened": [], "closed": [], "errors": [f"ABORT: {reason}"]},
+                run_time, slot=os.getenv("AUTO_RUN_SLOT", "manual"),
+            )
+            return
+
+        if level == "warn":
+            send_ntfy(
+                title="⚠️ Auto-run — datos sospechosos",
+                message=f"Run {timestamp}: {reason}\nContinúa, pero revisá.",
+                priority="high",
+            )
+
         # Step 3 — Paper sync (auto-closes stop loss / target)
         print("\n  [3/6] Running paper_sync...")
         run_paper_sync()
@@ -853,6 +942,28 @@ def main():
         # Step 5 — Claude analysis
         print("\n  [5/6] Calling Anthropic API...")
         analysis = run_claude_analysis(market_ctx, scanner_report, db_state)
+
+        # ── COMPUERTA DE EVENTO MACRO (determinista, por encima del LLM) ────
+        # Si hay un evento VERY_HIGH a ≤2 días, se descartan TODAS las aperturas
+        # propuestas por el LLM. Los cierres se respetan (salir siempre permitido).
+        blocked, ev = event_block_active(market_ctx, max_days=2)
+        if blocked and analysis and analysis.get("new_trades"):
+            dropped = len(analysis["new_trades"])
+            analysis["new_trades"] = []
+            print(f"\n  [event-gate] BLOQUEADO: {ev['event']} VERY_HIGH en "
+                  f"{ev['days_away']}d → {dropped} apertura(s) descartada(s)")
+            send_ntfy(
+                title="🚫 Aperturas bloqueadas — evento VERY_HIGH",
+                message=(
+                    f"{ev['event']} en {ev['days_away']}d (VERY_HIGH).\n"
+                    f"El LLM propuso {dropped} apertura(s); la compuerta las descartó.\n"
+                    f"Los cierres no se ven afectados."
+                ),
+                priority="high",
+            )
+        elif blocked:
+            print(f"\n  [event-gate] {ev['event']} VERY_HIGH en {ev['days_away']}d "
+                  f"— sin aperturas propuestas, nada que descartar")
 
         # Step 6 — Execute recommendations
         print("\n  [6/6] Executing recommendations...")
