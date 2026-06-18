@@ -60,6 +60,51 @@ MIN_POP_CREDIT   = 60                          # Bull Put Spread: POP mínimo (%
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# EXPIRACIÓN REAL — fuente única de verdad para la fecha (el LLM NO la elige)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_real_expiration(ticker):
+    """
+    Devuelve la fecha de expiración REAL de la cadena: la misma regla que usa
+    el spread builder (más cercana a 30 DTE dentro de 20-40). Crea sesión fresca.
+    Devuelve un datetime.date, o None si no se pudo obtener.
+    """
+    try:
+        return asyncio.run(_get_real_expiration_async(ticker))
+    except Exception as e:
+        print(f"  get_real_expiration error for {ticker}: {e}")
+        return None
+
+
+async def _get_real_expiration_async(ticker):
+    from tastytrade import Session
+    from tastytrade.instruments import NestedOptionChain
+
+    client_secret = os.getenv("TASTYTRADE_CLIENT_SECRET")
+    refresh_token = os.getenv("TASTYTRADE_REFRESH_TOKEN")
+    if not client_secret or not refresh_token:
+        return None
+
+    session = Session(client_secret, refresh_token)
+    chains  = await NestedOptionChain.get(session, ticker)
+    if not chains:
+        return None
+    chain = chains[0]
+
+    target_exp = None
+    best_diff  = 9999
+    for exp in chain.expirations:
+        dte = exp.days_to_expiration
+        if DTE_MIN <= dte <= DTE_MAX:
+            diff = abs(dte - 30)
+            if diff < best_diff:
+                best_diff  = diff
+                target_exp = exp
+
+    return target_exp.expiration_date if target_exp else None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # ASYNC CORE — fetch option chain + Greeks for one ticker
 # ══════════════════════════════════════════════════════════════════════════════
 

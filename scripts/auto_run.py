@@ -290,6 +290,7 @@ Reglas:
 - No abrir trades con earnings del subyacente en menos de 21 días (riesgo de IV crush)
 - Máximo {MAX_NEW_TRADES_PER_RUN} trades nuevos por run
 - Si no hay nada convincente, devolver new_trades vacío y explicar en no_trade_reason
+- NO incluyas fecha de expiración: el sistema la fija automáticamente desde la cadena real (no la calcules tú)
 
 Responde SOLO con este JSON (sin texto adicional, sin markdown):
 {{
@@ -300,7 +301,6 @@ Responde SOLO con este JSON (sin texto adicional, sin markdown):
       "strategy": "Bull Call Spread",
       "strike_low": 94.0,
       "strike_high": 101.0,
-      "expiration": "2026-07-10",
       "debit": 2.62,
       "rationale": "Párrafo explicando por qué este trade"
     }}
@@ -422,9 +422,20 @@ def execute_recommendations(analysis):
         ticker     = trade_rec.get("ticker", "").upper()
         strike_low = trade_rec.get("strike_low")
         strike_high = trade_rec.get("strike_high")
-        expiration  = trade_rec.get("expiration")
         debit       = trade_rec.get("debit")
         rationale   = trade_rec.get("rationale", "")
+
+        # B: la fecha de expiración NO la elige el LLM (inventa sábados).
+        # Se toma la expiración REAL de la cadena — misma regla que option_selector.
+        import option_selector
+        real_exp = option_selector.get_real_expiration(ticker)
+        if real_exp is None:
+            print(f"  ⚠️  {ticker}: no se pudo obtener expiración real de la cadena — se omite")
+            continue
+        expiration = real_exp.isoformat()
+        if trade_rec.get("expiration") and trade_rec["expiration"] != expiration:
+            print(f"  [exp-fix] {ticker}: LLM dijo {trade_rec['expiration']}, "
+                  f"se usa la real {expiration}")
 
         if not all([ticker, strike_low, strike_high, expiration, debit is not None]):
             print(f"  Skipping incomplete trade rec: {trade_rec}")
