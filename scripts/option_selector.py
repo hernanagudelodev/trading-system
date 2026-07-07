@@ -57,6 +57,8 @@ MAX_RISK_PCT     = 0.03                       # 3% del capital
 MAX_RISK_DOLLARS = CAPITAL * MAX_RISK_PCT     # ~$423 con $14,100
 MIN_RR_DEBIT     = 1.0                         # Bull Call Spread / Long Call: R/R mínimo
 MIN_POP_CREDIT   = 60                          # Bull Put Spread: POP mínimo (%)
+MIN_SPREAD_WIDTH = 3                           # ancho mínimo ($): evita spreads de $1-2
+                                               # donde el stop de -65% salta a -130% entre chequeos
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -303,7 +305,7 @@ def _build_call_spreads(strike_table, price):
             if short_leg["strike"] <= long_leg["strike"]:
                 continue
             spread_width = short_leg["strike"] - long_leg["strike"]
-            if spread_width < 1 or spread_width > price * 0.15:
+            if spread_width < MIN_SPREAD_WIDTH or spread_width > price * 0.15:
                 continue
 
             net_debit = round(long_leg["mid"] - short_leg["mid"], 2)
@@ -382,7 +384,7 @@ def _build_put_spreads(strike_table, price):
                 continue
 
             spread_width = short_leg["strike"] - long_leg["strike"]
-            if spread_width < 1 or spread_width > price * 0.12:
+            if spread_width < MIN_SPREAD_WIDTH or spread_width > price * 0.12:
                 continue
 
             # Net credit = what we receive for selling short - what we pay for long

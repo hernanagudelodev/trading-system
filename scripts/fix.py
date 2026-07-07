@@ -1,60 +1,60 @@
 """
-fix_weekend_expirations.py
-==========================
-Corrige las expiraciones guardadas en fin de semana (bug del LLM que elegía
-sábados). Sábado -> viernes anterior, domingo -> viernes anterior.
-Las opciones vencen viernes; el viernes anterior es la expiración real.
-
-Uso:
-    python fix_weekend_expirations.py            # dry-run
-    python fix_weekend_expirations.py --commit   # aplica
+check_hood.py — reconstruye qué pasó con HOOD el 6-jul (apertura -> stop en 90 min).
+Solo lectura.
 """
 import os
-import sys
-from datetime import timedelta
 import psycopg2
 from dotenv import load_dotenv
 
 load_dotenv()
-COMMIT = "--commit" in sys.argv
-
 conn = psycopg2.connect(os.getenv("DATABASE_URL"))
 cur  = conn.cursor()
+
+# Posición HOOD (stop del 6-jul)
 cur.execute("""
-    SELECT id, ticker, expiration
+    SELECT id, ticker, strike_low, strike_high, premium_paid,
+           current_spread_value, gross_pnl, pnl_pct,
+           opened_at, closed_at, last_synced_at
     FROM paper_positions
-    WHERE UPPER(status) = 'OPEN'
-    ORDER BY id
+    WHERE ticker='HOOD' AND close_reason='STOP_LOSS'
+    ORDER BY closed_at DESC LIMIT 1
 """)
-rows = cur.fetchall()
+row = cur.fetchone()
+if not row:
+    print("\n  No se encontró el stop de HOOD.\n"); cur.close(); conn.close(); raise SystemExit
 
-fixes = []
-for pid, ticker, exp in rows:
-    wd = exp.weekday()           # 5 = sábado, 6 = domingo
-    if wd == 5:
-        new_exp = exp - timedelta(days=1)
-    elif wd == 6:
-        new_exp = exp - timedelta(days=2)
-    else:
-        continue                 # ya es día hábil, no se toca
-    fixes.append((pid, ticker, exp, new_exp))
+cols = [d[0] for d in cur.description]
+rec  = dict(zip(cols, row))
+print("\n  === POSICIÓN HOOD ===")
+for k in cols:
+    print(f"    {k:22}: {rec[k]}")
 
-if not fixes:
-    print("\n  No hay expiraciones de fin de semana. Nada que corregir.\n")
-    cur.close(); conn.close(); sys.exit(0)
+dur = None
+if rec["opened_at"] and rec["closed_at"]:
+    dur = (rec["closed_at"] - rec["opened_at"])
+    print(f"\n    duración abierta      : {dur}")
 
-print(f"\n  Se corregirán {len(fixes)} expiraciones:")
-for pid, ticker, old, new in fixes:
-    print(f"    id {pid:<4} {ticker:<6} {old} ({old.strftime('%A')}) -> "
-          f"{new} ({new.strftime('%A')})")
+credito = abs(float(rec["premium_paid"]))
+cierre  = float(rec["current_spread_value"] or 0)
+ancho   = float(rec["strike_high"]) - float(rec["strike_low"])
+print(f"    crédito entrada       : ${credito:.2f}")
+print(f"    spread al cerrar      : ${cierre:.2f}")
+print(f"    ancho                 : ${ancho:.2f}")
+print(f"    → el spread pasó de ${credito:.2f} a ${cierre:.2f} "
+      f"({(cierre/credito-1)*100:+.0f}%)")
 
-if not COMMIT:
-    print("\n  DRY-RUN — no se escribió nada. Corré con --commit para aplicar.\n")
-    cur.close(); conn.close(); sys.exit(0)
+# Contexto de entrada (si existe)
+cur.execute("""
+    SELECT * FROM trade_context WHERE paper_position_id = %s
+""", (rec["id"],))
+ctx = cur.fetchone()
+if ctx:
+    ccols = [d[0] for d in cur.description]
+    print("\n  === CONTEXTO DE ENTRADA (trade_context) ===")
+    for k, v in zip(ccols, ctx):
+        print(f"    {k:22}: {v}")
+else:
+    print("\n  Sin trade_context para esta posición.")
 
-for pid, ticker, old, new in fixes:
-    cur.execute("UPDATE paper_positions SET expiration = %s WHERE id = %s", (new, pid))
-conn.commit()
-print(f"\n  ✅ {len(fixes)} expiraciones corregidas a viernes.\n")
-cur.close()
-conn.close()
+print()
+cur.close(); conn.close()
