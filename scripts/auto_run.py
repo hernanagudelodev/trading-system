@@ -414,12 +414,32 @@ def execute_recommendations(analysis):
     new_trades = analysis.get("new_trades", [])
     opened_count = 0
 
+    # Bloqueo de concentración: no abrir un ticker que ya está OPEN, ni
+    # dos veces el mismo ticker dentro de este mismo run.
+    open_tickers = set()
+    try:
+        import psycopg2
+        _c = psycopg2.connect(os.getenv("DATABASE_URL"))
+        _cur = _c.cursor()
+        _cur.execute("SELECT DISTINCT UPPER(ticker) FROM paper_positions WHERE UPPER(status)='OPEN'")
+        open_tickers = {r[0] for r in _cur.fetchall()}
+        _cur.close(); _c.close()
+    except Exception as e:
+        print(f"  ⚠️  no se pudo leer tickers abiertos ({e}) — se sigue sin bloqueo de concentración")
+    opened_this_run = set()
+
     for trade_rec in new_trades:
         if opened_count >= MAX_NEW_TRADES_PER_RUN:
             print(f"  Max trades per run reached ({MAX_NEW_TRADES_PER_RUN})")
             break
 
         ticker     = trade_rec.get("ticker", "").upper()
+
+        # Bloqueo de mismo ticker (cartera + este run)
+        if ticker in open_tickers or ticker in opened_this_run:
+            print(f"  [concentración] {ticker} ya tiene posición abierta — se omite (no apilar mismo nombre)")
+            continue
+
         strike_low = trade_rec.get("strike_low")
         strike_high = trade_rec.get("strike_high")
         debit       = trade_rec.get("debit")
@@ -459,6 +479,7 @@ def execute_recommendations(analysis):
                 "debit":     debit,
             })
             opened_count += 1
+            opened_this_run.add(ticker)
         except Exception as e:
             print(f"  Error opening {ticker}: {e}")
             results["errors"].append(f"Open {ticker}: {e}")
