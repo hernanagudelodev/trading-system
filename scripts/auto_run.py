@@ -393,7 +393,10 @@ def execute_recommendations(analysis):
 
     results = {"opened": [], "closed": [], "errors": []}
 
-    import trade as trade_module
+    # El executor se elige UNA vez (paper/live según TRADING_MODE). auto_run
+    # emite intenciones y no vuelve a preguntar el modo.
+    from executor import get_executor, OpenIntent
+    executor = get_executor()
 
     # Close positions Claude recommends closing
     for close_rec in analysis.get("close_positions", []):
@@ -401,11 +404,19 @@ def execute_recommendations(analysis):
         reason = close_rec.get("reason", "AUTO_CLOSE_AI")
         print(f"\n  Closing {ticker}: {reason}")
         try:
-            trade_module.cmd_paper_close(ticker)
-            results["closed"].append({
-                "ticker": ticker,
-                "reason": reason
-            })
+            # close_position devuelve True solo si el cierre se ejecutó.
+            # Si no consiguió precio real, se niega y devuelve False:
+            # NO reportarlo como cerrado (antes el log/push mentía — caso DAL).
+            ok = executor.close_position(ticker, reason)
+            if ok:
+                results["closed"].append({
+                    "ticker": ticker,
+                    "reason": reason
+                })
+            else:
+                msg = f"{ticker}: cierre NO ejecutado (sin precio real) — sigue ABIERTA"
+                print(f"  ⚠️  {msg}")
+                results["errors"].append(f"Close {msg}")
         except Exception as e:
             print(f"  Error closing {ticker}: {e}")
             results["errors"].append(f"Close {ticker}: {e}")
@@ -463,23 +474,29 @@ def execute_recommendations(analysis):
 
         print(f"\n  Opening {ticker} ${strike_low}/{strike_high} debit={debit}")
         try:
-            trade_module.cmd_paper_buy(
+            intent = OpenIntent(
                 ticker=ticker,
                 strike_low=float(strike_low),
                 strike_high=float(strike_high),
-                expiration_str=expiration,
+                expiration=expiration,
                 debit=float(debit),
                 rationale=rationale,
                 context_json=None,  # auto-read from reports
             )
-            results["opened"].append({
-                "ticker":    ticker,
-                "strategy":  "Bull Put Spread" if debit < 0 else "Bull Call Spread",
-                "strikes":   f"${strike_low}/{strike_high}",
-                "debit":     debit,
-            })
-            opened_count += 1
-            opened_this_run.add(ticker)
+            ok = executor.open_position(intent)
+            if ok:
+                results["opened"].append({
+                    "ticker":    ticker,
+                    "strategy":  "Bull Put Spread" if debit < 0 else "Bull Call Spread",
+                    "strikes":   f"${strike_low}/{strike_high}",
+                    "debit":     debit,
+                })
+                opened_count += 1
+                opened_this_run.add(ticker)
+            else:
+                msg = f"{ticker}: apertura NO ejecutada"
+                print(f"  ⚠️  {msg}")
+                results["errors"].append(f"Open {msg}")
         except Exception as e:
             print(f"  Error opening {ticker}: {e}")
             results["errors"].append(f"Open {ticker}: {e}")

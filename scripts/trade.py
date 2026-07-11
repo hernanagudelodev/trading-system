@@ -638,7 +638,11 @@ async def _fetch_paper_spread_value(ticker, strike_low, strike_high, expiration,
         else:
             spread_val = round(long_mid - short_mid, 2)
 
-        return spread_val if spread_val > 0 else 0.0
+        # Un spread con 20-40 DTE nunca vale $0.00. Si el cálculo da <= 0 es
+        # porque no hubo quotes reales (bid=ask=0) o los mids vinieron mal.
+        # Devolver None => "sin dato", NO "vale cero" (esto causaba cierres
+        # fantasma con ganancia máxima falsa — caso CDW/GS).
+        return spread_val if spread_val > 0 else None
 
     except Exception as e:
         print(f"  spread fetch error ({ticker}): {e}")
@@ -658,7 +662,9 @@ def fetch_paper_spread_value(ticker, strike_low, strike_high, expiration,
         try:
             val = asyncio.run(_fetch_paper_spread_value(
                 ticker, strike_low, strike_high, expiration, option_type))
-            if val is not None:
+            # Solo un precio estrictamente positivo cuenta como éxito.
+            # 0.0 o None => sin dato => reintentar.
+            if val is not None and val > 0:
                 return val
         except Exception:
             pass
@@ -1048,7 +1054,7 @@ def cmd_paper_close(ticker):
         print(f"\n  No open paper position found for {ticker}\n")
         cur.close()
         conn.close()
-        return
+        return False
 
     pos_id, ticker, strategy, sl, sh, exp, total_cost, premium, contracts = row
     is_put = strategy == "Bull Put Spread"
@@ -1065,7 +1071,7 @@ def cmd_paper_close(ticker):
               f"o cerrá con un precio conocido.\n")
         cur.close()
         conn.close()
-        return
+        return False
 
     total_cost   = float(total_cost)
     premium      = float(premium)
@@ -1106,6 +1112,7 @@ def cmd_paper_close(ticker):
     print(f"\n  {sign} Paper position closed:")
     print(f"     {ticker} ({strategy}) ${sl}/{sh} | "
           f"spread=${spread_value:.2f} | P&L ${gross_pnl:+.2f} ({pnl_pct:+.1f}%)\n")
+    return True
 
 
 # ══════════════════════════════════════════════════════════════════════════════
