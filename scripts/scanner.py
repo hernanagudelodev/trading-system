@@ -27,8 +27,7 @@ from tastytrade import Session
 
 from criteria import get_all_criteria, passes_hard_filters
 from option_selector import get_options_for_tickers
-from db import save_analysis, get_open_positions
-from scoring import score_criteria
+from db import get_open_positions
 
 load_dotenv()
 sys.stdout.reconfigure(encoding="utf-8")
@@ -559,13 +558,6 @@ def scan_tickers(tickers, tt_session, market_ctx):
             else:
                 eliminated[ticker] = reasons
                 print(f"OK ${criteria['price']:.2f} ✗ {reasons[0]}")
-
-            try:
-                scored = score_criteria(criteria)
-                if scored:
-                    save_analysis(scored)
-            except Exception:
-                pass
 
         except Exception as e:
             print(f"ERROR {e}")

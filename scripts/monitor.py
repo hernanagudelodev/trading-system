@@ -24,7 +24,6 @@ Usage:
 
 Dependencies:
     criteria.py  → current market data
-    scoring.py   → current score
     db.py        → positions
     .env         → DATABASE_URL, NTFY_TOPIC
 """
@@ -42,8 +41,7 @@ import anthropic
 from dotenv import load_dotenv
 
 from criteria import get_all_criteria
-from scoring import score_criteria
-from db import get_open_positions, save_analysis
+from db import get_open_positions
 
 load_dotenv()
 
@@ -227,134 +225,16 @@ def get_live_option_price(ticker, strike, expiration, option_type="call"):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SPREAD VALUE — live from Tastytrade (real market price, includes time value)
+# SPREAD VALUE — delega en pricing.py (fuente única)
 # ══════════════════════════════════════════════════════════════════════════════
-
-def _get_tt_session_monitor():
-    """Create a Tastytrade session for the monitor."""
-    client_secret = os.getenv("TASTYTRADE_CLIENT_SECRET")
-    refresh_token = os.getenv("TASTYTRADE_REFRESH_TOKEN")
-    if not client_secret or not refresh_token:
-        return None
-    try:
-        from tastytrade import Session as TTSession
-        return TTSession(client_secret, refresh_token)
-    except Exception:
-        return None
-
-
-async def _fetch_spread_value_async(ticker, strike_low, strike_high, expiration,
-                                    option_type="call", session=None):
-    """
-    Fetch real market value of a spread from Tastytrade.
-    option_type: 'call' for Bull Call Spread, 'put' for Bull Put Spread
-    session: pass existing session to avoid re-authenticating on every call.
-    Returns net spread value per share, or None on failure.
-    """
-    from tastytrade.instruments import NestedOptionChain
-    from tastytrade.dxfeed import Quote
-    from tastytrade import DXLinkStreamer
-
-    if session is None:
-        session = _get_tt_session_monitor()
-    else:
-        # Always create a fresh session to avoid stale connections
-        session = _get_tt_session_monitor()
-    if session is None:
-        return None
-
-    try:
-        chains = await NestedOptionChain.get(session, ticker)
-        if not chains:
-            return None
-        chain = chains[0]
-
-        target_exp = None
-        for exp in chain.expirations:
-            if exp.expiration_date == expiration:
-                target_exp = exp
-                break
-        if target_exp is None:
-            return None
-
-        long_strike_obj  = None
-        short_strike_obj = None
-        for s in target_exp.strikes:
-            sp = float(s.strike_price)
-            if abs(sp - strike_low) < 0.01:
-                long_strike_obj = s
-            elif abs(sp - strike_high) < 0.01:
-                short_strike_obj = s
-
-        if long_strike_obj is None or short_strike_obj is None:
-            return None
-
-        # Use put or call streamer symbol based on strategy
-        if option_type == "put":
-            long_sym  = long_strike_obj.put_streamer_symbol
-            short_sym = short_strike_obj.put_streamer_symbol
-        else:
-            long_sym  = long_strike_obj.call_streamer_symbol
-            short_sym = short_strike_obj.call_streamer_symbol
-
-        symbols    = [long_sym, short_sym]
-        quotes_map = {}
-
-        async with DXLinkStreamer(session) as streamer:
-            await streamer.subscribe(Quote, symbols)
-            for _ in symbols:
-                try:
-                    q = await asyncio.wait_for(streamer.get_event(Quote), timeout=10)
-                    quotes_map[q.event_symbol] = q
-                except asyncio.TimeoutError:
-                    break
-
-        long_q  = quotes_map.get(long_sym)
-        short_q = quotes_map.get(short_sym)
-        if long_q is None or short_q is None:
-            return None
-
-        long_bid  = float(long_q.bid_price)  if long_q.bid_price  else 0.0
-        long_ask  = float(long_q.ask_price)  if long_q.ask_price  else 0.0
-        short_bid = float(short_q.bid_price) if short_q.bid_price else 0.0
-        short_ask = float(short_q.ask_price) if short_q.ask_price else 0.0
-
-        long_mid  = (long_bid + long_ask) / 2   if (long_bid and long_ask)   else 0.0
-        short_mid = (short_bid + short_ask) / 2 if (short_bid and short_ask) else 0.0
-
-        if option_type == "put":
-            # Bull Put Spread value = short_put_mid - long_put_mid
-            spread_value = round(short_mid - long_mid, 2)
-        else:
-            spread_value = round(long_mid - short_mid, 2)
-
-        return spread_value if spread_value > 0 else None
-
-    except Exception as e:
-        print(f"  spread value fetch error for {ticker}: {e}")
-        return None
-
 
 def get_spread_value_tastytrade(ticker, strike_low, strike_high, expiration,
                                 option_type="call", session=None):
-    """
-    Synchronous wrapper. Creates a fresh event loop for each call to avoid
-    'Event loop is closed' errors when called multiple times in sequence.
-    Session parameter kept for API compatibility but not used across calls.
-    """
-    try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            return loop.run_until_complete(
-                _fetch_spread_value_async(ticker, strike_low, strike_high,
-                                          expiration, option_type, None)
-            )
-        finally:
-            loop.close()
-            asyncio.set_event_loop(None)
-    except Exception:
-        return None
+    """Delegado a pricing.get_spread_value — fuente única de pricing de spreads.
+    El parámetro 'session' se ignora (compatibilidad de firma)."""
+    import pricing
+    return pricing.get_spread_value(ticker, strike_low, strike_high, expiration,
+                                    option_type=option_type)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -684,7 +564,7 @@ def send_alert_notification(position, pnl_data, alert_level, reasons):
 # CONSOLE REPORT
 # ══════════════════════════════════════════════════════════════════════════════
 
-def print_position_report(position, pnl_data, alert_level, reasons, scored=None):
+def print_position_report(position, pnl_data, alert_level, reasons):
     icon     = level_icon(alert_level)
     ticker   = position["ticker"]
     strategy = position.get("strategy", "")
@@ -702,10 +582,6 @@ def print_position_report(position, pnl_data, alert_level, reasons, scored=None)
     print(f"  Ganancia/Perd:  ${pnl_data['gross_pnl']:.2f} ({pnl_data['pnl_pct']:.1f}%)")
     print(f"  % del maximo:   {pnl_data['profit_pct_of_max']*100:.1f}%")
     print(f"  Ganancia max:   ${pnl_data['max_profit']:.2f}")
-
-    if scored:
-        print(f"  Score actual:   {scored['score']}/{scored['score_max']} "
-              f"({scored['score_pct']}%) — {scored['verdict']}")
 
     print(f"\n  Alertas:")
     for reason in reasons:
@@ -735,7 +611,6 @@ def generate_html_report(positions_data, timestamp):
             pnl      = pd["pnl_data"]
             level    = pd["alert_level"]
             reasons  = pd["reasons"]
-            scored   = pd.get("scored")
             strategy = pos.get("strategy", "")
 
             level_colors = {
@@ -759,14 +634,6 @@ def generate_html_report(positions_data, timestamp):
             delta_html = ""
             if pnl.get("delta") is not None:
                 delta_html = f'<span>Delta: {pnl["delta"]:.3f}</span>'
-
-            score_html = ""
-            if scored:
-                score_html = (
-                    f'<div style="margin-top:8px;font-size:11px;color:#6b7280;">'
-                    f'Score: {scored["score"]}/{scored["score_max"]} '
-                    f'({scored["score_pct"]}%) — {scored["verdict"]}</div>'
-                )
 
             cards.append(f"""
             <div style="background:#111827;border-radius:16px;padding:16px;
@@ -828,7 +695,6 @@ def generate_html_report(positions_data, timestamp):
                     <span>Costo: ${float(pos.get('total_cost') or 0):.0f}</span>
                     <span>{pnl['dte']}d restantes</span>
                 </div>
-                {score_html}
             </div>""")
 
         cards_html = "\n".join(cards)
@@ -1008,12 +874,8 @@ def run_monitor(ask_ai=False):
             pnl_data["total_cost"] = float(position.get("total_cost") or 0)
             alert_level, reasons   = evaluate_alert_level(pnl_data)
 
-            scored = score_criteria(criteria)
-            if scored:
-                save_analysis(scored)
-
             print(f"{level_icon(alert_level)} {alert_level}")
-            print_position_report(position, pnl_data, alert_level, reasons, scored)
+            print_position_report(position, pnl_data, alert_level, reasons)
 
             if alert_level in ("WATCH", "ACTION", "URGENT") and ticker not in ntfy_sent:
                 # Solo notificar si el mercado está abierto o en pre-market
@@ -1027,7 +889,6 @@ def run_monitor(ask_ai=False):
                 "pnl_data":    pnl_data,
                 "alert_level": alert_level,
                 "reasons":     reasons,
-                "scored":      scored,
             })
 
         except Exception as e:
@@ -1100,9 +961,6 @@ def run_paper_monitor():
 
     print(f"  Paper positions abiertas: {len(positions)}\n")
 
-    # Create ONE session — reused across all spread value fetches
-    tt_session = _get_tt_session_monitor()
-
     for pos in positions:
         ticker      = pos["ticker"]
         strike_low  = float(pos["strike_low"])
@@ -1118,7 +976,7 @@ def run_paper_monitor():
         strategy     = pos.get("strategy", "Bull Call Spread")
         opt_type     = "put" if strategy == "Bull Put Spread" else "call"
         spread_value = get_spread_value_tastytrade(ticker, strike_low, strike_high,
-                                                   expiration, opt_type, tt_session)
+                                                   expiration, opt_type)
 
         # Small delay to avoid overwhelming DXLinkStreamer
         time.sleep(0.5)

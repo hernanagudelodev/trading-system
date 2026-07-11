@@ -555,122 +555,15 @@ def save_trade_context(position_id=None, paper_position_id=None,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PAPER TRADING — spread value fetch
+# PAPER TRADING — spread value fetch (delega en pricing.py, fuente única)
 # ══════════════════════════════════════════════════════════════════════════════
-
-async def _fetch_paper_spread_value(ticker, strike_low, strike_high, expiration,
-                                    option_type="call"):
-    """
-    Fetch real spread value from Tastytrade.
-    option_type: 'call' for Bull Call Spread, 'put' for Bull Put Spread
-    """
-    from tastytrade import Session, DXLinkStreamer
-    from tastytrade.instruments import NestedOptionChain
-    from tastytrade.dxfeed import Quote
-
-    client_secret = os.getenv("TASTYTRADE_CLIENT_SECRET")
-    refresh_token = os.getenv("TASTYTRADE_REFRESH_TOKEN")
-
-    try:
-        session = Session(client_secret, refresh_token)
-        chains  = await NestedOptionChain.get(session, ticker)
-        if not chains:
-            return None
-        chain = chains[0]
-
-        target_exp = None
-        for exp in chain.expirations:
-            if exp.expiration_date == expiration:
-                target_exp = exp
-                break
-        if target_exp is None:
-            return None
-
-        long_obj = short_obj = None
-        for s in target_exp.strikes:
-            sp = float(s.strike_price)
-            if abs(sp - strike_low) < 0.01:
-                long_obj = s
-            elif abs(sp - strike_high) < 0.01:
-                short_obj = s
-
-        if not long_obj or not short_obj:
-            return None
-
-        if option_type == "put":
-            long_sym  = long_obj.put_streamer_symbol
-            short_sym = short_obj.put_streamer_symbol
-        else:
-            long_sym  = long_obj.call_streamer_symbol
-            short_sym = short_obj.call_streamer_symbol
-
-        symbols    = [long_sym, short_sym]
-        quotes_map = {}
-
-        async with DXLinkStreamer(session) as streamer:
-            await streamer.subscribe(Quote, symbols)
-            # Recolecta hasta tener AMBOS quotes o agotar un presupuesto total.
-            # No abandona por un solo evento lento (clave en alta volatilidad/FOMC).
-            loop     = asyncio.get_running_loop()
-            deadline = loop.time() + 12
-            while len(quotes_map) < len(symbols):
-                remaining = deadline - loop.time()
-                if remaining <= 0:
-                    break
-                try:
-                    q = await asyncio.wait_for(streamer.get_event(Quote),
-                                               timeout=remaining)
-                    quotes_map[q.event_symbol] = q
-                except asyncio.TimeoutError:
-                    break
-
-        lq = quotes_map.get(long_sym)
-        sq = quotes_map.get(short_sym)
-        if not lq or not sq:
-            return None
-
-        long_mid  = (float(lq.bid_price or 0) + float(lq.ask_price or 0)) / 2
-        short_mid = (float(sq.bid_price or 0) + float(sq.ask_price or 0)) / 2
-
-        if option_type == "put":
-            # Bull Put Spread value = short_put_mid - long_put_mid
-            spread_val = round(short_mid - long_mid, 2)
-        else:
-            spread_val = round(long_mid - short_mid, 2)
-
-        # Un spread con 20-40 DTE nunca vale $0.00. Si el cálculo da <= 0 es
-        # porque no hubo quotes reales (bid=ask=0) o los mids vinieron mal.
-        # Devolver None => "sin dato", NO "vale cero" (esto causaba cierres
-        # fantasma con ganancia máxima falsa — caso CDW/GS).
-        return spread_val if spread_val > 0 else None
-
-    except Exception as e:
-        print(f"  spread fetch error ({ticker}): {e}")
-        return None
-
 
 def fetch_paper_spread_value(ticker, strike_low, strike_high, expiration,
                               option_type="call", retries=3, delay=2):
-    """
-    Wrapper síncrono con reintentos. Cada intento usa un event loop y una
-    sesión Tastytrade nuevos (evita conexiones obsoletas). Reintenta cuando
-    el streamer no entrega quotes a tiempo (típico en alta volatilidad/FOMC).
-    Devuelve el valor del spread, o None si fallan todos los intentos.
-    """
-    import time
-    for attempt in range(retries):
-        try:
-            val = asyncio.run(_fetch_paper_spread_value(
-                ticker, strike_low, strike_high, expiration, option_type))
-            # Solo un precio estrictamente positivo cuenta como éxito.
-            # 0.0 o None => sin dato => reintentar.
-            if val is not None and val > 0:
-                return val
-        except Exception:
-            pass
-        if attempt < retries - 1:
-            time.sleep(delay)
-    return None
+    """Delegado a pricing.get_spread_value — la lógica vive en un solo lugar."""
+    import pricing
+    return pricing.get_spread_value(ticker, strike_low, strike_high, expiration,
+                                    option_type=option_type, retries=retries, delay=delay)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

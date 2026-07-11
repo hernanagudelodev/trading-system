@@ -279,7 +279,7 @@ Empieza tu respuesta directamente con el carácter {{
 === INSTRUCCIONES ===
 1. Usa web search para buscar noticias recientes de los candidatos que pasaron filtros.
 2. Considera el contexto macro y eventos de la semana.
-3. Evalúa cada candidato con criterio conservador.
+3. Evalúa cada candidato con criterio conservador. Conservador significa elegir bien y respetar los gates —NO significa abstenerse de operar cuando hay un buen candidato. Si el scanner trae una estructura viable con señal clara, ábrela.
 4. Decide cuáles abrir como paper trade y cuáles ignorar.
 5. Decide si alguna posición abierta debe cerrarse anticipadamente por cambio de tesis.
 
@@ -287,6 +287,7 @@ Reglas:
 - debit positivo = Bull Call Spread (pagas), negativo = Bull Put Spread (cobras crédito)
 - Solo recomendar trades con señal clara y contexto favorable
 - Si hay evento macro VERY_HIGH en 2 días o menos, NO abrir ninguna posición nueva (regla dura: el sistema descarta cualquier apertura igual). Los cierres sí están permitidos.
+- Eventos HIGH o MEDIUM (CPI, PPI, NFP, etc.) NO prohíben abrir. Son contexto para elegir mejor, no motivo para abstenerte. NO inventes reglas duras de evento: la ÚNICA prohibición por evento es la de VERY_HIGH del punto anterior, que ya aplica el sistema por código. Con un HIGH podés y debés operar si hay un candidato con señal clara.
 - No abrir trades con earnings del subyacente en menos de 21 días (riesgo de IV crush)
 - Máximo {MAX_NEW_TRADES_PER_RUN} trades nuevos por run
 - Si no hay nada convincente, devolver new_trades vacío y explicar en no_trade_reason
@@ -294,6 +295,7 @@ Reglas:
 
 Responde SOLO con este JSON (sin texto adicional, sin markdown):
 {{
+  "headline": "Frase corta y COMPLETA (máximo 120 caracteres) que resuma la decisión del día para una notificación push. Debe entenderse sola y NO cortarse a la mitad. Ej: 'Abrí TGT y MSFT; resto sin señal clara' o 'Sin aperturas: ningún candidato pasó los filtros hoy'.",
   "analysis_summary": "Párrafo breve del contexto del día y decisiones tomadas",
   "new_trades": [
     {{
@@ -509,38 +511,40 @@ def execute_recommendations(analysis):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def send_run_summary(market_ctx, analysis, results, run_time):
-    """Send push notification with run summary."""
+    """Send push notification with run summary — corto y completo, sin cortar frases."""
     verdict = market_ctx.get("verdict", "N/A") if market_ctx else "N/A"
     vix     = market_ctx["vix"]["current"] if market_ctx else "N/A"
 
     lines = [f"🤖 Auto-run {datetime.now().strftime('%H:%M')} | {verdict} | VIX {vix}"]
 
-    # Summary from Claude
-    if analysis and analysis.get("analysis_summary"):
-        summary = analysis["analysis_summary"]
-        if len(summary) > 150:
-            summary = summary[:147] + "..."
-        lines.append(f"\n📊 {summary}")
+    # Headline: frase completa que el LLM escribió para que quepa (no se trunca).
+    # Fallback al analysis_summary recortado en límite de palabra si no hay headline.
+    headline = (analysis.get("headline") if analysis else "") or ""
+    if not headline and analysis and analysis.get("analysis_summary"):
+        s = analysis["analysis_summary"]
+        headline = s if len(s) <= 140 else s[:137].rsplit(" ", 1)[0] + "…"
+    if headline:
+        lines.append(f"\n📊 {headline}")
 
-    # Opened trades
+    # Opened trades (líneas cortas y completas)
     if results["opened"]:
         lines.append(f"\n✅ Abrí {len(results['opened'])} posición(es):")
         for t in results["opened"]:
             strategy_short = "BCS" if "Bull Call" in t["strategy"] else "BPS"
             sign = "db" if t["debit"] > 0 else "cr"
             lines.append(f"  • {t['ticker']} {strategy_short} {t['strikes']} ${abs(t['debit']):.2f}{sign}")
-    else:
-        no_trade = analysis.get("no_trade_reason", "") if analysis else ""
-        if no_trade:
-            lines.append(f"\n⏸ Sin trades nuevos: {no_trade[:100]}")
-        else:
-            lines.append("\n⏸ Sin trades nuevos hoy")
+    elif not results["closed"]:
+        # Sin aperturas ni cierres: el headline ya explica el porqué; no repetir
+        # el no_trade_reason largo (queda completo en el log/DB).
+        lines.append("\n⏸ Sin trades nuevos")
 
-    # Closed positions
+    # Closed positions (motivo recortado en límite de palabra, no a la mitad)
     if results["closed"]:
         lines.append(f"\n🔴 Cerré {len(results['closed'])} posición(es):")
         for c in results["closed"]:
-            lines.append(f"  • {c['ticker']}: {c['reason'][:60]}")
+            r = c["reason"]
+            r = r if len(r) <= 60 else r[:57].rsplit(" ", 1)[0] + "…"
+            lines.append(f"  • {c['ticker']}: {r}")
 
     # Errors
     if results["errors"]:
