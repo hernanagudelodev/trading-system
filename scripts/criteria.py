@@ -619,7 +619,10 @@ def select_strategy(criteria):
     if ivp >= 60:
         return "Bull Put Spread"
     elif ivp < 30:
-        if beta > 1.5 and trend_pct > 10 and rsi < 65:
+        # beta 1.2 (antes 1.5): abre un poco más de Long Calls manteniendo la
+        # exigencia de IV baja + momentum. Sigue siendo la estrategia más
+        # arriesgada (prima completa a riesgo), por eso el resto de filtros se mantiene.
+        if beta > 1.2 and trend_pct > 10 and rsi < 65:
             return "Long Call"
         return "Bull Call Spread"
     else:
