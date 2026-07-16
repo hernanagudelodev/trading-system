@@ -30,11 +30,30 @@ import os
 import time
 
 import requests
+from dotenv import load_dotenv
 
-NTFY_TOPIC    = os.getenv("NTFY_TOPIC", "")
-NTFY_BASE_URL = os.getenv("NTFY_BASE_URL", "https://ntfy.sh")
-NTFY_RETRIES  = 3
-NTFY_TIMEOUT  = 10
+# Para que el módulo sirva solo (python -c, scripts sueltos). Los llamadores que
+# ya hacen load_dotenv() no se ven afectados: es idempotente.
+load_dotenv()
+
+NTFY_RETRIES = 3
+NTFY_TIMEOUT = 10
+
+
+def _topic():
+    """
+    NTFY_TOPIC se lee AL USAR, no al importar.
+
+    Leerla a nivel de módulo la ataba al orden de los imports: monitor.py hace
+    `from notify import send_ntfy` en la línea 43 y `load_dotenv()` en la 48
+    — el topic salía vacío y el monitor dejaba de notificar en silencio.
+    Mismo defecto que CAPITAL = os.getenv(...) a nivel de módulo.
+    """
+    return os.getenv("NTFY_TOPIC", "").strip()
+
+
+def _base_url():
+    return os.getenv("NTFY_BASE_URL", "https://ntfy.sh").rstrip("/")
 
 
 def send_ntfy(title, message, priority="default", tags=None) -> bool:
@@ -46,12 +65,17 @@ def send_ntfy(title, message, priority="default", tags=None) -> bool:
     priority : 'min' | 'low' | 'default' | 'high' | 'urgent'
     tags     : lista de tags de ntfy (opcional) — venía de monitor.py
 
-    Sin NTFY_TOPIC devuelve False: no se envió nada, y eso NO es un éxito.
+    Sin NTFY_TOPIC avisa y devuelve False: no se envió nada, y eso NO es un éxito.
     """
-    if not NTFY_TOPIC:
+    topic = _topic()
+    if not topic:
+        # Antes esto devolvía False callado. Un topic ausente NO es "no hay nada
+        # que notificar": es un error de config que apaga TODAS las alertas.
+        print("  ⛔ NTFY_TOPIC vacía o ausente — no se envió el push. "
+              "¿Falta load_dotenv() o la env var?")
         return False
 
-    url     = f"{NTFY_BASE_URL}/{NTFY_TOPIC}"
+    url = f"{_base_url()}/{topic}"
     headers = {
         "Title":        title.encode("utf-8"),
         "Priority":     priority,
