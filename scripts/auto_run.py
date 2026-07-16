@@ -427,18 +427,55 @@ def execute_recommendations(analysis):
     new_trades = analysis.get("new_trades", [])
     opened_count = 0
 
-    # Bloqueo de concentración: no abrir un ticker que ya está OPEN, ni
-    # dos veces el mismo ticker dentro de este mismo run.
+    # ── Estado de la cartera del libro activo ─────────────────────────────────
+    # UNA lectura para dos gates: concentración (mismo ticker) y riesgo agregado.
+    # La tabla depende del libro. Antes 'paper_positions' estaba hardcodeado —
+    # en live habría leído el libro equivocado sin decir nada.
+    from executor import current_mode
+    from option_selector import CAPITAL, position_max_loss
+
+    _mode  = current_mode()
+    _table = "positions" if _mode == "live" else "paper_positions"
+
+    # Tope agregado: OBLIGATORIO en live. En paper default 100% (= sin tope).
+    _raw_pct = os.getenv("MAX_PORTFOLIO_RISK_PCT")
+    if _raw_pct is None:
+        if _mode == "live":
+            raise RuntimeError(
+                "MAX_PORTFOLIO_RISK_PCT obligatoria con TRADING_MODE=live. "
+                "Sin tope declarado no se abre nada."
+            )
+        _raw_pct = "100"
+    MAX_PORTFOLIO_RISK = CAPITAL * float(_raw_pct) / 100.0
+
     open_tickers = set()
+    current_risk = 0.0
     try:
         import psycopg2
-        _c = psycopg2.connect(os.getenv("DATABASE_URL"))
+        _c   = psycopg2.connect(os.getenv("DATABASE_URL"))
         _cur = _c.cursor()
-        _cur.execute("SELECT DISTINCT UPPER(ticker) FROM paper_positions WHERE UPPER(status)='OPEN'")
-        open_tickers = {r[0] for r in _cur.fetchall()}
+        _cur.execute(f"""
+            SELECT UPPER(ticker), strike_low, strike_high, premium_paid, contracts
+            FROM {_table}
+            WHERE UPPER(status) = 'OPEN'
+        """)
+        for _tkr, _sl, _sh, _prem, _n in _cur.fetchall():
+            open_tickers.add(_tkr)
+            current_risk += position_max_loss(_sl, _sh, _prem, _n)
         _cur.close(); _c.close()
     except Exception as e:
-        print(f"  ⚠️  no se pudo leer tickers abiertos ({e}) — se sigue sin bloqueo de concentración")
+        # FAIL-CLOSED. Antes seguía "sin bloqueo de concentración" — pero no poder
+        # ver tu exposición es exactamente cuando NO hay que abrir. Los cierres
+        # de arriba ya se ejecutaron y se conservan en results.
+        msg = f"no se pudo leer la cartera ({_table}): {e} — NO se abre nada este run"
+        print(f"  ⛔ {msg}")
+        results["errors"].append(msg)
+        return results
+
+    print(f"\n  [cartera/{_mode}] {len(open_tickers)} abiertas · "
+          f"riesgo ${current_risk:,.0f} / ${MAX_PORTFOLIO_RISK:,.0f} "
+          f"({current_risk/CAPITAL*100:.1f}% del capital)")
+
     opened_this_run = set()
 
     for trade_rec in new_trades:
@@ -453,10 +490,22 @@ def execute_recommendations(analysis):
             print(f"  [concentración] {ticker} ya tiene posición abierta — se omite (no apilar mismo nombre)")
             continue
 
-        strike_low = trade_rec.get("strike_low")
+        strike_low  = trade_rec.get("strike_low")
         strike_high = trade_rec.get("strike_high")
         debit       = trade_rec.get("debit")
         rationale   = trade_rec.get("rationale", "")
+
+        # Completitud de lo que dio el LLM — antes de gastar red en la cadena.
+        if not all([ticker, strike_low, strike_high, debit is not None]):
+            print(f"  Skipping incomplete trade rec: {trade_rec}")
+            continue
+
+        # Tope de riesgo agregado de cartera.
+        _new_risk = position_max_loss(strike_low, strike_high, debit)
+        if current_risk + _new_risk > MAX_PORTFOLIO_RISK:
+            print(f"  [tope-cartera] {ticker} se omite: ${current_risk:,.0f} "
+                  f"+ ${_new_risk:,.0f} > ${MAX_PORTFOLIO_RISK:,.0f}")
+            continue
 
         # B: la fecha de expiración NO la elige el LLM (inventa sábados).
         # Se toma la expiración REAL de la cadena — misma regla que option_selector.
@@ -469,10 +518,6 @@ def execute_recommendations(analysis):
         if trade_rec.get("expiration") and trade_rec["expiration"] != expiration:
             print(f"  [exp-fix] {ticker}: LLM dijo {trade_rec['expiration']}, "
                   f"se usa la real {expiration}")
-
-        if not all([ticker, strike_low, strike_high, expiration, debit is not None]):
-            print(f"  Skipping incomplete trade rec: {trade_rec}")
-            continue
 
         print(f"\n  Opening {ticker} ${strike_low}/{strike_high} debit={debit}")
         try:
@@ -495,6 +540,7 @@ def execute_recommendations(analysis):
                 })
                 opened_count += 1
                 opened_this_run.add(ticker)
+                current_risk += _new_risk        # acumular DENTRO del run
             else:
                 msg = f"{ticker}: apertura NO ejecutada"
                 print(f"  ⚠️  {msg}")

@@ -613,3 +613,21 @@ async def _get_options_async(session, tickers_data):
                                                     criteria.get("price", 0),
                                                     strategy)
     return _build_markdown(tickers_data, results)
+
+def position_max_loss(strike_low, strike_high, debit, contracts=1) -> float:
+    """
+    Pérdida máxima en DÓLARES de un spread vertical de 2 patas.
+    Fuente ÚNICA: la usan el gate de cartera (auto_run) y check_open.py.
+
+    Manda el SIGNO de `debit`, no el string de strategy:
+        debit > 0  -> débito  (BCS): pérdida máx = lo que pagaste
+        debit < 0  -> crédito (BPS): pérdida máx = ancho - crédito
+
+    `premium_paid` en la DB ya trae ese signo, así que una fila se pasa directo.
+    """
+    width = abs(float(strike_high) - float(strike_low))
+    d     = float(debit)
+    n     = int(contracts or 1)
+    if d > 0:
+        return round(d * 100 * n, 2)
+    return round((width - abs(d)) * 100 * n, 2)
