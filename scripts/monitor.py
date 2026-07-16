@@ -38,7 +38,7 @@ from datetime import datetime, date
 
 from dotenv import load_dotenv
 
-from notify import send_ntfy
+from notify import send_push
 
 from criteria import get_all_criteria
 from db import get_open_positions
@@ -522,7 +522,7 @@ def send_alert_notification(position, pnl_data, alert_level, reasons):
         f"{reason_text}"
     )
 
-    send_ntfy(title, message, priority=priorities.get(alert_level, "default"))
+    send_push(title, message, priority=priorities.get(alert_level, "default"))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -753,7 +753,7 @@ def send_heartbeat(positions_data, timestamp):
             f"P&L: ${pnl['gross_pnl']:+.0f} ({pct:.0f}% max) | {pnl['dte']}d"
         )
 
-    send_ntfy(
+    send_push(
         title=f"Monitor — {len(positions_with_alerts)} posicion(es) requieren atencion",
         message="\n".join(lines) + f"\n{timestamp}",
         priority="default",
@@ -767,7 +767,7 @@ def send_market_close_summary(positions_data, timestamp):
     _market_close_sent = True
 
     if not positions_data:
-        send_ntfy(
+        send_push(
             title="Mercado cerrado - Sin posiciones",
             message=f"Mercado cerrado.\n{timestamp}",
             priority="low",
@@ -786,7 +786,7 @@ def send_market_close_summary(positions_data, timestamp):
             f"({pct:.0f}% max) | {pnl['dte']}d al venc."
         )
 
-    send_ntfy(
+    send_push(
         title=f"Cierre de mercado — {len(positions_data)} posicion(es)",
         message="\n".join(lines) + f"\n{timestamp}",
         priority="default",
@@ -1045,7 +1045,7 @@ def run_paper_monitor():
             cur2.close()
             conn2.close()
             # Paper normalmente es silencioso; un cierre SÍ amerita aviso.
-            send_ntfy(
+            send_push(
                 title=f"Paper auto-cierre: {ticker} ({close_reason})",
                 message=(f"{ticker} {strategy} ${strike_low}/{strike_high}\n"
                          f"P&L ${gross_pnl:+.2f} ({pnl_pct:+.1f}%) | DTE {dte}\n"

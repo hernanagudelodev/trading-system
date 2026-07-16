@@ -48,10 +48,10 @@ _REPORTS_DIR = os.path.join(_BASE_DIR, "reports")
 
 sys.path.insert(0, _SCRIPTS_DIR)
 
-# Notificaciones: fuente ÚNICA en notify.py. Antes había una copia de send_ntfy
+# Notificaciones: fuente ÚNICA en notify.py. Antes había una copia de send_push
 # acá y otra en monitor.py, ya divergidas (monitor chequeaba status_code, esta
 # no). Misma enfermedad que las tres copias de pricing.
-from notify import send_ntfy
+from notify import send_push
 
 AI_MODEL = "claude-sonnet-4-6"
 
@@ -580,7 +580,7 @@ def send_run_summary(market_ctx, analysis, results, run_time):
     message = "\n".join(lines)
     priority = "high" if results["opened"] or results["closed"] else "default"
 
-    send_ntfy(
+    send_push(
         title=f"Auto-run | {len(results['opened'])} abiertos | {len(results['closed'])} cerrados",
         message=message,
         priority=priority
@@ -871,7 +871,7 @@ def generate_weekly_summary():
 
         push_lines.append(f"\nAbiertas: {len(open_pos)}")
 
-        send_ntfy(
+        send_push(
             title=f"Resumen semanal | P&L ${total_pnl:+.0f} | {win_rate}% win",
             message="\n".join(push_lines),
             priority="default"
@@ -990,7 +990,7 @@ def main():
 
         if not ok:  # level == 'abort'
             run_time = time.time() - start_time
-            send_ntfy(
+            send_push(
                 title="🚨 Auto-run ABORTADO — datos inválidos",
                 message=(
                     f"Run {timestamp} abortado ANTES de la IA.\n"
@@ -1008,7 +1008,7 @@ def main():
             return
 
         if level == "warn":
-            send_ntfy(
+            send_push(
                 title="⚠️ Auto-run — datos sospechosos",
                 message=f"Run {timestamp}: {reason}\nContinúa, pero revisá.",
                 priority="high",
@@ -1037,7 +1037,7 @@ def main():
             analysis["new_trades"] = []
             print(f"\n  [event-gate] BLOQUEADO: {ev['event']} VERY_HIGH en "
                   f"{ev['days_away']}d → {dropped} apertura(s) descartada(s)")
-            send_ntfy(
+            send_push(
                 title="🚫 Aperturas bloqueadas — evento VERY_HIGH",
                 message=(
                     f"{ev['event']} en {ev['days_away']}d (VERY_HIGH).\n"
@@ -1082,7 +1082,7 @@ def main():
         traceback.print_exc()
 
         # Send failure alert
-        send_ntfy(
+        send_push(
             title="🚨 Auto-run FALLÓ",
             message=(
                 f"Error en auto-run {timestamp}\n"
