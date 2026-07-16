@@ -631,3 +631,20 @@ def position_max_loss(strike_low, strike_high, debit, contracts=1) -> float:
     if d > 0:
         return round(d * 100 * n, 2)
     return round((width - abs(d)) * 100 * n, 2)
+
+def portfolio_risk_pct() -> float:
+    """
+    Tope de riesgo AGREGADO de cartera, en % del capital.
+    Fuente ÚNICA: la usan el gate de auto_run y check_open.py.
+
+    Obligatoria en los DOS libros (paper y live). Sin default: un tope ausente
+    no es "sin tope", es un bug. El default silencioso es exactamente cómo
+    MAX_COST terminó siendo decorativo y dejó pasar el GS de $3,945 (§12.3).
+    """
+    raw = os.getenv("MAX_PORTFOLIO_RISK_PCT")
+    if raw is None:
+        raise RuntimeError(
+            "MAX_PORTFOLIO_RISK_PCT no está definida. Obligatoria en paper y en "
+            "live: sin ella el gate de cartera no rechazaría nada."
+        )
+    return float(raw)

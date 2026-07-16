@@ -22,7 +22,7 @@ Cubre:
   F. tope de cartera: rechaza cuando la cartera existente ya está cerca del tope
   G. tope de cartera: ACUMULA dentro del run (el 2do trade ve el riesgo del 1ro)
   H. fail-closed: DB ilegible -> 0 aperturas, error registrado, cierres conservados
-  I. paper al 100% -> el tope no estorba (comportamiento actual sin cambios)
+  I. la var es obligatoria: si falta, explota en vez de defaultear a 'sin tope'
 
 Uso (desde cualquier carpeta):
     python scripts/test/test_executor_flow.py
@@ -183,12 +183,12 @@ check("strikes invertidos no cambian el ancho",
 # ══════════════════════════════════════════════════════════════════════════════
 # B — enrutamiento
 # ══════════════════════════════════════════════════════════════════════════════
-print("\n  === B · enrutamiento (cartera vacía, sin tope) ===")
+print("\n  === B · enrutamiento (cartera vacía, tope holgado) ===")
 
 fake, res = run_case({
     "new_trades": [BCS_200, BPS_380],
     "close_positions": [{"ticker": "NVDA", "reason": "tesis rota"}],
-}, db_rows=[])
+}, db_rows=[], pct=40)
 
 check("2 aperturas llegan al executor", fake.opened == ["AAPL", "MSFT"], f"opened={fake.opened}")
 check("1 cierre llega al executor", fake.closed == ["NVDA"], f"closed={fake.closed}")
@@ -207,7 +207,7 @@ fake, res = run_case({
         {"ticker": "AAPL", "strike_low": 95,  "strike_high": 100, "debit": 1.0},
     ],
     "close_positions": [],
-}, db_rows=[])
+}, db_rows=[], pct=40)
 
 check("solo se abre 1 AAPL", fake.opened == ["AAPL"], f"opened={fake.opened}")
 
@@ -220,7 +220,7 @@ print("\n  === D · concentración: ticker ya OPEN en la DB ===")
 fake, res = run_case({
     "new_trades": [BCS_200, BPS_380],
     "close_positions": [],
-}, db_rows=[("AAPL", 90, 95, 1.0, 1)])
+}, db_rows=[("AAPL", 90, 95, 1.0, 1)], pct=40)
 
 check("AAPL bloqueado por estar OPEN", "AAPL" not in fake.opened, f"opened={fake.opened}")
 check("MSFT sí se abre", fake.opened == ["MSFT"], f"opened={fake.opened}")
@@ -234,7 +234,7 @@ print("\n  === E · cierre que el executor NO logra ===")
 fake, res = run_case({
     "new_trades": [],
     "close_positions": [{"ticker": "TSLA", "reason": "sin precio"}],
-}, db_rows=[], close_ok=False)
+}, db_rows=[], pct=40, close_ok=False)
 
 check("TSLA NO va a closed", res["closed"] == [], f"closed={res['closed']}")
 check("TSLA va a errors", len(res["errors"]) == 1, f"errors={res['errors']}")
@@ -285,7 +285,7 @@ print("\n  === H · DB ilegible -> no se abre nada ===")
 fake, res = run_case({
     "new_trades": [BCS_200, BPS_380],
     "close_positions": [{"ticker": "NVDA", "reason": "tesis rota"}],
-}, db_rows=None)
+}, db_rows=None, pct=40)
 
 check("CERO aperturas con la DB caída", fake.opened == [], f"opened={fake.opened}")
 check("se registra el error", len(res["errors"]) >= 1, f"errors={res['errors']}")
@@ -294,17 +294,23 @@ check("los cierres SÍ se conservan", res["closed"] and res["closed"][0]["ticker
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# I — paper al 100%: sin cambios de comportamiento
+# I — la var es OBLIGATORIA en los dos libros
 # ══════════════════════════════════════════════════════════════════════════════
-print("\n  === I · paper sin MAX_PORTFOLIO_RISK_PCT -> 100%, no estorba ===")
+print("\n  === I · sin MAX_PORTFOLIO_RISK_PCT -> explota (no defaultea) ===")
 
-# Cartera con $2,000 de riesgo + trade nuevo. 100% de 14100 = 14100. Pasa.
-fake, res = run_case({
-    "new_trades": [BCS_200],
-    "close_positions": [],
-}, db_rows=[("XYZ", 50, 70, 20.0, 1)], pct=None)
-
-check("abre igual: el tope al 100% no bloquea", fake.opened == ["AAPL"], f"opened={fake.opened}")
+# Antes esto caía a 100% = sin tope. Un tope ausente no es "sin tope", es un bug:
+# es como MAX_COST terminó decorativo y dejó pasar el GS de $3,945.
+try:
+    fake, res = run_case({
+        "new_trades": [BCS_200],
+        "close_positions": [],
+    }, db_rows=[], pct=None)
+    check("falta la var -> RuntimeError", False,
+          f"NO explotó: abrió {fake.opened} — el tope volvió a ser decorativo")
+except RuntimeError as e:
+    check("falta la var -> RuntimeError", "MAX_PORTFOLIO_RISK_PCT" in str(e), str(e))
+except Exception as e:
+    check("falta la var -> RuntimeError", False, f"explotó pero con {type(e).__name__}: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════

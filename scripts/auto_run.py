@@ -20,6 +20,11 @@ Workflow:
 Dependencies:
     All scripts in scripts/
     ANTHROPIC_API_KEY, TASTYTRADE_*, NTFY_TOPIC in .env
+
+    OBLIGATORIAS (el run explota si faltan — a propósito):
+        MAX_PORTFOLIO_RISK_PCT  tope de riesgo agregado, % del capital (ej: 40)
+        ACCOUNT_NLV             capital base
+        TRADING_MODE            'paper' | 'live'  (ausente -> 'paper')
 """
 
 import os
@@ -43,34 +48,12 @@ _REPORTS_DIR = os.path.join(_BASE_DIR, "reports")
 
 sys.path.insert(0, _SCRIPTS_DIR)
 
-NTFY_TOPIC    = os.getenv("NTFY_TOPIC", "")
-NTFY_BASE_URL = "https://ntfy.sh"
+# Notificaciones: fuente ÚNICA en notify.py. Antes había una copia de send_ntfy
+# acá y otra en monitor.py, ya divergidas (monitor chequeaba status_code, esta
+# no). Misma enfermedad que las tres copias de pricing.
+from notify import send_ntfy
+
 AI_MODEL = "claude-sonnet-4-6"
-
-# Max paper trades to open per run
-# Claude decides based on signal quality — this is a hard safety cap
-MAX_NEW_TRADES_PER_RUN = 5
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# NOTIFICATIONS
-# ══════════════════════════════════════════════════════════════════════════════
-
-def send_ntfy(title, message, priority="default"):
-    if not NTFY_TOPIC:
-        return
-    try:
-        requests.post(
-            f"{NTFY_BASE_URL}/{NTFY_TOPIC}",
-            data=message.encode("utf-8"),
-            headers={
-                "Title":    title.encode("utf-8"),
-                "Priority": priority,
-            },
-            timeout=10,
-        )
-    except Exception as e:
-        print(f"  ntfy error: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -195,6 +178,11 @@ def get_current_state():
 def run_claude_analysis(market_ctx, scanner_report, db_state):
     print("\n  [4/6] Calling Anthropic API...")
 
+    # El tope de cartera se le declara al LLM para que ordene por convicción.
+    # El gate de código lo hace cumplir igual — esto es contexto, no garantía.
+    from option_selector import portfolio_risk_pct
+    _pct = portfolio_risk_pct()
+
     # Try to read compact AI summary of market context
     mc_ai_path = os.path.join(_REPORTS_DIR, "market_context_ai.md")
     if os.path.exists(mc_ai_path):
@@ -289,7 +277,8 @@ Reglas:
 - Si hay evento macro VERY_HIGH en 2 días o menos, NO abrir ninguna posición nueva (regla dura: el sistema descarta cualquier apertura igual). Los cierres sí están permitidos.
 - Eventos HIGH o MEDIUM (CPI, PPI, NFP, etc.) NO prohíben abrir. Son contexto para elegir mejor, no motivo para abstenerte. NO inventes reglas duras de evento: la ÚNICA prohibición por evento es la de VERY_HIGH del punto anterior, que ya aplica el sistema por código. Con un HIGH podés y debés operar si hay un candidato con señal clara.
 - No abrir trades con earnings del subyacente en menos de 21 días (riesgo de IV crush)
-- Máximo {MAX_NEW_TRADES_PER_RUN} trades nuevos por run
+- No hay límite de CANTIDAD de trades por run. Lo que limita es el RIESGO AGREGADO: el sistema rechaza toda apertura que haga que la pérdida máxima combinada de la cartera supere el {_pct:.0f}% del capital.
+- Ordená new_trades por convicción DESCENDENTE. Si el presupuesto de riesgo se agota, el sistema abre los primeros de la lista y descarta el resto: el orden importa.
 - Si no hay nada convincente, devolver new_trades vacío y explicar en no_trade_reason
 - NO incluyas fecha de expiración: el sistema la fija automáticamente desde la cadena real (no la calcules tú)
 
@@ -423,30 +412,22 @@ def execute_recommendations(analysis):
             print(f"  Error closing {ticker}: {e}")
             results["errors"].append(f"Close {ticker}: {e}")
 
-    # Open new paper trades
+    # Open new trades
     new_trades = analysis.get("new_trades", [])
-    opened_count = 0
 
     # ── Estado de la cartera del libro activo ─────────────────────────────────
     # UNA lectura para dos gates: concentración (mismo ticker) y riesgo agregado.
     # La tabla depende del libro. Antes 'paper_positions' estaba hardcodeado —
     # en live habría leído el libro equivocado sin decir nada.
     from executor import current_mode
-    from option_selector import CAPITAL, position_max_loss
+    from option_selector import CAPITAL, position_max_loss, portfolio_risk_pct
 
     _mode  = current_mode()
     _table = "positions" if _mode == "live" else "paper_positions"
 
-    # Tope agregado: OBLIGATORIO en live. En paper default 100% (= sin tope).
-    _raw_pct = os.getenv("MAX_PORTFOLIO_RISK_PCT")
-    if _raw_pct is None:
-        if _mode == "live":
-            raise RuntimeError(
-                "MAX_PORTFOLIO_RISK_PCT obligatoria con TRADING_MODE=live. "
-                "Sin tope declarado no se abre nada."
-            )
-        _raw_pct = "100"
-    MAX_PORTFOLIO_RISK = CAPITAL * float(_raw_pct) / 100.0
+    # Tope agregado: obligatorio en los DOS libros. Sin default silencioso.
+    PCT                = portfolio_risk_pct()
+    MAX_PORTFOLIO_RISK = CAPITAL * PCT / 100.0
 
     open_tickers = set()
     current_risk = 0.0
@@ -476,13 +457,12 @@ def execute_recommendations(analysis):
           f"riesgo ${current_risk:,.0f} / ${MAX_PORTFOLIO_RISK:,.0f} "
           f"({current_risk/CAPITAL*100:.1f}% del capital)")
 
+    print(f"  [tope/{PCT:.0f}%] sin límite de cantidad — el presupuesto de "
+          f"riesgo se consume en el ORDEN de la lista del LLM")
+
     opened_this_run = set()
 
     for trade_rec in new_trades:
-        if opened_count >= MAX_NEW_TRADES_PER_RUN:
-            print(f"  Max trades per run reached ({MAX_NEW_TRADES_PER_RUN})")
-            break
-
         ticker     = trade_rec.get("ticker", "").upper()
 
         # Bloqueo de mismo ticker (cartera + este run)
@@ -538,7 +518,6 @@ def execute_recommendations(analysis):
                     "strikes":   f"${strike_low}/{strike_high}",
                     "debit":     debit,
                 })
-                opened_count += 1
                 opened_this_run.add(ticker)
                 current_risk += _new_risk        # acumular DENTRO del run
             else:

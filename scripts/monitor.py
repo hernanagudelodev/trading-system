@@ -33,12 +33,12 @@ import time
 import asyncio
 import argparse
 import schedule
-import requests
 import yfinance as yf
 from datetime import datetime, date
 
-import anthropic
 from dotenv import load_dotenv
+
+from notify import send_ntfy
 
 from criteria import get_all_criteria
 from db import get_open_positions
@@ -81,8 +81,6 @@ INTERVAL_MARKET_OPEN    = 5
 INTERVAL_PRE_MARKET     = 10
 INTERVAL_MARKET_CLOSED  = 30
 
-NTFY_TOPIC    = os.getenv("NTFY_TOPIC", "")
-NTFY_BASE_URL = "https://ntfy.sh"
 
 HEARTBEAT_INTERVAL_MIN = 60
 
@@ -91,9 +89,6 @@ _market_close_sent   = False
 
 REPORT_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                            "reports", "monitor_report.html")
-
-AI_MODEL      = "claude-sonnet-4-20250514"
-AI_MAX_TOKENS = 1000
 
 # Strategy type classification
 DEBIT_SPREADS   = {"Bull Call Spread", "Bear Put Spread"}
@@ -503,36 +498,6 @@ def level_icon(level):
 def level_icon_emoji(level):
     return {"NORMAL": "verde", "WATCH": "amarillo", "ACTION": "naranja", "URGENT": "rojo"}.get(level, "---")
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# NTFY NOTIFICATIONS
-# ══════════════════════════════════════════════════════════════════════════════
-
-def send_ntfy(title, message, priority="default", tags=None):
-    """Send push notification via ntfy.sh."""
-    if not NTFY_TOPIC:
-        return
-
-    url = f"{NTFY_BASE_URL}/{NTFY_TOPIC}"
-    headers = {
-        "Title":        title.encode("utf-8"),
-        "Priority":     priority,
-        "Content-Type": "text/plain; charset=utf-8",
-    }
-    if tags:
-        headers["Tags"] = ",".join(tags)
-
-    try:
-        resp = requests.post(
-            url,
-            data=message.encode("utf-8"),
-            headers=headers,
-            timeout=10,
-        )
-        if resp.status_code not in (200, 204):
-            print(f"  ntfy warning: HTTP {resp.status_code}")
-    except Exception as e:
-        print(f"  ntfy error: {e}")
 
 
 def send_alert_notification(position, pnl_data, alert_level, reasons):
