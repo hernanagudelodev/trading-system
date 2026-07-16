@@ -81,23 +81,64 @@ class PaperExecutor(Executor):
 
 class LiveExecutor(Executor):
     """
-    Ejecución real. NO implementado — placeholder deliberado que se niega a correr.
-    Cuando se construya, aquí van: envío de orden al broker, seguimiento del ciclo
-    de vida (enviada→llena|rechazada|parcial), manejo de pata suelta, e
-    idempotencia. La reconciliación DB-vs-broker es un proceso aparte.
-    Requisitos completos: docs/REQUISITOS_LIVE.md
+    Ejecución REAL. El ciclo de vida de la orden vive en broker_orders.py;
+    acá está solo el pegamento con la interfaz que auto_run conoce.
+
+    ESTADO: open_position manda y confirma órdenes. NO ESCRIBE LA DB todavía.
+    close_position sigue sin implementar.
+
+    Consecuencia, y por eso este executor NO es desplegable aún: una posición
+    abierta por acá existe en el broker y NO en `positions`. El monitor no la
+    ve, o sea que no tiene stop loss. Solo sirve para probar contra sandbox.
+    El escritor de DB es el bloque siguiente, y sale de ver la forma real de un
+    fill — que se conoce mandando una orden de verdad en sandbox, no
+    adivinándola.
+
+    Lo que NO hace y es deliberado:
+      - No arregla una pata suelta. La detecta, grita y devuelve False. Un
+        arreglo automático equivocado deja una opción desnuda.
+      - No reintenta a ciegas si el broker no devolvió id: estado desconocido.
+      - No reporta True por nada que no sea un fill confirmado por el broker.
     """
     mode = "live"
 
     def open_position(self, intent: OpenIntent) -> bool:
-        raise NotImplementedError(
-            "LiveExecutor no implementado. No se puede operar en real todavía. "
-            "Ver docs/REQUISITOS_LIVE.md antes de construir esto."
-        )
+        from broker_orders import abrir_spread
+
+        r = abrir_spread(intent)
+
+        if r.ok:
+            print(f"  [live] {intent.ticker} LLENA · id={r.order_id} · "
+                  f"fill={r.fill_price}")
+            print(f"  [live] ⚠️  la posición NO quedó en la DB — el escritor "
+                  f"todavía no existe. El monitor no la ve.")
+            return True
+
+        if r.estado == "partial":
+            # Lo peor que puede pasar. Push urgente y parar.
+            try:
+                from notify import send_push
+                send_push(
+                    f"PATA SUELTA — {intent.ticker}",
+                    f"Orden {r.order_id} con fill PARCIAL.\n"
+                    f"{intent.ticker} ${intent.strike_low}/${intent.strike_high} "
+                    f"{intent.expiration}\n\n"
+                    f"Puede haber una opción DESNUDA en la cuenta. "
+                    f"Revisar A MANO ya.",
+                    priority="urgent",
+                )
+            except Exception as e:
+                print(f"  [live] no se pudo avisar de la pata suelta: {e}")
+            print(f"  [live] ⛔ {intent.ticker}: {r.detalle}")
+            return False
+
+        print(f"  [live] {intent.ticker} NO abierta ({r.estado}): {r.detalle}")
+        return False
 
     def close_position(self, ticker: str, reason: str) -> bool:
         raise NotImplementedError(
-            "LiveExecutor no implementado. No se puede operar en real todavía."
+            "LiveExecutor.close_position no implementado. Un cierre en vivo "
+            "necesita leer la posición del broker, no de la DB."
         )
 
 
