@@ -101,13 +101,23 @@ class LiveExecutor(Executor):
         )
 
 
-def get_executor() -> Executor:
+VALID_MODES = ("paper", "live")
+
+def current_mode() -> str:
     """
-    Elige el executor UNA vez, según TRADING_MODE ('paper' | 'live').
-    Default: 'paper'. 'live' se niega a correr hasta estar implementado —
-    salvaguarda para que un env var mal puesto no mande órdenes reales.
+    Fuente ÚNICA de TRADING_MODE. Ausente -> 'paper' (default seguro).
+    Presente pero inválido -> explota: un typo no se adivina.
     """
     mode = os.getenv("TRADING_MODE", "paper").strip().lower()
+    if mode not in VALID_MODES:
+        raise RuntimeError(
+            f"TRADING_MODE='{mode}' inválido. Válidos: {VALID_MODES}."
+        )
+    return mode
+
+
+def get_executor() -> Executor:
+    mode = current_mode()
     if mode == "live":
         print("  ⚠️  TRADING_MODE=live — LiveExecutor no implementado, abortará.")
         return LiveExecutor()

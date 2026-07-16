@@ -568,6 +568,7 @@ def send_run_summary(market_ctx, analysis, results, run_time):
 
 def _ensure_log_table():
     """Create auto_run_logs table if it doesn't exist."""
+    
     try:
         import psycopg2
         conn = psycopg2.connect(os.getenv("DATABASE_URL"))
@@ -585,7 +586,8 @@ def _ensure_log_table():
                 summary      TEXT,
                 no_trade_reason TEXT,
                 full_log     TEXT,
-                run_time_sec INTEGER
+                run_time_sec INTEGER,
+                mode         VARCHAR(10) NOT NULL DEFAULT 'paper'
             )
         """)
         conn.commit()
@@ -640,11 +642,14 @@ def _save_log_to_db(market_ctx, analysis, results, run_time, slot="unknown"):
 
         conn = psycopg2.connect(os.getenv("DATABASE_URL"))
         cur  = conn.cursor()
+        
+        from executor import current_mode
+
         cur.execute("""
             INSERT INTO auto_run_logs
                 (slot, verdict, vix, opened, closed, errors,
-                 summary, no_trade_reason, full_log, run_time_sec)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 summary, no_trade_reason, full_log, run_time_sec, mode)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id
         """, (
             slot,
@@ -657,7 +662,9 @@ def _save_log_to_db(market_ctx, analysis, results, run_time, slot="unknown"):
             no_trade[:500] if no_trade else "",
             full_log,
             int(run_time),
+            current_mode(),
         ))
+
         log_id = cur.fetchone()[0]
         conn.commit()
         cur.close()
