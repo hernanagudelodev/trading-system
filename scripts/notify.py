@@ -68,30 +68,35 @@ def _chat_id():
     return os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 
-def _build_text(title, message):
+def _build_text(title, message, mono=False):
     """
-    HTML de Telegram con TODO escapado. El cuerpo trae texto del LLM, que puede
-    contener <, > o & — sin escapar, Telegram rechaza el mensaje con 400 y el
-    aviso se pierde por un carácter.
+    HTML de Telegram con TODO escapado. El cuerpo trae texto del LLM y salida de
+    scripts, que pueden contener <, > o & — sin escapar, Telegram rechaza el
+    mensaje con 400 y el aviso se pierde por un carácter.
+
+    mono=True envuelve el cuerpo en <pre>: necesario para tablas alineadas por
+    columnas (check_open), que en fuente proporcional quedan ilegibles.
     """
     t = f"<b>{html.escape(str(title))}</b>"
     m = html.escape(str(message))
-    texto = f"{t}\n\n{m}"
-    if len(texto) > MAX_LEN:
-        marca  = "\n\n[…recortado]"
-        corte  = MAX_LEN - len(marca)
-        cuerpo = texto[:corte]
+    abre, cierra = ("<pre>", "</pre>") if mono else ("", "")
+
+    marca = "\n[…recortado]"
+    fijo  = len(t) + 2 + len(abre) + len(cierra)      # título + '\n\n' + tags
+    presupuesto = MAX_LEN - fijo
+
+    if len(m) > presupuesto:
+        corte = presupuesto - len(marca)
         # Cortar en límite de línea SOLO si el salto está cerca del corte. Si no,
         # un cuerpo sin saltos retrocedía hasta el \n del título y se perdía el
         # mensaje entero: 6000 caracteres entraban y salían 27.
-        nl = cuerpo.rfind("\n")
-        if nl > corte - 200:
-            cuerpo = cuerpo[:nl]
-        texto = cuerpo + marca
-    return texto
+        nl = m.rfind("\n", 0, corte)
+        m  = (m[:nl] if nl > corte - 200 else m[:corte]) + marca
+
+    return f"{t}\n\n{abre}{m}{cierra}"
 
 
-def send_push(title, message, priority="default", tags=None) -> bool:
+def send_push(title, message, priority="default", tags=None, mono=False) -> bool:
     """
     Manda un push por Telegram. Devuelve True SOLO si Telegram lo aceptó.
 
@@ -99,6 +104,7 @@ def send_push(title, message, priority="default", tags=None) -> bool:
     message  : cuerpo
     priority : 'min' | 'low' | 'default' | 'high' | 'urgent'
     tags     : compatibilidad con la firma vieja de monitor.py — se ignora.
+    mono     : envuelve el cuerpo en <pre> (tablas alineadas)
 
     Sin token o sin chat_id: avisa y devuelve False. Un canal sin configurar NO
     es "no había nada que notificar": es un error de config que apaga TODAS las
@@ -114,7 +120,7 @@ def send_push(title, message, priority="default", tags=None) -> bool:
     prefijo = _PREFIX.get(priority, "")
     payload = {
         "chat_id":              chat,
-        "text":                 _build_text(f"{prefijo}{title}", message),
+        "text":                 _build_text(f"{prefijo}{title}", message, mono),
         "parse_mode":           "HTML",
         "disable_notification": priority in _SILENT,
         "link_preview_options": {"is_disabled": True},
