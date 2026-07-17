@@ -145,56 +145,109 @@ def fetch_tastytrade_data():
 # SPREAD GROUPING
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _nombre_estrategia(option_type, long_strike, short_strike):
+    """
+    El nombre sale de la ESTRUCTURA, no de una suposición.
+
+        CALL, long < short -> Bull Call Spread   (débito)
+        CALL, long > short -> Bear Call Spread   (crédito)
+        PUT,  long < short -> Bull Put Spread    (crédito)
+        PUT,  long > short -> Bear Put Spread    (débito)
+
+    Antes estaba clavado en "Bull Call Spread". Derivarlo significa que un
+    spread bajista abierto a mano se etiqueta bien en vez de mentir, y que
+    cuando entre lo bajista a paper esto ya lo entiende.
+    """
+    alcista = float(long_strike) < float(short_strike)
+    if str(option_type).upper() == "CALL":
+        return "Bull Call Spread" if alcista else "Bear Call Spread"
+    return "Bull Put Spread" if alcista else "Bear Put Spread"
+
+
 def group_spreads(tt_positions):
+    """
+    Agrupa las patas crudas de Tastytrade en spreads verticales de 2 patas.
+
+    EL BUG QUE ESTO ARREGLA
+        La versión anterior sólo miraba CALLS:
+            if pos["option_type"] == "CALL":
+        Un Bull Put Spread —27 de tus 43 trades, la estrategia mayoritaria—
+        nunca se agrupaba: las dos patas caían en `singles` y quedaban sueltas.
+        O sea que un BPS abierto en vivo viviría en el broker y jamás en
+        `positions`: el monitor no lo vería y no tendría stop loss.
+
+    LA MATEMÁTICA YA SERVÍA
+        net_debit = long.avg_open - short.avg_open
+        En un BPS el long es el strike BAJO (put barato) y el short el ALTO
+        (put caro), así que da NEGATIVO = crédito — exactamente la convención
+        del sistema. No hubo que inventar nada: faltaban el filtro y el nombre.
+    """
     spreads = []
     singles = []
     used    = set()
 
-    calls_by_key = {}
+    # Se agrupa por (ticker, expiración, tipo). Antes la clave no llevaba el
+    # tipo porque sólo entraban calls; ahora sin él un call y un put del mismo
+    # ticker y expiración se emparejarían entre sí.
+    por_clave = {}
     for i, pos in enumerate(tt_positions):
-        if pos["option_type"] == "CALL":
-            key = (pos["ticker"], str(pos["expiration"]))
-            calls_by_key.setdefault(key, []).append((i, pos))
+        tipo = str(pos.get("option_type", "")).upper()
+        if tipo not in ("CALL", "PUT"):
+            continue
+        key = (pos["ticker"], str(pos["expiration"]), tipo)
+        por_clave.setdefault(key, []).append((i, pos))
 
-    for key, legs in calls_by_key.items():
-        if len(legs) == 2:
-            idx_a, leg_a = legs[0]
-            idx_b, leg_b = legs[1]
+    for (ticker, exp, tipo), legs in por_clave.items():
+        if len(legs) != 2:
+            continue
 
-            if leg_a.get("quantity_direction") == "Long":
-                long_leg, short_leg = leg_a, leg_b
-                long_idx, short_idx = idx_a, idx_b
-            elif leg_b.get("quantity_direction") == "Long":
-                long_leg, short_leg = leg_b, leg_a
-                long_idx, short_idx = idx_b, idx_a
-            elif leg_a["strike"] < leg_b["strike"]:
-                long_leg, short_leg = leg_a, leg_b
-                long_idx, short_idx = idx_a, idx_b
-            else:
-                long_leg, short_leg = leg_b, leg_a
-                long_idx, short_idx = idx_b, idx_a
+        idx_a, leg_a = legs[0]
+        idx_b, leg_b = legs[1]
 
-            net_debit  = round(long_leg["avg_open_price"] - short_leg["avg_open_price"], 2)
-            total_cost = round(net_debit * abs(long_leg["quantity"]) * 100, 2)
+        if leg_a.get("quantity_direction") == "Long":
+            long_leg, short_leg = leg_a, leg_b
+            long_idx, short_idx = idx_a, idx_b
+        elif leg_b.get("quantity_direction") == "Long":
+            long_leg, short_leg = leg_b, leg_a
+            long_idx, short_idx = idx_b, idx_a
+        elif leg_a["strike"] < leg_b["strike"]:
+            # Sin dirección: se asume alcista (long = strike bajo), que es lo
+            # único que el sistema abre. Un bajista manual caería mal acá.
+            long_leg, short_leg = leg_a, leg_b
+            long_idx, short_idx = idx_a, idx_b
+        else:
+            long_leg, short_leg = leg_b, leg_a
+            long_idx, short_idx = idx_b, idx_a
 
-            spreads.append({
-                "type":                   "Bull Call Spread",
-                "ticker":                 long_leg["ticker"],
-                "expiration":             long_leg["expiration"],
-                "strike_low":             long_leg["strike"],
-                "strike_high":            short_leg["strike"],
-                "contracts":              abs(long_leg["quantity"]),
-                "premium_paid":           net_debit,
-                "total_cost":             total_cost,
-                "avg_open_long":          long_leg["avg_open_price"],
-                "avg_open_short":         short_leg["avg_open_price"],
-                "symbol_long":            long_leg["symbol"],
-                "symbol_short":           short_leg["symbol"],
-                "tastytrade_symbol":      long_leg["symbol"],
-                "tastytrade_symbol_short": short_leg["symbol"],
-            })
-            used.add(long_idx)
-            used.add(short_idx)
+        net_debit  = round(long_leg["avg_open_price"] - short_leg["avg_open_price"], 2)
+        contracts  = abs(long_leg["quantity"])
+        total_cost = round(net_debit * contracts * 100, 2)
+
+        # strike_low/high son NUMÉRICOS, no "el del long / el del short".
+        # En un bear call spread el long es el strike ALTO: asumir lo contrario
+        # invertía los campos, y position_max_loss y pricing esperan low < high.
+        s_long, s_short = float(long_leg["strike"]), float(short_leg["strike"])
+        strike_low, strike_high = min(s_long, s_short), max(s_long, s_short)
+
+        spreads.append({
+            "type":                    _nombre_estrategia(tipo, s_long, s_short),
+            "option_type":             tipo,
+            "ticker":                  long_leg["ticker"],
+            "expiration":              long_leg["expiration"],
+            "strike_low":              strike_low,
+            "strike_high":             strike_high,
+            "contracts":               contracts,
+            "premium_paid":            net_debit,     # >0 débito · <0 crédito
+            "total_cost":              total_cost,
+            "avg_open_long":           long_leg["avg_open_price"],
+            "avg_open_short":          short_leg["avg_open_price"],
+            "symbol_long":             long_leg["symbol"],
+            "symbol_short":            short_leg["symbol"],
+            "tastytrade_symbol":       long_leg["symbol"],
+            "tastytrade_symbol_short": short_leg["symbol"],
+        })
+        used.add(long_idx)
+        used.add(short_idx)
 
     for i, pos in enumerate(tt_positions):
         if i not in used:
