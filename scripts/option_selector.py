@@ -648,3 +648,60 @@ def portfolio_risk_pct() -> float:
             "live: sin ella el gate de cartera no rechazaría nada."
         )
     return float(raw)
+
+
+def spread_pnl(strike_low, strike_high, premium_paid, contracts, spread_value):
+    """
+    P&L de un spread vertical de 2 patas a un `spread_value` dado.
+
+    FUENTE ÚNICA. Antes esta matemática vivía en DOS lugares:
+        monitor.run_paper_monitor  (línea ~971)
+        trade.cmd_paper_close      (línea ~440)
+    Y ya habían divergido: el monitor NO multiplicaba por `contracts`. En paper
+    no se nota —el INSERT lo tiene clavado en 1— pero en live `contracts` viene
+    del broker, y el P&L del monitor saldría mal por el multiplicador.
+    Es el mismo bug que tenía check_open.py. Las copias se separan solas.
+
+    MANDA EL SIGNO, no el string de strategy:
+        premium_paid > 0  débito  (BCS): pagaste al abrir, cobrás al cerrar
+        premium_paid < 0  crédito (BPS): cobraste al abrir, pagás al cerrar
+    Así un Bear Call Spread —que también es crédito— sale bien sin nombrarlo.
+
+    spread_value : valor actual del spread por acción, POSITIVO
+                   (lo que devuelve pricing.get_spread_value)
+
+    Devuelve dict con max_profit, max_loss, current_value, gross_pnl, pnl_pct,
+    profit_pct_of_max, strategy_type. pnl_pct y profit_pct_of_max pueden ser
+    None si la base es cero: sin dato -> None, nunca un 0 que miente.
+    """
+    width = abs(float(strike_high) - float(strike_low))
+    prem  = float(premium_paid)
+    n     = int(contracts or 1)
+    sv    = abs(float(spread_value))
+
+    if prem < 0:
+        # CRÉDITO. Cobraste `net_credit` al abrir; cerrar cuesta `current_value`.
+        net_credit    = abs(prem)
+        max_profit    = round(net_credit * n * 100, 2)
+        current_value = round(sv * n * 100, 2)          # costo de cerrar
+        gross_pnl     = round(max_profit - current_value, 2)
+        base_pct      = max_profit
+        tipo          = "credit_spread"
+    else:
+        # DÉBITO. Pagaste `total_cost` al abrir; cerrar te paga `current_value`.
+        total_cost    = round(prem * n * 100, 2)
+        max_profit    = round((width - prem) * n * 100, 2)
+        current_value = round(sv * n * 100, 2)
+        gross_pnl     = round(current_value - total_cost, 2)
+        base_pct      = total_cost
+        tipo          = "debit_spread"
+
+    return {
+        "max_profit":        max_profit,
+        "max_loss":          position_max_loss(strike_low, strike_high, prem, n),
+        "current_value":     current_value,
+        "gross_pnl":         gross_pnl,
+        "pnl_pct":           round(gross_pnl / base_pct * 100, 2) if base_pct else None,
+        "profit_pct_of_max": round(gross_pnl / max_profit, 4) if max_profit else None,
+        "strategy_type":     tipo,
+    }

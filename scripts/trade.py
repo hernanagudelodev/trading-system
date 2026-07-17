@@ -910,22 +910,16 @@ def cmd_paper_sync():
             print("no data")
             continue
 
-        spread_width = strike_high - strike_low
+        # P&L: fuente ÚNICA en option_selector.spread_pnl. Era la TERCERA copia
+        # de esta matemática (con cmd_paper_close y run_paper_monitor).
+        from option_selector import spread_pnl
+        r = spread_pnl(strike_low, strike_high, premium, contracts, spread_value)
 
-        if is_put:
-            net_credit    = abs(premium)
-            max_profit    = round(net_credit * contracts * 100, 2)
-            cost_to_close = round(spread_value * contracts * 100, 2)
-            current_value = cost_to_close
-            gross_pnl     = round(max_profit - cost_to_close, 2)
-            pnl_pct       = round(gross_pnl / max_profit * 100, 2) if max_profit else 0
-            profit_pct_max = round(gross_pnl / max_profit, 4) if max_profit else 0
-        else:
-            max_profit     = round((spread_width - premium) * contracts * 100, 2)
-            current_value  = round(spread_value * contracts * 100, 2)
-            gross_pnl      = round(current_value - total_cost, 2)
-            pnl_pct        = round(gross_pnl / total_cost * 100, 2) if total_cost else 0
-            profit_pct_max = round(gross_pnl / max_profit, 4) if max_profit else 0
+        max_profit     = r["max_profit"]
+        current_value  = r["current_value"]
+        gross_pnl      = r["gross_pnl"]
+        pnl_pct        = r["pnl_pct"] if r["pnl_pct"] is not None else 0
+        profit_pct_max = r["profit_pct_of_max"] if r["profit_pct_of_max"] is not None else 0
 
         print(f"spread=${spread_value:.2f} | P&L ${gross_pnl:+.2f} ({pnl_pct:+.1f}%)")
 
@@ -1070,25 +1064,17 @@ def cmd_paper_close(ticker):
         conn.close()
         return False
 
-    total_cost   = float(total_cost)
-    premium      = float(premium)
-    contracts    = int(contracts)
-    spread_width = float(sh) - float(sl)
+    # P&L: fuente ÚNICA en option_selector.spread_pnl. Esta matemática vivía
+    # copiada acá y en monitor.run_paper_monitor, y ya habían divergido — el
+    # monitor no multiplicaba por `contracts`. Idénticas con 1 contrato (que es
+    # todo lo que paper abre hoy), distintas apenas haya más.
+    from option_selector import spread_pnl
+    r = spread_pnl(float(sl), float(sh), float(premium), int(contracts), spread_value)
 
-    if is_put:
-        net_credit     = abs(premium)
-        max_profit     = round(net_credit * contracts * 100, 2)
-        cost_to_close  = round(spread_value * contracts * 100, 2)
-        current_value  = cost_to_close
-        gross_pnl      = round(max_profit - cost_to_close, 2)
-        pnl_pct        = round(gross_pnl / max_profit * 100, 2) if max_profit else 0
-        profit_pct_max = round(gross_pnl / max_profit, 4) if max_profit else 0
-    else:
-        max_profit     = round((spread_width - premium) * contracts * 100, 2)
-        current_value  = round(spread_value * contracts * 100, 2)
-        gross_pnl      = round(current_value - total_cost, 2)
-        pnl_pct        = round(gross_pnl / total_cost * 100, 2) if total_cost else 0
-        profit_pct_max = round(gross_pnl / max_profit, 4) if max_profit else 0
+    current_value  = r["current_value"]
+    gross_pnl      = r["gross_pnl"]
+    pnl_pct        = r["pnl_pct"] if r["pnl_pct"] is not None else 0
+    profit_pct_max = r["profit_pct_of_max"] if r["profit_pct_of_max"] is not None else 0
 
     cur.execute("""
         UPDATE paper_positions SET
