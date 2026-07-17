@@ -437,7 +437,38 @@ def insert_position(tt_pos, account_number):
     return pos_id
 
 
-def close_position_in_db(db_pos_id, tt_pos, close_reason="Closed in Tastytrade"):
+def close_position_in_db(db_pos_id, close_price, close_reason="Closed in Tastytrade"):
+    """
+    Marca una posición real como cerrada.
+
+    close_price : prima RECIBIDA por acción al cerrar (float), o None si no se
+                  conoce. NO se inventa. None -> el P&L queda NULL.
+    Devuelve el gross_pnl, o None si no se pudo calcular.
+
+    EL BUG QUE ESTO ARREGLA — 17-jul, con plata real
+        La firma anterior recibía `tt_pos` y hacía:
+            close_price = tt_pos["mark"] if tt_pos else 0.0
+        Pero run_sync SIEMPRE pasa None: detecta el cierre justamente porque la
+        posición YA NO ESTÁ en Tastytrade — no hay `mark` que consultar. O sea
+        que el `else 0.0` no era un fallback: era el único camino.
+        Resultado real: CCL abrió a 0.44, cerró a 0.43 (P&L real -$1, NLV -$3.50
+        con comisiones) y la DB registró P&L = -$44.00. La pérdida máxima entera.
+        Un error de 44x, sin excepción, sin aviso, con números plausibles.
+
+        Es el mismo `0.0` que ya cazaste en cmd_paper_close y corregiste ahí.
+        Esta copia quedó viva porque nadie había cerrado una posición REAL nunca.
+
+    POR QUÉ NULL Y NO 0
+        Que el broker no la tenga es un HECHO: se marca CLOSED. Cuánto se ganó
+        NO se sabe: se marca NULL. Un 0 y un -44 son los dos mentiras; NULL es
+        la verdad. Sin dato real -> None, nunca 0.0 (§10).
+
+    DE DÓNDE SALE EL PRECIO
+        Sólo lo sabe quien ejecutó el cierre, en el momento del fill
+        (LiveExecutor lo tiene en r.fill_price). run_sync corre después, cuando
+        la posición ya desapareció y el dato se perdió. Un cierre sincronizado
+        a posteriori queda como CLOSED_PRICE_UNKNOWN, a propósito.
+    """
     conn = get_db_connection()
     cur  = conn.cursor()
     cur.execute("""
@@ -448,15 +479,35 @@ def close_position_in_db(db_pos_id, tt_pos, close_reason="Closed in Tastytrade")
     if not row:
         cur.close()
         conn.close()
-        return
+        return None
 
     total_cost, contracts, premium_paid = row
-    total_cost   = float(total_cost or 0)
-    contracts    = int(contracts or 1)
-    close_price  = tt_pos["mark"] if tt_pos else 0.0
+    total_cost = float(total_cost or 0)
+    contracts  = int(contracts or 1)
+
+    # ── Sin precio: se cierra, pero NO se inventa el P&L ──────────────────────
+    if close_price is None:
+        cur.execute("""
+            UPDATE positions SET
+                status           = 'CLOSED',
+                closed_at        = NOW(),
+                premium_received = NULL,
+                total_received   = NULL,
+                gross_pnl        = NULL,
+                net_pnl          = NULL,
+                pnl_pct          = NULL,
+                close_reason     = %s
+            WHERE id = %s
+        """, ("CLOSED_PRICE_UNKNOWN", db_pos_id))
+        conn.commit()
+        cur.close()
+        conn.close()
+        return None
+
+    close_price    = float(close_price)
     total_received = round(close_price * contracts * 100, 2)
-    gross_pnl    = round(total_received - total_cost, 2)
-    pnl_pct      = round(gross_pnl / total_cost * 100, 2) if total_cost else 0
+    gross_pnl      = round(total_received - total_cost, 2)
+    pnl_pct        = round(gross_pnl / total_cost * 100, 2) if total_cost else None
 
     cur.execute("""
         UPDATE positions SET
@@ -1094,15 +1145,25 @@ def run_sync():
             both_gone = (sym_long not in tt_all_symbols and
                          sym_short not in tt_all_symbols)
             if both_gone:
+                # None a propósito: la posición ya no está en Tastytrade, así que
+                # el precio de salida no existe acá. Queda CLOSED_PRICE_UNKNOWN
+                # con P&L NULL. Antes esto registraba la pérdida máxima entera.
                 pnl = close_position_in_db(db_pos["id"], None, "Closed in Tastytrade")
                 print(f"\n  CLOSED spread: {db_pos['ticker']} (DB id={db_pos['id']})")
-                print(f"    P&L: ${pnl:.2f}" if pnl is not None else "    P&L: unknown")
+                if pnl is None:
+                    print(f"    P&L: SIN DATO — el precio de salida no lo sabe el sync.")
+                    print(f"         Marcada CLOSED_PRICE_UNKNOWN, no se inventa un número.")
+                else:
+                    print(f"    P&L: ${pnl:.2f}")
                 closed_count += 1
         else:
             if sym_long and sym_long not in tt_all_symbols:
                 pnl = close_position_in_db(db_pos["id"], None, "Closed in Tastytrade")
                 print(f"\n  CLOSED position: {db_pos['ticker']} (DB id={db_pos['id']})")
-                print(f"    P&L: ${pnl:.2f}" if pnl is not None else "    P&L: unknown")
+                if pnl is None:
+                    print(f"    P&L: SIN DATO — marcada CLOSED_PRICE_UNKNOWN.")
+                else:
+                    print(f"    P&L: ${pnl:.2f}")
                 closed_count += 1
 
     print(f"\n{'=' * 55}")
