@@ -79,6 +79,38 @@ class PaperExecutor(Executor):
             return False
 
 
+def _buscar_posicion_abierta(ticker):
+    """
+    Busca en `positions` la posición OPEN de este ticker.
+    Devuelve (id, contracts) o (None, motivo).
+
+    No adivina: 0 filas o más de 1 -> None y el motivo. Cerrar la fila
+    equivocada es peor que no cerrar ninguna.
+    """
+    import os
+    import psycopg2
+    try:
+        conn = psycopg2.connect(os.getenv("DATABASE_URL"))
+        cur  = conn.cursor()
+        cur.execute("""
+            SELECT id, contracts FROM positions
+            WHERE UPPER(ticker) = %s AND UPPER(status) = 'OPEN'
+            ORDER BY id DESC
+        """, (ticker.upper(),))
+        filas = cur.fetchall()
+        cur.close(); conn.close()
+    except Exception as e:
+        return None, f"no se pudo leer la DB: {e}"
+
+    if not filas:
+        return None, (f"{ticker} no está OPEN en `positions` — el broker la cerró "
+                      f"pero la DB nunca la tuvo")
+    if len(filas) > 1:
+        return None, (f"{ticker} tiene {len(filas)} filas OPEN en `positions` "
+                      f"(ids {[f[0] for f in filas]}) — no se elige a ciegas")
+    return filas[0], None
+
+
 class LiveExecutor(Executor):
     """
     Ejecución REAL. El ciclo de vida de la orden vive en broker_orders.py; acá
@@ -173,6 +205,38 @@ class LiveExecutor(Executor):
 
         print(f"  [live] {ticker} cierre llenó · id={r.order_id} · "
               f"fill={r.fill_price}")
+
+        # ── REGISTRAR EL PRECIO DE SALIDA ─────────────────────────────────────
+        # Este es el ÚNICO momento en que el precio de salida existe. En cuanto
+        # la posición desaparece del broker, el dato se pierde para siempre:
+        # run_sync detecta el cierre justamente porque ya no está, así que no
+        # tiene qué precio consultar y marca CLOSED_PRICE_UNKNOWN.
+        # El 17-jul CCL cerró a 0.43 y la DB registró -$44.00 (la pérdida máxima
+        # entera) porque nadie escribió este número.
+        #
+        # SIGNO: r.fill_price viene en la convención del sistema (>0 débito,
+        # <0 crédito). close_position_in_db espera la prima RECIBIDA por acción.
+        # Cerrar un BCS: fill -0.43 = crédito 0.43 = recibiste 0.43 -> se invierte.
+        if r.fill_price is None:
+            print(f"  [live] ⚠️  el broker no dio precio de fill — el P&L de "
+                  f"{ticker} va a quedar SIN DATO, no en cero.")
+        else:
+            recibido = -float(r.fill_price)
+            fila, motivo = _buscar_posicion_abierta(ticker)
+            if fila is None:
+                print(f"  [live] ⚠️  no se pudo registrar el P&L: {motivo}")
+            else:
+                pos_id, _ = fila
+                try:
+                    import trade as trade_module
+                    pnl = trade_module.close_position_in_db(
+                        pos_id, recibido, f"CLOSED_LIVE: {reason}")
+                    print(f"  [live] DB id={pos_id} cerrada · prima recibida "
+                          f"${recibido:.2f} · P&L ${pnl:.2f}"
+                          if pnl is not None else
+                          f"  [live] DB id={pos_id} cerrada · P&L sin dato")
+                except Exception as e:
+                    print(f"  [live] ⚠️  no se pudo escribir el cierre en la DB: {e}")
 
         # La confirmación no es el fill: es que el broker no tenga nada.
         if not verificar_cerrada(ticker):
