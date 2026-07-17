@@ -8,13 +8,17 @@ nada de paper ni live. Un Executor las ejecuta. La bandera TRADING_MODE elige QU
 executor se instancia UNA sola vez — no hay 'if paper' desperdigado por el código.
 
     PaperExecutor : escribe en la DB (comportamiento actual, sin cambios)
-    LiveExecutor  : manda órdenes al broker + reconcilia (NO implementado aún)
+    LiveExecutor  : manda órdenes al broker (implementado en la rama `live`;
+                    acá es un stub que se niega a correr, a propósito: si algún
+                    día TRADING_MODE=live cae en el worker de paper, explota en
+                    vez de operar)
 
 Uso desde auto_run:
     from executor import get_executor, OpenIntent
     ex = get_executor()                      # lee TRADING_MODE, default 'paper'
     ok = ex.open_position(OpenIntent(...))   # bool: ejecutado o no
     ok = ex.close_position(ticker, reason)   # bool
+    ex.sync_after_opens()                    # una vez por run, tras las aperturas
 """
 import os
 from dataclasses import dataclass
@@ -34,7 +38,7 @@ class OpenIntent:
 
 
 class Executor:
-    """Interfaz común. Ambos modos implementan estos dos métodos."""
+    """Interfaz común entre auto_run y el mundo real."""
     mode = "base"
 
     def open_position(self, intent: OpenIntent) -> bool:
@@ -42,6 +46,26 @@ class Executor:
 
     def close_position(self, ticker: str, reason: str) -> bool:
         raise NotImplementedError
+
+    def sync_after_opens(self) -> None:
+        """
+        Se llama UNA vez por run, después del bucle de aperturas.
+
+        Paper: no hace nada — cmd_paper_buy ya escribió la fila.
+        Live : baja del broker lo que se acaba de abrir. Sin esto la posición
+               existe en Tastytrade y NO en `positions`, y el monitor lee
+               `positions`: quedaría sin stop loss hasta el próximo run.
+
+        POR QUÉ ES UN MÉTODO Y NO UN `if mode == "live"` EN auto_run
+            Porque la bandera vive en get_executor() y en ningún otro lado.
+            auto_run llama esto sin preguntar de qué modo es; cada executor sabe
+            si tiene algo que sincronizar. Una bandera chequeada en dos lugares
+            son dos lugares donde puede discrepar.
+
+        No-op por default, no NotImplementedError: sincronizar es OPCIONAL, y un
+        executor que no lo necesita no tiene por qué declararlo.
+        """
+        pass
 
 
 class PaperExecutor(Executor):

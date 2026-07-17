@@ -528,6 +528,19 @@ def execute_recommendations(analysis):
             print(f"  Error opening {ticker}: {e}")
             results["errors"].append(f"Open {ticker}: {e}")
 
+
+    # La DB no sabe nada de lo que se acaba de abrir. El executor decide si hace
+    # falta sincronizar: paper no (cmd_paper_buy ya escribió), live sí. Se llama
+    # sin preguntar el modo — la bandera vive en get_executor() y en ningún otro
+    # lado.
+    if results["opened"]:
+        try:
+            executor.sync_after_opens()
+        except Exception as e:
+            msg = f"sync post-apertura falló: {e}"
+            print(f"  ⚠️  {msg}")
+            results["errors"].append(msg)
+
     return results
 
 
