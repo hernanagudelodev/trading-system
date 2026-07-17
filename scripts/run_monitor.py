@@ -46,65 +46,115 @@ from monitor import (
 # AUTO RUN SCHEDULING
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Track last auto_run to avoid double-runs
-_last_auto_run_date  = None
-_last_auto_run_slot  = None  # 'morning' or 'afternoon'
+# ── DEDUPLICACIÓN ────────────────────────────────────────────────────────────
+# En memoria: evita que el loop dispare dos veces el mismo slot en este proceso.
+# NO sobrevive a un reinicio — para eso está _ya_corrio_hoy(), que pregunta a la
+# DB. Railway reinicia el contenedor en cada deploy, y sin el chequeo de DB un
+# deploy dentro de la ventana dispararía un segundo run del mismo slot.
+_corridos_hoy = set()          # {(date, 'morning'), (date, 'afternoon')}
 
 AUTO_RUN_SLOTS = [
     {"name": "morning",   "hour_et": 10, "minute_et": 0},
     {"name": "afternoon", "hour_et": 14, "minute_et": 30},
 ]
 
+# El loop hace sleep(60) DESPUÉS de trabajar, y scheduled_run() tarda segundos
+# priceando posiciones. O sea que cada vuelta son 60s + trabajo: el reloj deriva.
+# Con la condición original —`et_now.minute == m`, un minuto exacto— basta con
+# que una vuelta caiga a las 09:59:58 y la siguiente a las 10:01:03 para que el
+# slot NO se dispare en todo el día, sin error y sin aviso. Pasó el 17-jul.
+# La ventana lo absorbe; la deduplicación evita que dispare de más.
+VENTANA_MIN = 15
+
+
 def _get_et_time():
-    """Get current time in ET (UTC-4 in summer, UTC-5 in winter)."""
+    """
+    Hora en Nueva York, con zoneinfo — no con una aproximación.
+
+    La versión anterior hacía:
+        offset = -4 if 3 <= month <= 11 else -5
+    EE.UU. sale del horario de verano el PRIMER DOMINGO DE NOVIEMBRE, así que
+    con esa cuenta todo noviembre quedaba en EDT y el auto_run habría corrido
+    una hora antes de lo previsto — 9:00 ET en vez de 10:00. zoneinfo es stdlib
+    y conoce las reglas de verdad.
+    """
     import datetime as dt
-    utc_now = dt.datetime.now(dt.timezone.utc)
-    # Simple DST approximation: EDT (UTC-4) Mar-Nov, EST (UTC-5) Nov-Mar
-    month = utc_now.month
-    offset = -4 if 3 <= month <= 11 else -5
-    et_now = utc_now + dt.timedelta(hours=offset)
-    return et_now
+    from zoneinfo import ZoneInfo
+    return dt.datetime.now(dt.timezone.utc).astimezone(ZoneInfo("America/New_York"))
+
+
+def _ya_corrio_hoy(slot_name, hoy_et):
+    """
+    ¿Ya hay un run de este slot hoy en auto_run_logs?
+
+    Sobrevive a un reinicio, que es justo lo que la marca en memoria no hace.
+    run_at está en UTC; se compara contra el rango del día en ET.
+
+    Ante un error de DB devuelve False: preferimos un run de más a ninguno.
+    Un run duplicado lo frena el bloqueo de concentración; un run que falta no
+    lo frena nadie.
+    """
+    try:
+        import os
+        import psycopg2
+        conn = psycopg2.connect(os.getenv("DATABASE_URL"))
+        cur  = conn.cursor()
+        cur.execute("""
+            SELECT COUNT(*) FROM auto_run_logs
+            WHERE slot = %s
+              AND (run_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/New_York')::date = %s
+        """, (slot_name, hoy_et))
+        n = cur.fetchone()[0]
+        cur.close(); conn.close()
+        return n > 0
+    except Exception as e:
+        print(f"  ⚠️  no se pudo verificar si {slot_name} ya corrió ({e}) — se asume que no")
+        return False
 
 
 def should_run_auto():
     """
-    Returns the slot name if it's time to run auto_run, else None.
-    Runs once per slot per day — prevents double-runs from loop timing.
+    Devuelve el nombre del slot si toca correr, o None.
     """
-    global _last_auto_run_date, _last_auto_run_slot
+    et_now  = _get_et_time()
+    today   = et_now.date()
 
-    et_now   = _get_et_time()
-    today    = et_now.date()
-    weekday  = et_now.weekday()
-
-    # Only on weekdays
-    if weekday >= 5:
+    if et_now.weekday() >= 5:
         return None
 
-    for slot in AUTO_RUN_SLOTS:
-        h, m = slot["hour_et"], slot["minute_et"]
+    ahora_min = et_now.hour * 60 + et_now.minute
 
-        # Window: exactly on the minute (loop checks every 60s)
-        if et_now.hour == h and et_now.minute == m:
-            # Check we haven't already run this slot today
-            if _last_auto_run_date == today and _last_auto_run_slot == slot["name"]:
-                return None
-            return slot["name"]
+    for slot in AUTO_RUN_SLOTS:
+        slot_min = slot["hour_et"] * 60 + slot["minute_et"]
+        atraso   = ahora_min - slot_min
+
+        # Ventana, no un minuto exacto.
+        if not (0 <= atraso < VENTANA_MIN):
+            continue
+
+        if (today, slot["name"]) in _corridos_hoy:
+            return None
+        if _ya_corrio_hoy(slot["name"], today):
+            _corridos_hoy.add((today, slot["name"]))
+            return None
+
+        if atraso > 0:
+            print(f"  ⏱  slot '{slot['name']}' con {atraso}min de atraso — se dispara igual")
+        return slot["name"]
 
     return None
 
 
 def run_auto():
     """Import and run auto_run.main() in-process."""
-    global _last_auto_run_date, _last_auto_run_slot
-
     et_now = _get_et_time()
     slot   = should_run_auto()
     if not slot:
         return
 
-    _last_auto_run_date = et_now.date()
-    _last_auto_run_slot = slot
+    # Se marca ANTES de correr: si auto_run revienta, no se reintenta en bucle
+    # dentro de la ventana.
+    _corridos_hoy.add((et_now.date(), slot))
 
     print(f"\n{'═' * 55}")
     print(f"  AUTO RUN ({slot}) — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
