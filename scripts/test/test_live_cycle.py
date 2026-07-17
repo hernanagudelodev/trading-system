@@ -7,11 +7,11 @@ CICLO COMPLETO CON PLATA REAL. Abre, verifica, guarda en la DB, cierra, verifica
 
 QUÉ PRUEBA
     Que el camino entero funciona de punta a punta con el broker real:
-        LiveExecutor.open_position  -> broker_orders.abrir_spread
+        LiveExecutor.open_position  -> broker_orders.open_spread
         account.get_positions()     -> ¿existe de verdad?
         trade.run_sync()            -> tabla `positions`
-        LiveExecutor.close_position -> broker_orders.cerrar_spread
-        verificar_cerrada()         -> ¿el broker dice cero?
+        LiveExecutor.close_position -> broker_orders.close_spread
+        verify_closed()         -> ¿el broker dice cero?
 
     Nada de esto es código nuevo. El script solo los llama en orden.
 
@@ -116,7 +116,7 @@ async def _elegir_estructura(ticker):
 
 def main(ticker):
     from executor import OpenIntent, LiveExecutor
-    from broker_orders import executor_env, verificar_cerrada, _contar_patas
+    from broker_orders import executor_env, verify_closed, _count_legs
     from option_selector import position_max_loss, MIN_SPREAD_WIDTH
     import pricing
 
@@ -157,13 +157,13 @@ def main(ticker):
         )
 
     # ── Candado 3: el ticker tiene que estar LIMPIO ──────────────────────────
-    previas = asyncio.run(_contar_patas(ticker))
+    previas = asyncio.run(_count_legs(ticker))
     if previas:
         print(f"\n  ⛔ el broker YA tiene {len(previas)} pata(s) de {ticker}:")
         for pp in previas:
             print(f"       {pp.symbol}  qty={pp.quantity} {pp.quantity_direction}")
         print(f"\n     Abrir otra dejaría {len(previas)+2} patas: el paso 3 abortaría")
-        print(f"     DESPUÉS de abrir, y cerrar_spread exige exactamente 2 — o sea")
+        print(f"     DESPUÉS de abrir, y close_spread exige exactamente 2 — o sea")
         print(f"     que la nueva quedaría abierta. Cerrá esas primero.")
         return
     print(f"\n  ✓ el broker no tiene ninguna pata de {ticker}")
@@ -203,7 +203,7 @@ def main(ticker):
         # ══ 3 · ¿ESTÁ ABIERTA? ════════════════════════════════════════════════
         sep("3 · ¿EL BROKER LA TIENE?")
         time.sleep(3)                     # que la posición asiente en el broker
-        patas = asyncio.run(_contar_patas(ticker))
+        patas = asyncio.run(_count_legs(ticker))
         print(f"\n  {len(patas)} pata(s) de {ticker} en el broker:")
         for p in patas:
             print(f"    {p.symbol}  qty={p.quantity} {p.quantity_direction} "
@@ -231,7 +231,7 @@ def main(ticker):
         # ══ 6 · ¿CERRÓ? ═══════════════════════════════════════════════════════
         sep("6 · ¿EL BROKER DICE CERO?")
         time.sleep(2)
-        if verificar_cerrada(ticker):
+        if verify_closed(ticker):
             abierta = False
 
     finally:

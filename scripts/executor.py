@@ -121,18 +121,18 @@ def _buscar_posicion_abierta(ticker):
             WHERE UPPER(ticker) = %s AND UPPER(status) = 'OPEN'
             ORDER BY id DESC
         """, (ticker.upper(),))
-        filas = cur.fetchall()
+        rows = cur.fetchall()
         cur.close(); conn.close()
     except Exception as e:
         return None, f"no se pudo leer la DB: {e}"
 
-    if not filas:
+    if not rows:
         return None, (f"{ticker} no está OPEN en `positions` — el broker la cerró "
                       f"pero la DB nunca la tuvo")
-    if len(filas) > 1:
-        return None, (f"{ticker} tiene {len(filas)} filas OPEN en `positions` "
-                      f"(ids {[f[0] for f in filas]}) — no se elige a ciegas")
-    return filas[0], None
+    if len(rows) > 1:
+        return None, (f"{ticker} tiene {len(rows)} rows OPEN en `positions` "
+                      f"(ids {[f[0] for f in rows]}) — no se elige a ciegas")
+    return rows[0], None
 
 
 class LiveExecutor(Executor):
@@ -161,9 +161,9 @@ class LiveExecutor(Executor):
     mode = "live"
 
     def open_position(self, intent: OpenIntent) -> bool:
-        from broker_orders import abrir_spread
+        from broker_orders import open_spread
 
-        r = abrir_spread(intent)
+        r = open_spread(intent)
 
         if r.ok:
             print(f"  [live] {intent.ticker} LLENA · id={r.order_id} · "
@@ -172,7 +172,7 @@ class LiveExecutor(Executor):
             # auto_run termina el bucle de aperturas.
             return True
 
-        if r.estado == "partial":
+        if r.status == "partial":
             # Lo peor que puede pasar. Push urgente y parar.
             try:
                 from notify import send_push
@@ -187,10 +187,10 @@ class LiveExecutor(Executor):
                 )
             except Exception as e:
                 print(f"  [live] no se pudo avisar de la pata suelta: {e}")
-            print(f"  [live] ⛔ {intent.ticker}: {r.detalle}")
+            print(f"  [live] ⛔ {intent.ticker}: {r.detail}")
             return False
 
-        print(f"  [live] {intent.ticker} NO abierta ({r.estado}): {r.detalle}")
+        print(f"  [live] {intent.ticker} NO abierta ({r.status}): {r.detail}")
         return False
 
     def close_position(self, ticker: str, reason: str) -> bool:
@@ -202,11 +202,11 @@ class LiveExecutor(Executor):
         te quedaste con una posición real creyendo que no. Mismo espíritu que
         cmd_paper_close devolviendo False cuando no pudo pricear.
         """
-        from broker_orders import cerrar_spread, verificar_cerrada
+        from broker_orders import close_spread, verify_closed
 
-        r = cerrar_spread(ticker, reason)
+        r = close_spread(ticker, reason)
 
-        if r.estado == "partial":
+        if r.status == "partial":
             try:
                 from notify import send_push
                 send_push(
@@ -218,11 +218,11 @@ class LiveExecutor(Executor):
                 )
             except Exception as e:
                 print(f"  [live] no se pudo avisar de la pata suelta: {e}")
-            print(f"  [live] ⛔ {ticker}: {r.detalle}")
+            print(f"  [live] ⛔ {ticker}: {r.detail}")
             return False
 
         if not r.ok:
-            print(f"  [live] {ticker} NO cerrada ({r.estado}): {r.detalle}")
+            print(f"  [live] {ticker} NO cerrada ({r.status}): {r.detail}")
             return False
 
         print(f"  [live] {ticker} cierre llenó · id={r.order_id} · "
@@ -240,15 +240,15 @@ class LiveExecutor(Executor):
         # <0 crédito). close_position_in_db espera la prima RECIBIDA por acción.
         # Cerrar un BCS: fill -0.43 = crédito 0.43 = recibiste 0.43 -> se invierte.
         if r.fill_price is None:
-            print(f"  [live] ⚠️  el broker no dio precio de fill — el P&L de "
+            print(f"  [live] ⚠️  el broker no dio price de fill — el P&L de "
                   f"{ticker} va a quedar SIN DATO, no en cero.")
         else:
             recibido = -float(r.fill_price)
-            fila, motivo = _buscar_posicion_abierta(ticker)
-            if fila is None:
-                print(f"  [live] ⚠️  no se pudo registrar el P&L: {motivo}")
+            row, why = _buscar_posicion_abierta(ticker)
+            if row is None:
+                print(f"  [live] ⚠️  no se pudo registrar el P&L: {why}")
             else:
-                pos_id, _ = fila
+                pos_id, _ = row
                 try:
                     import trade as trade_module
                     pnl = trade_module.close_position_in_db(
@@ -256,18 +256,18 @@ class LiveExecutor(Executor):
                     print(f"  [live] DB id={pos_id} cerrada · prima recibida "
                           f"${recibido:.2f} · P&L ${pnl:.2f}"
                           if pnl is not None else
-                          f"  [live] DB id={pos_id} cerrada · P&L sin dato")
+                          f"  [live] DB id={pos_id} cerrada · P&L missing_fills dato")
                 except Exception as e:
                     print(f"  [live] ⚠️  no se pudo escribir el cierre en la DB: {e}")
 
         # La confirmación no es el fill: es que el broker no tenga nada.
-        if not verificar_cerrada(ticker):
+        if not verify_closed(ticker):
             try:
                 from notify import send_push
                 send_push(
                     f"CIERRE DUDOSO — {ticker}",
-                    f"La orden {r.order_id} reportó fill, pero el broker todavía "
-                    f"muestra patas abiertas de {ticker}.\n\nRevisar A MANO.",
+                    f"La order {r.order_id} reportó fill, pero el broker todavía "
+                    f"muestra legs abiertas de {ticker}.\n\nRevisar A MANO.",
                     priority="urgent",
                 )
             except Exception:
