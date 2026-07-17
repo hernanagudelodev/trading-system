@@ -1028,7 +1028,7 @@ def cmd_paper_history():
     print()
 
 
-def cmd_paper_close(ticker):
+def cmd_paper_close(ticker, close_reason="MANUAL"):
     ensure_tables()
     conn = get_db_connection()
     cur  = conn.cursor()
@@ -1082,10 +1082,10 @@ def cmd_paper_close(ticker):
             current_spread_value = %s, current_value = %s,
             premium_received = %s, total_received = %s,
             gross_pnl = %s, pnl_pct = %s, profit_pct_of_max = %s,
-            close_reason = 'MANUAL', last_synced_at = NOW()
+            close_reason = %s, last_synced_at = NOW()
         WHERE id = %s
     """, (spread_value, current_value, spread_value, current_value,
-          gross_pnl, pnl_pct, profit_pct_max, pos_id))
+          gross_pnl, pnl_pct, profit_pct_max, close_reason, pos_id))
 
     conn.commit()
     cur.close()

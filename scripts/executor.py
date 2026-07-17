@@ -97,7 +97,7 @@ class PaperExecutor(Executor):
         import trade as trade_module
         # cmd_paper_close ya devuelve True/False (True solo si cerró de verdad)
         try:
-            return bool(trade_module.cmd_paper_close(ticker))
+            return bool(trade_module.cmd_paper_close(ticker, close_reason=reason))
         except Exception as e:
             print(f"  [paper] error cerrando {ticker}: {e}")
             return False
