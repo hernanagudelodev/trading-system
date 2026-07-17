@@ -32,6 +32,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from monitor import (
     scheduled_run,
+    healthcheck_ping,
     get_interval,
     INTERVAL_MARKET_OPEN,
     INTERVAL_PRE_MARKET,
@@ -203,6 +204,16 @@ while True:
 
     # Check if auto_run should fire
     run_auto()
+
+    # ── DEAD-MAN'S SWITCH ────────────────────────────────────────────────────
+    # Va acá, en el loop, y no en scheduled_run: el loop late cada 60s pase lo
+    # que pase, mientras que el monitor corre cada 5min (mercado abierto) o cada
+    # 30 (cerrado). Atado al ciclo, healthchecks gritaría todas las noches.
+    #
+    # Un proceso muerto NO PUEDE avisar que murió — el 17-jul el auto_run se
+    # saltó medio día y nos enteramos porque no sonó el teléfono. Acá el aviso
+    # viene de AFUERA: si esto deja de latir, healthchecks avisa por Telegram.
+    healthcheck_ping()
 
     # Adaptive interval update
     new_interval = get_interval()
