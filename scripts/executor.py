@@ -140,19 +140,17 @@ class LiveExecutor(Executor):
     Ejecución REAL. El ciclo de vida de la orden vive en broker_orders.py; acá
     está solo el pegamento con la interfaz que auto_run conoce.
 
-    ESTADO
-        open_position  : manda, sigue y confirma la orden. NO escribe la DB.
-        close_position : cierra contra el broker y VERIFICA contra el broker.
+    QUÉ HACE CADA MÉTODO
+        open_position    : manda, sigue y confirma la orden contra el broker.
+        sync_after_opens : baja a `positions` lo que se abrió (run_sync).
+        close_position   : cierra contra el broker, VERIFICA contra el broker, y
+                           registra el precio de salida real.
 
-        Que no escriba la DB es deliberado: la verdad de una posición real está
-        en Tastytrade, y `trade.py --sync` ya la baja a `positions`. Dos
-        escritores del mismo hecho es un dueño de más.
-
-    POR QUÉ TODAVÍA NO VA A RAILWAY
-        Nadie corre el sync después de una apertura. Una posición abierta por
-        auto_run existiría en el broker y no en `positions` hasta el próximo
-        run — y el monitor lee `positions`. O sea: sin stop loss en el medio.
-        Eso se resuelve antes de automático, no antes de un test supervisado.
+    LA ASIMETRÍA ENTRE ABRIR Y CERRAR
+        Al abrir, la posición QUEDA en el broker: la verdad sigue ahí y run_sync
+        la lee después. Al cerrar, la posición DESAPARECE y el precio de salida
+        se pierde — sólo lo vio el executor, en el instante del fill. Por eso el
+        cierre escribe directo y la apertura delega en el sync.
 
     LO QUE NO HACE, A PROPÓSITO
       - No arregla una pata suelta. La detecta, grita y devuelve False. Un
@@ -170,8 +168,8 @@ class LiveExecutor(Executor):
         if r.ok:
             print(f"  [live] {intent.ticker} LLENA · id={r.order_id} · "
                   f"fill={r.fill_price}")
-            print(f"  [live] ⚠️  la posición NO quedó en la DB — el escritor "
-                  f"todavía no existe. El monitor no la ve.")
+            # La DB se escribe en sync_after_opens(), una vez por run, cuando
+            # auto_run termina el bucle de aperturas.
             return True
 
         if r.estado == "partial":
@@ -277,6 +275,27 @@ class LiveExecutor(Executor):
             return False
 
         return True
+
+    def sync_after_opens(self) -> None:
+        """
+        Baja del broker lo que auto_run acaba de abrir.
+
+        Sin esto la posición existe en Tastytrade y NO en `positions`, y el
+        monitor lee `positions`: quedaría sin stop loss hasta el próximo run
+        —hasta 4 horas y media entre las 10:00 y las 14:30 ET— con plata real.
+
+        UNA vez por run, no por posición: run_sync baja la cuenta entera.
+
+        POR QUÉ run_sync Y NO ESCRIBIR LA FILA ACÁ
+            Al ABRIR, la posición QUEDA en el broker: la verdad sigue disponible
+            y group_spreads la lee con los precios reales de apertura.
+            Al CERRAR es al revés — la posición desaparece y el precio se pierde
+            — y por eso close_position sí escribe directo.
+            La asimetría no es capricho: es dónde vive la verdad en cada momento.
+        """
+        import trade as trade_module
+        print("  [live] sincronizando la DB con el broker...")
+        trade_module.run_sync()
 
 
 VALID_MODES = ("paper", "live")
