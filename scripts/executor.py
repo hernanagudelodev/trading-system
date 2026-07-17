@@ -81,24 +81,28 @@ class PaperExecutor(Executor):
 
 class LiveExecutor(Executor):
     """
-    Ejecución REAL. El ciclo de vida de la orden vive en broker_orders.py;
-    acá está solo el pegamento con la interfaz que auto_run conoce.
+    Ejecución REAL. El ciclo de vida de la orden vive en broker_orders.py; acá
+    está solo el pegamento con la interfaz que auto_run conoce.
 
-    ESTADO: open_position manda y confirma órdenes. NO ESCRIBE LA DB todavía.
-    close_position sigue sin implementar.
+    ESTADO
+        open_position  : manda, sigue y confirma la orden. NO escribe la DB.
+        close_position : cierra contra el broker y VERIFICA contra el broker.
 
-    Consecuencia, y por eso este executor NO es desplegable aún: una posición
-    abierta por acá existe en el broker y NO en `positions`. El monitor no la
-    ve, o sea que no tiene stop loss. Solo sirve para probar contra sandbox.
-    El escritor de DB es el bloque siguiente, y sale de ver la forma real de un
-    fill — que se conoce mandando una orden de verdad en sandbox, no
-    adivinándola.
+        Que no escriba la DB es deliberado: la verdad de una posición real está
+        en Tastytrade, y `trade.py --sync` ya la baja a `positions`. Dos
+        escritores del mismo hecho es un dueño de más.
 
-    Lo que NO hace y es deliberado:
+    POR QUÉ TODAVÍA NO VA A RAILWAY
+        Nadie corre el sync después de una apertura. Una posición abierta por
+        auto_run existiría en el broker y no en `positions` hasta el próximo
+        run — y el monitor lee `positions`. O sea: sin stop loss en el medio.
+        Eso se resuelve antes de automático, no antes de un test supervisado.
+
+    LO QUE NO HACE, A PROPÓSITO
       - No arregla una pata suelta. La detecta, grita y devuelve False. Un
         arreglo automático equivocado deja una opción desnuda.
-      - No reintenta a ciegas si el broker no devolvió id: estado desconocido.
-      - No reporta True por nada que no sea un fill confirmado por el broker.
+      - No reintenta si el broker no devolvió id: estado desconocido.
+      - No reporta True por nada que el broker no haya confirmado.
     """
     mode = "live"
 
@@ -136,10 +140,55 @@ class LiveExecutor(Executor):
         return False
 
     def close_position(self, ticker: str, reason: str) -> bool:
-        raise NotImplementedError(
-            "LiveExecutor.close_position no implementado. Un cierre en vivo "
-            "necesita leer la posición del broker, no de la DB."
-        )
+        """
+        Cierra contra el BROKER y verifica contra el BROKER.
+
+        Devuelve True SOLO si Tastytrade confirma que no queda ninguna pata.
+        Un fill reportado no alcanza: si el código cree que cerró y no cerró,
+        te quedaste con una posición real creyendo que no. Mismo espíritu que
+        cmd_paper_close devolviendo False cuando no pudo pricear.
+        """
+        from broker_orders import cerrar_spread, verificar_cerrada
+
+        r = cerrar_spread(ticker, reason)
+
+        if r.estado == "partial":
+            try:
+                from notify import send_push
+                send_push(
+                    f"PATA SUELTA al cerrar — {ticker}",
+                    f"Orden {r.order_id}: cierre PARCIAL.\n\n"
+                    f"Puede haber una opción DESNUDA en la cuenta. "
+                    f"Revisar A MANO ya.",
+                    priority="urgent",
+                )
+            except Exception as e:
+                print(f"  [live] no se pudo avisar de la pata suelta: {e}")
+            print(f"  [live] ⛔ {ticker}: {r.detalle}")
+            return False
+
+        if not r.ok:
+            print(f"  [live] {ticker} NO cerrada ({r.estado}): {r.detalle}")
+            return False
+
+        print(f"  [live] {ticker} cierre llenó · id={r.order_id} · "
+              f"fill={r.fill_price}")
+
+        # La confirmación no es el fill: es que el broker no tenga nada.
+        if not verificar_cerrada(ticker):
+            try:
+                from notify import send_push
+                send_push(
+                    f"CIERRE DUDOSO — {ticker}",
+                    f"La orden {r.order_id} reportó fill, pero el broker todavía "
+                    f"muestra patas abiertas de {ticker}.\n\nRevisar A MANO.",
+                    priority="urgent",
+                )
+            except Exception:
+                pass
+            return False
+
+        return True
 
 
 VALID_MODES = ("paper", "live")
@@ -160,6 +209,13 @@ def current_mode() -> str:
 def get_executor() -> Executor:
     mode = current_mode()
     if mode == "live":
-        print("  ⚠️  TRADING_MODE=live — LiveExecutor no implementado, abortará.")
+        # OJO: en la rama `live` este executor SÍ opera con plata real. El
+        # mensaje anterior decía "no implementado, abortará" — heredado del stub
+        # de la rama main. Leer eso en un log y creer que no pasó nada es
+        # exactamente el fallo que este proyecto persigue: el log mintiendo
+        # sobre lo que el sistema hizo.
+        from broker_orders import executor_env
+        print(f"  ⚠️  TRADING_MODE=live · EXECUTOR_ENV={executor_env()} — "
+              f"LiveExecutor OPERA de verdad.")
         return LiveExecutor()
     return PaperExecutor()
