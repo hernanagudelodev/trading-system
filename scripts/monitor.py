@@ -236,208 +236,6 @@ def get_spread_value_tastytrade(ticker, strike_low, strike_high, expiration,
 # P&L CALCULATION — strategy-aware
 # ══════════════════════════════════════════════════════════════════════════════
 
-def calculate_current_pnl(position, current_price):
-    """
-    Calculate P&L for any supported strategy.
-
-    Strategy logic:
-        Bull Call Spread / Bear Put Spread
-            → real spread value from Tastytrade (includes time value)
-              fallback: intrinsic-only estimate
-        Long Call / Long Put
-            → live option price from yfinance (fallback: delta approximation)
-        Cash Secured Put / Covered Call
-            → premium decay: profit = premium - current option value
-        Long Straddle
-            → combined call + put value
-
-    Returns dict with: current_price, current_value, gross_pnl, pnl_pct,
-                       profit_pct_of_max, max_profit, dte, spread_value,
-                       strategy_type, delta (for long options)
-    """
-    strategy      = position.get("strategy", "Bull Call Spread")
-    strike_low    = float(position["strike_low"])
-    strike_high   = float(position["strike_high"])
-    contracts     = int(position["contracts"])
-    total_cost    = float(position.get("total_cost") or 0)
-    expiration    = position["expiration"]
-    ticker        = position["ticker"]
-    price_at_open = float(position.get("price_at_open") or strike_low)
-
-    # Parse expiration
-    if isinstance(expiration, date):
-        exp_date = expiration
-    else:
-        exp_date = datetime.strptime(str(expiration), "%Y-%m-%d").date()
-
-    dte = (exp_date - date.today()).days
-
-    # ── DEBIT SPREADS (Bull Call Spread, Bear Put Spread) ────────────────────
-    if strategy in DEBIT_SPREADS:
-        spread_width      = strike_high - strike_low
-        premium_per_share = total_cost / (contracts * 100) if contracts > 0 else 0
-        max_profit        = (spread_width - premium_per_share) * contracts * 100
-
-        # Try real market value from Tastytrade first (includes time value)
-        spread_value = get_spread_value_tastytrade(ticker, strike_low, strike_high, exp_date)
-
-        if spread_value is None:
-            # Fallback: intrinsic-only estimate (no time value)
-            if strategy == "Bull Call Spread":
-                if current_price >= strike_high:
-                    spread_value = spread_width
-                elif current_price <= strike_low:
-                    spread_value = 0
-                else:
-                    spread_value = current_price - strike_low
-            else:  # Bear Put Spread
-                if current_price <= strike_low:
-                    spread_value = spread_width
-                elif current_price >= strike_high:
-                    spread_value = 0
-                else:
-                    spread_value = strike_high - current_price
-
-        current_value     = spread_value * contracts * 100
-        gross_pnl         = current_value - total_cost
-        pnl_pct           = (gross_pnl / total_cost * 100) if total_cost > 0 else 0
-        profit_pct_of_max = (gross_pnl / max_profit) if max_profit > 0 else 0
-
-        return {
-            "current_price":      current_price,
-            "current_value":      current_value,
-            "gross_pnl":          gross_pnl,
-            "pnl_pct":            pnl_pct,
-            "profit_pct_of_max":  profit_pct_of_max,
-            "max_profit":         max_profit,
-            "dte":                dte,
-            "spread_value":       spread_value,
-            "strategy_type":      "debit_spread",
-            "delta":              None,
-        }
-
-    # ── LONG OPTIONS (Long Call, Long Put) ───────────────────────────────────
-    elif strategy in LONG_OPTIONS:
-        option_type  = "call" if strategy == "Long Call" else "put"
-        premium_paid = total_cost / (contracts * 100) if contracts > 0 else 0
-
-        live_price = get_live_option_price(ticker, strike_low, exp_date, option_type)
-
-        if live_price is not None:
-            current_value = live_price * contracts * 100
-            delta = get_live_delta(ticker, strike_low, exp_date, option_type)
-        else:
-            delta         = get_live_delta(ticker, strike_low, exp_date, option_type)
-            price_change  = current_price - price_at_open
-            estimated_val = max(0, premium_paid + (abs(delta) * price_change))
-            current_value = estimated_val * contracts * 100
-
-        max_profit        = total_cost * 2
-        gross_pnl         = current_value - total_cost
-        pnl_pct           = (gross_pnl / total_cost * 100) if total_cost > 0 else 0
-        profit_pct_of_max = (gross_pnl / max_profit) if max_profit > 0 else 0
-
-        return {
-            "current_price":      current_price,
-            "current_value":      current_value,
-            "gross_pnl":          gross_pnl,
-            "pnl_pct":            pnl_pct,
-            "profit_pct_of_max":  profit_pct_of_max,
-            "max_profit":         max_profit,
-            "dte":                dte,
-            "spread_value":       current_value / (contracts * 100) if contracts > 0 else 0,
-            "strategy_type":      "long_option",
-            "delta":              delta,
-        }
-
-    # ── CREDIT OPTIONS (Cash Secured Put, Covered Call) ──────────────────────
-    elif strategy in CREDIT_OPTIONS:
-        option_type      = "put" if strategy == "Cash Secured Put" else "call"
-        premium_received = total_cost
-
-        live_price = get_live_option_price(ticker, strike_low, exp_date, option_type)
-
-        if live_price is not None:
-            cost_to_close = live_price * contracts * 100
-        else:
-            delta        = get_live_delta(ticker, strike_low, exp_date, option_type)
-            price_change = current_price - price_at_open
-            remaining    = max(0, (premium_received / (contracts * 100)) - (abs(delta) * abs(price_change)))
-            cost_to_close = remaining * contracts * 100
-
-        max_profit        = premium_received
-        gross_pnl         = premium_received - cost_to_close
-        pnl_pct           = (gross_pnl / premium_received * 100) if premium_received > 0 else 0
-        profit_pct_of_max = (gross_pnl / max_profit) if max_profit > 0 else 0
-
-        return {
-            "current_price":      current_price,
-            "current_value":      cost_to_close,
-            "gross_pnl":          gross_pnl,
-            "pnl_pct":            pnl_pct,
-            "profit_pct_of_max":  profit_pct_of_max,
-            "max_profit":         max_profit,
-            "dte":                dte,
-            "spread_value":       cost_to_close / (contracts * 100) if contracts > 0 else 0,
-            "strategy_type":      "credit_option",
-            "delta":              None,
-        }
-
-    # ── LONG STRADDLE ────────────────────────────────────────────────────────
-    elif strategy in STRADDLES:
-        strike     = strike_low
-        call_price = get_live_option_price(ticker, strike, exp_date, "call")
-        put_price  = get_live_option_price(ticker, strike, exp_date, "put")
-
-        if call_price is not None and put_price is not None:
-            current_value = (call_price + put_price) * contracts * 100
-        else:
-            call_delta        = get_live_delta(ticker, strike, exp_date, "call")
-            put_delta         = get_live_delta(ticker, strike, exp_date, "put")
-            premium_per_share = total_cost / (contracts * 100) if contracts > 0 else 0
-            price_change      = current_price - price_at_open
-            call_val  = max(0, (premium_per_share / 2) + call_delta * price_change)
-            put_val   = max(0, (premium_per_share / 2) - abs(put_delta) * price_change)
-            current_value = (call_val + put_val) * contracts * 100
-
-        max_profit        = total_cost * 3
-        gross_pnl         = current_value - total_cost
-        pnl_pct           = (gross_pnl / total_cost * 100) if total_cost > 0 else 0
-        profit_pct_of_max = (gross_pnl / max_profit) if max_profit > 0 else 0
-
-        return {
-            "current_price":      current_price,
-            "current_value":      current_value,
-            "gross_pnl":          gross_pnl,
-            "pnl_pct":            pnl_pct,
-            "profit_pct_of_max":  profit_pct_of_max,
-            "max_profit":         max_profit,
-            "dte":                dte,
-            "spread_value":       current_value / (contracts * 100) if contracts > 0 else 0,
-            "strategy_type":      "straddle",
-            "delta":              None,
-        }
-
-    # ── FALLBACK (unknown strategy) ───────────────────────────────────────────
-    else:
-        return {
-            "current_price":      current_price,
-            "current_value":      0,
-            "gross_pnl":          0,
-            "pnl_pct":            0,
-            "profit_pct_of_max":  0,
-            "max_profit":         total_cost,
-            "dte":                dte,
-            "spread_value":       0,
-            "strategy_type":      "unknown",
-            "delta":              None,
-        }
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ALERT EVALUATION
-# ══════════════════════════════════════════════════════════════════════════════
-
 def evaluate_alert_level(pnl_data):
     profit_pct_of_max = pnl_data["profit_pct_of_max"]
     pnl_pct           = pnl_data["pnl_pct"]
@@ -797,94 +595,6 @@ def send_market_close_summary(positions_data, timestamp):
 # MAIN MONITOR RUN
 # ══════════════════════════════════════════════════════════════════════════════
 
-def run_monitor(ask_ai=False):
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-
-    print(f"\n{'=' * 60}")
-    print(f"  MONITOR DE POSICIONES — {timestamp}")
-
-    market_status = get_market_status()
-    status_label  = {"open": "ABIERTO", "pre": "PRE-MARKET", "closed": "CERRADO"}
-    print(f"  Mercado: {status_label.get(market_status, '?')} | "
-          f"Intervalo: {get_interval()}min")
-
-    print(f"\n  Alertas:")
-    print(f"{'=' * 60}")
-
-    positions = get_open_positions()
-
-    if not positions:
-        print("\n  No hay posiciones abiertas.\n")
-        generate_html_report([], timestamp)
-        return
-
-    print(f"\n  Posiciones abiertas: {len(positions)}")
-
-    positions_data = []
-    ntfy_sent      = set()
-
-    for position in positions:
-        ticker   = position["ticker"]
-        strategy = position.get("strategy", "desconocida")
-        print(f"\n  Revisando {ticker} ({strategy})...", end=" ", flush=True)
-
-        try:
-            criteria = get_all_criteria(ticker)
-            if criteria is None:
-                print("Sin datos de mercado")
-                continue
-
-            current_price = criteria["price"]
-            pnl_data      = calculate_current_pnl(position, current_price)
-            pnl_data["total_cost"] = float(position.get("total_cost") or 0)
-            alert_level, reasons   = evaluate_alert_level(pnl_data)
-
-            print(f"{level_icon(alert_level)} {alert_level}")
-            print_position_report(position, pnl_data, alert_level, reasons)
-
-            if alert_level in ("WATCH", "ACTION", "URGENT") and ticker not in ntfy_sent:
-                # Solo notificar si el mercado está abierto o en pre-market
-                # Con mercado cerrado no puedes actuar — silencio hasta apertura
-                if get_market_status() in ("open", "pre"):
-                    send_alert_notification(position, pnl_data, alert_level, reasons)
-                    ntfy_sent.add(ticker)
-
-            positions_data.append({
-                "position":    position,
-                "pnl_data":    pnl_data,
-                "alert_level": alert_level,
-                "reasons":     reasons,
-            })
-
-        except Exception as e:
-            print(f"Error: {e}")
-            continue
-
-    generate_html_report(positions_data, timestamp)
-
-    print(f"\n{'=' * 60}")
-    urgent = sum(1 for p in positions_data if p["alert_level"] == "URGENT")
-    action = sum(1 for p in positions_data if p["alert_level"] == "ACTION")
-    watch  = sum(1 for p in positions_data if p["alert_level"] == "WATCH")
-    normal = sum(1 for p in positions_data if p["alert_level"] == "NORMAL")
-    print(f"  URGENT: {urgent}  ACTION: {action}  WATCH: {watch}  NORMAL: {normal}")
-    print(f"{'=' * 60}")
-    print(f"  Monitor completado — {timestamp}\n")
-
-    if should_send_heartbeat():
-        send_heartbeat(positions_data, timestamp)
-
-    global _market_close_sent
-    if get_market_status() == "closed" and not _market_close_sent:
-        send_market_close_summary(positions_data, timestamp)
-    elif get_market_status() == "open":
-        _market_close_sent = False
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PAPER MONITOR
-# ══════════════════════════════════════════════════════════════════════════════
-
 def run_position_monitor():
     """
     Vigila las posiciones abiertas del libro activo, y las CIERRA cuando toca.
@@ -962,48 +672,65 @@ def run_position_monitor():
         expiration  = pos["expiration"]
         dte         = (expiration - date.today()).days
 
-        print(f"  Revisando {ticker} (paper)...", end=" ", flush=True)
+        strategy = pos.get("strategy", "Bull Call Spread")
+        is_long  = strategy in ("Long Call", "Long Put")
 
-        # Determine option type for spread value fetch
-        strategy     = pos.get("strategy", "Bull Call Spread")
-        opt_type     = "put" if strategy == "Bull Put Spread" else "call"
-        spread_value = get_spread_value_tastytrade(ticker, strike_low, strike_high,
-                                                   expiration, opt_type)
+        print(f"  Revisando {ticker} [{mode}]...", end=" ", flush=True)
 
-        # Small delay to avoid overwhelming DXLinkStreamer
-        time.sleep(0.5)
+        # El precio viene de fuentes distintas según la estrategia:
+        #   spreads   -> valor del spread por la cadena de Tastytrade
+        #   Long Call -> precio de la opción sola por yfinance
+        # Son campos separados en spread_pnl porque son mediciones distintas.
+        spread_value = None
+        long_value   = None
+        if is_long:
+            opt_type   = "call" if strategy == "Long Call" else "put"
+            long_value = get_live_option_price(ticker, strike_low, expiration, opt_type)
+        else:
+            opt_type     = "put" if premium < 0 else "call"   # el signo manda
+            spread_value = get_spread_value_tastytrade(ticker, strike_low, strike_high,
+                                                       expiration, opt_type)
 
+        time.sleep(0.5)   # no saturar DXLinkStreamer
+
+        # `precio` es el valor actual: spread_value para spreads, long_value para
+        # longs. price_fresh gobierna si se puede CERRAR — nunca con precio viejo.
+        precio      = long_value if is_long else spread_value
         price_fresh = True
-        if spread_value is None:
+        if precio is None:
             last_known = float(pos["current_spread_value"] or 0)
             if last_known <= 0:
                 print(f"sin datos reales — omitiendo")
-                print(f"\n  [--] {ticker} (PAPER) — {strategy} — SIN DATOS")
+                print(f"\n  [--] {ticker} [{mode}] — {strategy} — SIN DATOS")
                 print(f"  {'─' * 50}")
                 print(f"  Strike(s):     ${strike_low} / ${strike_high}")
                 print(f"  Expiracion:    {expiration} ({dte} dias)")
-                print(f"  No se pudo obtener precio real del spread.")
+                print(f"  No se pudo obtener precio real.")
                 print()
                 continue
-            spread_value = last_known
-            price_fresh  = False
-            print(f"usando último valor conocido: ${spread_value:.2f} (NO se cerrará con precio viejo)")
+            precio      = last_known
+            price_fresh = False
+            print(f"usando último valor conocido: ${precio:.2f} (NO se cerrará con precio viejo)")
         else:
-            print(f"spread=${spread_value:.2f}")
+            print(f"{'opción' if is_long else 'spread'}=${precio:.2f}")
 
-        # P&L: fuente ÚNICA en option_selector.spread_pnl. Esta matemática vivía
-        # copiada acá y en trade.cmd_paper_close, y ya habían divergido: ESTA
-        # copia NO multiplicaba por `contracts`. En paper no se notaba (el INSERT
-        # lo tiene clavado en 1); en live `contracts` viene del broker y el P&L
-        # habría salido corto por el multiplicador.
+        if is_long:
+            spread_value = None
+            long_value   = precio
+        else:
+            spread_value = precio
+
+        # P&L: fuente ÚNICA en option_selector.spread_pnl, que ahora maneja las
+        # tres estrategias (Bull Call, Bull Put, Long Call). Reemplazó también a
+        # calculate_current_pnl, que sólo sabía debit spreads y longs — nunca
+        # Bull Put, que es la mitad de la cartera.
         from option_selector import spread_pnl
 
-        strategy      = pos.get("strategy", "Bull Call Spread")
         contracts     = int(pos.get("contracts") or 1)
-        spread_width  = strike_high - strike_low
-        is_put_spread = premium < 0          # el signo manda, no el string
+        is_put_spread = (not is_long) and premium < 0    # el signo manda
 
-        r = spread_pnl(strike_low, strike_high, premium, contracts, spread_value)
+        r = spread_pnl(strike_low, strike_high, premium, contracts, spread_value,
+                       strategy=strategy, long_value=long_value)
         max_profit     = r["max_profit"]
         max_loss       = r["max_loss"]
         current_value  = r["current_value"]
@@ -1013,7 +740,6 @@ def run_position_monitor():
         profit_pct_max = r["profit_pct_of_max"] if r["profit_pct_of_max"] is not None else 0
         strategy_type  = r["strategy_type"]
 
-        # Alert level
         pnl_data = {
             "profit_pct_of_max": profit_pct_max,
             "pnl_pct":           pnl_pct,
@@ -1023,7 +749,7 @@ def run_position_monitor():
         alert_level, reasons = evaluate_alert_level(pnl_data)
         icon = level_icon(alert_level)
 
-        print(f"\n  {icon} {ticker} (PAPER) — {strategy} — {alert_level}")
+        print(f"\n  {icon} {ticker} [{mode}] — {strategy} — {alert_level}")
         print(f"  {'─' * 50}")
         print(f"  Strike(s):     ${strike_low} / ${strike_high}")
         print(f"  Expiracion:    {expiration} ({dte} dias)")
@@ -1032,14 +758,23 @@ def run_position_monitor():
             print(f"  Costo cierre:  ${cost_to_close:.2f}")
         else:
             print(f"  Costo total:   ${total_cost:.2f}")
-        print(f"  Spread actual: ${spread_value:.2f}")
+        print(f"  Valor actual:  ${precio:.2f}")
         print(f"  Ganancia/Perd: ${gross_pnl:+.2f} ({pnl_pct:+.1f}%)")
         print(f"  % del maximo:  {profit_pct_max*100:.1f}%")
-        print(f"  Ganancia max:  ${max_profit:.2f}")
+        if max_profit is not None:
+            print(f"  Ganancia max:  ${max_profit:.2f}")
         print(f"\n  Alertas:")
-        for r in reasons:
-            print(f"    - {r}")
+        for motivo in reasons:
+            print(f"    - {motivo}")
         print()
+
+        # ── ALERTA (lo que antes hacía run_monitor) ───────────────────────────
+        # Con mercado cerrado no podés actuar: silencio hasta apertura, para no
+        # despertar el teléfono de noche por algo que no se puede tocar.
+        if alert_level in ("WATCH", "ACTION", "URGENT") and price_fresh:
+            if get_market_status() in ("open", "pre"):
+                send_alert_notification(pos, {**pnl_data, "gross_pnl": gross_pnl},
+                                        alert_level, reasons)
 
         # ── Cierre determinista — el worker es el ÚNICO dueño de stops de paper ─
         # Usa las mismas constantes canónicas que el monitor real (sin inventar
@@ -1161,9 +896,9 @@ def healthcheck_ping():
 
 
 def scheduled_run():
-    # run_monitor vigila `positions` y sólo ALERTA — nunca cerró nada.
-    # run_position_monitor es la que decide y cierra, en el libro que toque.
-    run_monitor(ask_ai=False)
+    # Un solo monitor: precia una vez, alerta y cierra, sobre el libro del modo.
+    # Antes había dos (run_monitor sólo alertaba, run_position_monitor cerraba),
+    # que priceaban lo mismo con segundos de diferencia. Fusionados en B.
     try:
         run_position_monitor()
     except Exception as e:
@@ -1204,4 +939,4 @@ if __name__ == "__main__":
                 print(f"  Intervalo ajustado: {current_interval}min")
             time.sleep(60)
     else:
-        run_monitor(ask_ai=True)
+        run_position_monitor()

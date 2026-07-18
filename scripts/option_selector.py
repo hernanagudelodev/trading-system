@@ -650,45 +650,93 @@ def portfolio_risk_pct() -> float:
     return float(raw)
 
 
-def spread_pnl(strike_low, strike_high, premium_paid, contracts, spread_value):
+def spread_pnl(strike_low, strike_high, premium_paid, contracts, spread_value,
+               strategy=None, long_value=None):
     """
-    P&L de un spread vertical de 2 patas a un `spread_value` dado.
+    P&L de una posición de opciones. FUENTE ÚNICA.
 
-    FUENTE ÚNICA. Antes esta matemática vivía en DOS lugares:
-        monitor.run_paper_monitor  (línea ~971)
-        trade.cmd_paper_close      (línea ~440)
-    Y ya habían divergido: el monitor NO multiplicaba por `contracts`. En paper
-    no se nota —el INSERT lo tiene clavado en 1— pero en live `contracts` viene
-    del broker, y el P&L del monitor saldría mal por el multiplicador.
-    Es el mismo bug que tenía check_open.py. Las copias se separan solas.
+    Reemplaza a calculate_current_pnl (monitor) y a las 3 copias de la matemática
+    de spreads que había en trade/monitor. Maneja las TRES estrategias que el
+    sistema opera, y ninguna otra función calcula P&L:
 
-    MANDA EL SIGNO, no el string de strategy:
-        premium_paid > 0  débito  (BCS): pagaste al abrir, cobrás al cerrar
-        premium_paid < 0  crédito (BPS): cobraste al abrir, pagás al cerrar
-    Así un Bear Call Spread —que también es crédito— sale bien sin nombrarlo.
+        Bull Call Spread  (débito, 2 patas)   premium_paid > 0
+        Bull Put Spread   (crédito, 2 patas)  premium_paid < 0
+        Long Call / Put   (1 pata)            strategy in ("Long Call","Long Put")
 
-    spread_value : valor actual del spread por acción, POSITIVO
-                   (lo que devuelve pricing.get_spread_value)
+    EL SIGNO MANDA, NO EL STRING (para spreads)
+        Un Bear Call Spread —también crédito— sale bien sin nombrarlo. El string
+        `strategy` sólo se mira para distinguir la pata larga: un Long Call no
+        tiene `spread_value`, tiene `long_value` (precio de la opción sola).
 
-    Devuelve dict con max_profit, max_loss, current_value, gross_pnl, pnl_pct,
-    profit_pct_of_max, strategy_type. pnl_pct y profit_pct_of_max pueden ser
-    None si la base es cero: sin dato -> None, nunca un 0 que miente.
+    PARÁMETROS
+        spread_value : valor del spread por acción, POSITIVO. Sólo spreads.
+        long_value   : precio de la opción larga por acción. Sólo Long Call/Put.
+                       Vienen de fuentes distintas (spread_value de la cadena de
+                       Tastytrade; long_value de yfinance), por eso son campos
+                       separados y no uno reutilizado.
+
+    Devuelve dict con las mismas claves para las tres estrategias, así el que
+    consume (evaluate_alert_level, run_position_monitor) no ramifica:
+        max_profit, max_loss, current_value, gross_pnl, pnl_pct,
+        profit_pct_of_max, spread_value, strategy_type, dte(None), delta(None)
+    pnl_pct y profit_pct_of_max pueden ser None si la base es cero.
     """
+    n   = int(contracts or 1)
+    prem = float(premium_paid)
+
+    # ── LONG CALL / LONG PUT (1 pata) ─────────────────────────────────────────
+    if strategy in ("Long Call", "Long Put"):
+        total_cost = round(prem * n * 100, 2) if prem > 0 else round(abs(prem) * n * 100, 2)
+        # total_cost real: lo pagado por la opción. premium_paid de una long es
+        # el débito (positivo). Si viniera el total_cost directo, usarlo.
+        if long_value is None:
+            # Sin precio no se inventa: P&L desconocido, no cero (§10).
+            return {
+                "max_profit": None, "max_loss": total_cost, "current_value": None,
+                "gross_pnl": None, "pnl_pct": None, "profit_pct_of_max": None,
+                "spread_value": None, "strategy_type": "long_option",
+                "dte": None, "delta": None,
+            }
+        current_value = round(float(long_value) * n * 100, 2)
+        gross_pnl     = round(current_value - total_cost, 2)
+        # Una long call no tiene máximo real; se usa 2x el costo como referencia
+        # para que el objetivo del 70% signifique algo (convención heredada).
+        max_profit    = round(total_cost * 2, 2)
+        return {
+            "max_profit":        max_profit,
+            "max_loss":          total_cost,          # una long pierde a lo sumo la prima
+            "current_value":     current_value,
+            "gross_pnl":         gross_pnl,
+            "pnl_pct":           round(gross_pnl / total_cost * 100, 2) if total_cost else None,
+            "profit_pct_of_max": round(gross_pnl / max_profit, 4) if max_profit else None,
+            "spread_value":      round(float(long_value), 4),
+            "strategy_type":     "long_option",
+            "dte":               None,
+            "delta":             None,
+        }
+
+    # ── SPREADS DE 2 PATAS ────────────────────────────────────────────────────
+    if spread_value is None:
+        return {
+            "max_profit": None, "max_loss": None, "current_value": None,
+            "gross_pnl": None, "pnl_pct": None, "profit_pct_of_max": None,
+            "spread_value": None, "strategy_type": "spread",
+            "dte": None, "delta": None,
+        }
+
     width = abs(float(strike_high) - float(strike_low))
-    prem  = float(premium_paid)
-    n     = int(contracts or 1)
     sv    = abs(float(spread_value))
 
     if prem < 0:
-        # CRÉDITO. Cobraste `net_credit` al abrir; cerrar cuesta `current_value`.
+        # CRÉDITO (Bull Put / Bear Call). Cobraste al abrir; cerrar cuesta sv.
         net_credit    = abs(prem)
         max_profit    = round(net_credit * n * 100, 2)
-        current_value = round(sv * n * 100, 2)          # costo de cerrar
+        current_value = round(sv * n * 100, 2)
         gross_pnl     = round(max_profit - current_value, 2)
         base_pct      = max_profit
         tipo          = "credit_spread"
     else:
-        # DÉBITO. Pagaste `total_cost` al abrir; cerrar te paga `current_value`.
+        # DÉBITO (Bull Call / Bear Put). Pagaste al abrir; cerrar te paga sv.
         total_cost    = round(prem * n * 100, 2)
         max_profit    = round((width - prem) * n * 100, 2)
         current_value = round(sv * n * 100, 2)
@@ -703,5 +751,8 @@ def spread_pnl(strike_low, strike_high, premium_paid, contracts, spread_value):
         "gross_pnl":         gross_pnl,
         "pnl_pct":           round(gross_pnl / base_pct * 100, 2) if base_pct else None,
         "profit_pct_of_max": round(gross_pnl / max_profit, 4) if max_profit else None,
+        "spread_value":      round(sv, 4),
         "strategy_type":     tipo,
+        "dte":               None,
+        "delta":             None,
     }
