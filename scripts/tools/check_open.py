@@ -27,10 +27,12 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from executor import current_mode
 from option_selector import CAPITAL, position_max_loss, portfolio_risk_pct
 
-MODE  = current_mode()
+# El libro entra por ARGUMENTO, no por el modo del proceso. Este script lo corre
+# el bot (servicio propio en `main`, TRADING_MODE=paper): mirar current_mode()
+# mostraría paper siempre. 'live' -> positions; cualquier otra cosa -> paper.
+MODE  = "live" if "live" in [a.lower() for a in sys.argv[1:]] else "paper"
 TABLE = "positions" if MODE == "live" else "paper_positions"
 
 PCT      = portfolio_risk_pct()

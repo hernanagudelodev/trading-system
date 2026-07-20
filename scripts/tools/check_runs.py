@@ -18,9 +18,13 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-args   = [a for a in sys.argv[1:] if a != "--log"]
-show_log = "--log" in sys.argv
-arg    = args[0] if args else None
+# El libro es un FILTRO opcional sobre auto_run_logs (que tiene columna `mode`),
+# no una tabla que elegir. Sin él, se ven los dos libros.
+raw      = [a.lower() for a in sys.argv[1:]]
+show_log = "--log" in raw
+book     = "live" if "live" in raw else ("paper" if "paper" in raw else None)
+args     = [a for a in raw if a not in ("--log", "live", "paper")]
+arg      = args[0] if args else None
 
 conn = psycopg2.connect(os.getenv("DATABASE_URL"))
 cur  = conn.cursor()
@@ -34,6 +38,12 @@ elif arg.isdigit() and int(arg) <= 31:      # últimos N
     where, params, titulo = "TRUE", (), f"últimos {arg} runs"
 else:                                        # id puntual
     where, params, titulo = "id = %s", (int(arg),), f"run id {arg}"
+
+# Acoplar el filtro de libro, si se pidió
+if book:
+    where  += " AND mode = %s"
+    params  = (*params, book)
+    titulo += f" · {book.upper()}"
 
 limit = f"LIMIT {int(arg)}" if (arg and arg.isdigit() and int(arg) <= 31) else ""
 

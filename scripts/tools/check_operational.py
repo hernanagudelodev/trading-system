@@ -15,17 +15,24 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-limit = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else 20
+# El libro filtra por la columna `mode` (auto_run_logs la tiene); sin él, ambos.
+_args = [a.lower() for a in sys.argv[1:]]
+book  = "live" if "live" in _args else ("paper" if "paper" in _args else None)
+_nums = [a for a in _args if a.isdigit()]
+limit = int(_nums[0]) if _nums else 20
+_mode_where = "WHERE mode = %s" if book else ""
+_mode_p     = (book,) if book else ()
 
 conn = psycopg2.connect(os.getenv("DATABASE_URL"))
 cur  = conn.cursor()
 
-cur.execute("""
+cur.execute(f"""
     SELECT run_at, slot, opened, closed, errors, run_time_sec
     FROM auto_run_logs
+    {_mode_where}
     ORDER BY run_at DESC
     LIMIT %s
-""", (limit,))
+""", (*_mode_p, limit))
 rows = cur.fetchall()
 
 if not rows:
@@ -62,13 +69,14 @@ print(f"    Aperturas acumuladas : {total_open}")
 print(f"    Cierres acumulados   : {total_close}")
 
 # Chequeo de cadencia: ¿hay días hábiles sin sus 2 slots?
-cur.execute("""
+cur.execute(f"""
     SELECT DATE(run_at) AS dia, COUNT(*) AS runs
     FROM auto_run_logs
     WHERE run_at >= NOW() - INTERVAL '10 days'
+    {"AND mode = %s" if book else ""}
     GROUP BY DATE(run_at)
     ORDER BY dia DESC
-""")
+""", _mode_p)
 print(f"\n  Runs por día (últimos 10 días) — esperado 2 por día hábil:")
 for dia, n in cur.fetchall():
     flag = "  ⚠️ menos de 2" if n < 2 else ""
