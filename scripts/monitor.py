@@ -298,17 +298,20 @@ def level_icon_emoji(level):
 
 
 
-def send_alert_notification(position, pnl_data, alert_level, reasons):
+def send_alert_notification(position, pnl_data, alert_level, reasons, mode="paper"):
     ticker   = position["ticker"]
     strategy = position.get("strategy", "")
     pnl      = pnl_data["gross_pnl"]
     pct      = pnl_data["profit_pct_of_max"] * 100
     dte      = pnl_data["dte"]
 
+    # El modo va en el título: con dos workers, una alerta URGENTE de plata real
+    # y una de paper no se pueden confundir.
+    tag = "🔴 LIVE" if mode == "live" else "📄 PAPER"
     level_titles = {
-        "URGENT": f"URGENTE — {ticker}",
-        "ACTION": f"ACCION — {ticker}",
-        "WATCH":  f"WATCH — {ticker}",
+        "URGENT": f"{tag} · URGENTE — {ticker}",
+        "ACTION": f"{tag} · ACCION — {ticker}",
+        "WATCH":  f"{tag} · WATCH — {ticker}",
     }
     priorities = {"URGENT": "urgent", "ACTION": "high", "WATCH": "default"}
 
@@ -774,7 +777,7 @@ def run_position_monitor():
         if alert_level in ("WATCH", "ACTION", "URGENT") and price_fresh:
             if get_market_status() in ("open", "pre"):
                 send_alert_notification(pos, {**pnl_data, "gross_pnl": gross_pnl},
-                                        alert_level, reasons)
+                                        alert_level, reasons, mode)
 
         # ── Cierre determinista — el worker es el ÚNICO dueño de stops de paper ─
         # Usa las mismas constantes canónicas que el monitor real (sin inventar

@@ -9,9 +9,10 @@ Solo cuenta trades del SISTEMA ACTUAL (post-reglas). Los anteriores al
 2026-06-20 son del sistema viejo sin gates y contaminan la expectativa.
 
 Uso:
-    python check_closed.py                 # desde 2026-06-20 (post-reglas)
-    python check_closed.py 2026-06-23      # desde otra fecha
-    python check_closed.py all             # todos (incluye era vieja)
+    python check_closed.py                      # libro del modo activo, desde 2026-06-20
+    python check_closed.py live                 # libro LIVE (positions)
+    python check_closed.py paper 2026-06-23     # paper, desde otra fecha
+    python check_closed.py live all             # live, todos
 """
 import os
 import sys
@@ -22,8 +23,19 @@ load_dotenv()
 
 EXCLUIR = ("PRE_RULES", "INVALID_STRIKES", "MANUAL_PRICE_FIX")
 
-arg   = sys.argv[1] if len(sys.argv) > 1 else "2026-06-20"
-desde = None if arg.lower() == "all" else arg
+# El libro entra por ARGUMENTO, no por el modo del proceso. Este script lo corre
+# el bot de Telegram, que es su propio servicio en `main` con TRADING_MODE=paper
+# — si mirara current_mode() SIEMPRE vería paper, sin importar qué le pidas.
+# Por eso el libro es explícito: 'live' o 'paper' como argumento.
+# Sin libro -> paper, el inofensivo: nunca mostrás plata real por accidente.
+args = [a.lower() for a in sys.argv[1:]]
+mode  = "live" if "live" in args else "paper"
+TABLE = "positions" if mode == "live" else "paper_positions"
+
+# Lo que no sea libro es el filtro de fecha (o 'all').
+resto = [a for a in args if a not in ("live", "paper")]
+arg   = resto[0] if resto else "2026-06-20"
+desde = None if arg == "all" else arg
 
 conn = psycopg2.connect(os.getenv("DATABASE_URL"))
 cur  = conn.cursor()
@@ -31,22 +43,22 @@ cur  = conn.cursor()
 if desde:
     cur.execute("""
         SELECT ticker, strategy, close_reason, gross_pnl, pnl_pct, closed_at
-        FROM paper_positions
+        FROM {table}
         WHERE UPPER(status) = 'CLOSED'
           AND (close_reason IS NULL OR close_reason NOT IN %s)
           AND closed_at >= %s
         ORDER BY closed_at
-    """, (EXCLUIR, desde))
-    print(f"\n  [Filtro: cerrados desde {desde} — sistema post-reglas]")
+    """.format(table=TABLE), (EXCLUIR, desde))
+    print(f"\n  [{mode.upper()} · cerrados desde {desde} — sistema post-reglas]")
 else:
     cur.execute("""
         SELECT ticker, strategy, close_reason, gross_pnl, pnl_pct, closed_at
-        FROM paper_positions
+        FROM {table}
         WHERE UPPER(status) = 'CLOSED'
           AND (close_reason IS NULL OR close_reason NOT IN %s)
         ORDER BY closed_at
-    """, (EXCLUIR,))
-    print(f"\n  [Filtro: TODOS los cerrados — incluye era vieja contaminada]")
+    """.format(table=TABLE), (EXCLUIR,))
+    print(f"\n  [{mode.upper()} · TODOS los cerrados — incluye era vieja contaminada]")
 
 rows = cur.fetchall()
 

@@ -56,16 +56,17 @@ POLL_TIMEOUT  = 30          # long polling: Telegram espera hasta 30s
 HTTP_TIMEOUT  = POLL_TIMEOUT + 10
 SCRIPT_TIMEOUT = 120        # un script colgado no puede tapar el bot
 
-# Un argumento válido: dígitos, 'all', o fecha YYYY-MM-DD. Nada más.
-ARG_OK = re.compile(r"^(all|\d{1,3}|\d{4}-\d{2}-\d{2})$")
+# Un argumento válido: 'live'/'paper' (libro), dígitos, 'all', fecha, o '--log'.
+# Cada token se valida por separado; nada que no matchee esto llega al script.
+ARG_OK = re.compile(r"^(live|paper|all|--log|\d{1,3}|\d{4}-\d{2}-\d{2})$")
 
 # ── WHITELIST ────────────────────────────────────────────────────────────────
 # comando -> (ruta del script, acepta_argumento, descripción)
 COMANDOS = {
-    "/open":        (os.path.join(_TOOLS, "check_open.py"),        False,
-                     "posiciones abiertas, exposición y concentración"),
+    "/open":        (os.path.join(_TOOLS, "check_open.py"),        True,
+                     "abiertas y exposición · arg: live | paper"),
     "/closed":      (os.path.join(_TOOLS, "check_closed.py"),      True,
-                     "cerradas y expectativa real · arg: fecha | all"),
+                     "cerradas y expectativa · arg: live|paper, fecha, all"),
     "/runs":        (os.path.join(_TOOLS, "check_runs.py"),        True,
                      "razonamiento de los runs · arg: N | fecha"),
     "/operational": (os.path.join(_TOOLS, "check_operational.py"), True,
@@ -161,12 +162,15 @@ def _manejar(texto):
     if len(partes) > 1:
         if not acepta:
             return ("Sin argumentos", f"{cmd} no acepta argumentos.", False)
-        arg = partes[1]
-        if not ARG_OK.match(arg):
-            return ("Argumento inválido",
-                    f"'{arg}' no es válido. Se acepta: un número, 'all', "
-                    f"o una fecha YYYY-MM-DD.", False)
-        args = [arg]
+        # Hasta 3 tokens, cada uno validado por separado. El script decide qué
+        # hacer con cada uno (libro, fecha, N); el bot solo garantiza que ningún
+        # token contenga nada fuera del patrón — la defensa contra inyección.
+        for arg in partes[1:4]:
+            if not ARG_OK.match(arg.lower()):
+                return ("Argumento inválido",
+                        f"'{arg}' no es válido. Se acepta: live, paper, un "
+                        f"número, 'all', una fecha YYYY-MM-DD, o --log.", False)
+            args.append(arg.lower())
 
     if not os.path.exists(script):
         return ("Script no encontrado", f"No existe {script}", False)
