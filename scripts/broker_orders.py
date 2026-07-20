@@ -182,13 +182,16 @@ async def _session_and_account():
 
     # httpx trae 5.0s por default y el sandbox va degradado: un endpoint que
     # devuelve 405 sin hacer nada tarda 2.1s. El refresh del token y la cadena
-    # se pasan de 5s y revientan con ReadTimeout — el 16-jul falló así, y
-    # 30 minutos antes había funcionado. Es una carrera, no un bug intermitente.
-    # _client es privado del SDK: si un upgrade lo renombra, esto se salta sin
-    # romper nada, y volvés al default de 5s.
+    # se pasan de 5s y revientan con ReadTimeout — el 16-jul falló así.
+    #
+    # Se asigna un FLOAT, no httpx.Timeout(...). En tastytrade 13.2.0 un camino
+    # interno hace `float + _client.timeout`, y con un objeto Timeout ahí eso
+    # revienta con "unsupported operand type(s) for +: 'float' and 'Timeout'" —
+    # que fue el error del primer auto_run en vivo (20-jul). httpx acepta el
+    # float y lo envuelve solo en Timeout(timeout=60.0), mismo efecto sin romper
+    # la suma. _client es privado: si un upgrade lo renombra, el except lo salta.
     try:
-        import httpx
-        session._client.timeout = httpx.Timeout(SESSION_TIMEOUT)
+        session._client.timeout = float(SESSION_TIMEOUT)
     except Exception as e:
         print(f"    (no se pudo subir el timeout de la sesión: {e})")
 
