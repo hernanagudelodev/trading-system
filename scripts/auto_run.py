@@ -116,11 +116,31 @@ def run_scanner():
 # STEP 3 — Paper Sync
 # ══════════════════════════════════════════════════════════════════════════════
 
-def run_paper_sync():
-    print("\n  [3/6] Running paper_sync...")
+def run_step3_sync():
+    """
+    Paso 3: sincroniza P&L y detecta cierres, en el libro del modo activo.
+
+    paper -> cmd_paper_sync(): recalcula P&L de paper_positions con precios reales
+             y auto-cierra stops/targets de paper.
+    live  -> run_sync(): baja del broker a `positions` — el estado real manda.
+
+    EL BUG QUE ESTO ARREGLA (20-jul, primer auto_run en live)
+        Antes esto llamaba cmd_paper_sync() SIEMPRE, sin mirar el modo. En live
+        el paso 3 sincronizaba contra paper_positions — la tabla equivocada —
+        mientras el resto del run operaba sobre la cuenta real. Mismo patrón que
+        el bug del monitor: dos funciones (una paper, una live) y el llamador
+        elegía la de paper sin preguntar el modo. La bandera vive en
+        current_mode() y en ningún otro lado.
+    """
+    from executor import current_mode
+    mode = current_mode()
+    print(f"\n  [3/6] Sincronizando [{mode}]...")
     try:
         import trade as trade_module
-        trade_module.cmd_paper_sync()
+        if mode == "live":
+            trade_module.run_sync()
+        else:
+            trade_module.cmd_paper_sync()
         return True
     except Exception as e:
         print(f"  ERROR: {e}")
@@ -132,29 +152,40 @@ def run_paper_sync():
 # ══════════════════════════════════════════════════════════════════════════════
 
 def get_current_state():
-    """Get open paper positions and recent closed positions from DB."""
+    """
+    Estado de la cartera del LIBRO ACTIVO para dárselo a Claude.
+
+    La tabla depende del modo — antes 'paper_positions' estaba hardcodeado, así
+    que en live le pasaba a Claude la cartera de PAPER como si fuera la real. La
+    decisión de qué abrir con plata real se tomaba mirando el libro equivocado:
+    el gate de concentración creería tomado un ticker que en la cuenta real está
+    libre, y al revés. Mismo patrón que execute_recommendations, que ya elegía
+    la tabla por modo — esta lectura se había quedado atrás.
+    """
+    from executor import current_mode
+    table = "positions" if current_mode() == "live" else "paper_positions"
     try:
         import psycopg2
         conn = psycopg2.connect(os.getenv("DATABASE_URL"))
         cur  = conn.cursor()
 
-        # Open paper positions
-        cur.execute("""
+        # Posiciones abiertas del libro activo
+        cur.execute(f"""
             SELECT ticker, strategy, strike_low, strike_high, expiration,
                    premium_paid, total_cost, gross_pnl, pnl_pct,
                    profit_pct_of_max, opened_at
-            FROM paper_positions
+            FROM {table}
             WHERE UPPER(status) = 'OPEN'
             ORDER BY opened_at DESC
         """)
         cols  = [d[0] for d in cur.description]
         open_positions = [dict(zip(cols, row)) for row in cur.fetchall()]
 
-        # Recently closed (last 5)
-        cur.execute("""
+        # Cerradas recientes (últimas 5) del mismo libro
+        cur.execute(f"""
             SELECT ticker, strategy, strike_low, strike_high,
                    gross_pnl, pnl_pct, close_reason, closed_at
-            FROM paper_positions
+            FROM {table}
             WHERE UPPER(status) = 'CLOSED'
             ORDER BY closed_at DESC
             LIMIT 5
@@ -1027,9 +1058,9 @@ def main():
                 priority="high",
             )
 
-        # Step 3 — Paper sync (auto-closes stop loss / target)
-        print("\n  [3/6] Running paper_sync...")
-        run_paper_sync()
+        # Step 3 — Sync del libro activo (auto-cierra stop/target en paper;
+        # en live baja el estado real del broker). Mode-aware: ver run_step3_sync.
+        run_step3_sync()
 
         # Step 4 — Get current DB state
         print("\n  [4/6] Reading DB state...")
