@@ -102,9 +102,24 @@ CIERRE_ESPERA     = 30     # ciclos de POLL_SEGUNDOS por nivel (~60s)
 # máxima en los DOS casos (pagás más débito, o cobrás menos crédito sobre el
 # mismo ancho), así que se cede sólo mientras el trade siga pasando el gate que
 # ya pasó al mid. Ver _concession_allowed.
-APERTURA_PASO       = 0.01
-APERTURA_CESION_MAX = 0.02
-APERTURA_ESPERA     = 10   # ciclos por nivel (~20s)
+APERTURA_PASO       = 0.02   # cuánto se cede por intento
+APERTURA_ESPERA     = 10     # ciclos por nivel (~20s)
+
+# La cesión de apertura es PROPORCIONAL al ancho del spread, no un valor fijo.
+# Un paso fijo de $0.02 es razonable en un spread de $3 (CCL) y ridículo en uno
+# de $13 (DLTR): en el ancho grande, ceder 2 centavos es ruido frente a un
+# bid/ask de 5-10, y el trade no llena aunque el R/R sea holgado (DLTR 20-jul:
+# R/R 2.38, el mejor del scanner, no abrió por ceder de a milímetros).
+#
+# Ceder el 1% del ancho escala solo:
+#     spread $3  -> tope $0.03      spread $13 -> tope $0.13
+# El R/R apenas se mueve (DLTR 2.38 -> 2.29 cediendo $0.10) y sigue holgado.
+# Y NADA de esto pisa el gate de riesgo: _concession_allowed corta antes si el
+# débito cedido sacaría el trade de MAX_RISK_DOLLARS. Dos topes, gana el que
+# corte primero. La apertura sigue siendo reacia — sólo que ahora reacia en
+# proporción, no en un número que no escala.
+APERTURA_CESION_PCT = 0.01   # 1% del ancho del spread
+APERTURA_CESION_MIN = 0.02   # piso: nunca menos que esto, para spreads angostos
 
 POLL_SEGUNDOS   = 2
 POLL_INTENTOS   = 30           # ~60s: un límite al mid llena o no llena
@@ -529,6 +544,10 @@ async def _open_async(intent, dry_run=False):
     attempt  = 0
     order_id = None
 
+    # Tope de cesión proporcional al ancho, con piso para spreads angostos.
+    ancho    = abs(float(intent.strike_high) - float(intent.strike_low))
+    cesion_max = max(APERTURA_CESION_MIN, round(ancho * APERTURA_CESION_PCT, 2))
+
     while True:
         try:
             if order_id is None:
@@ -580,11 +599,11 @@ async def _open_async(intent, dry_run=False):
         next_price = price - step
         conceded    = abs(float(initial - next_price))
 
-        if conceded > APERTURA_CESION_MAX + 1e-9:
+        if conceded > cesion_max + 1e-9:
             cancelled = await _cancel_order(session, account, order_id)
             return OrderResult("timeout", order_id=order_id, raw=final,
                                detail=(f"no llenó cediendo hasta "
-                                        f"${APERTURA_CESION_MAX:.2f} — "
+                                        f"${cesion_max:.2f} (1% de ${ancho:g}) — "
                                         + ("cancelled. No pasó nada."
                                            if cancelled else
                                            "NO SE PUDO CANCELAR, sigue viva en el broker.")))
@@ -604,7 +623,7 @@ async def _open_async(intent, dry_run=False):
         order   = _build_order(legs, price, f"{ext_id}-{attempt + 1}")
         attempt += 1
         print(f"    no llenó — cediendo a {price} "
-              f"(conceded ${conceded:.2f} de ${APERTURA_CESION_MAX:.2f})")
+              f"(conceded ${conceded:.2f} de ${cesion_max:.2f})")
 
 
 def open_spread(intent, dry_run=False) -> OrderResult:
