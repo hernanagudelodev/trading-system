@@ -1,17 +1,15 @@
-yfinance
-pandas
-psycopg2-binary
-python-dotenv
+# Core
+tastytrade==13.2.0
 anthropic
 requests
-schedule
-pytz
-tastytrade
-anthropic
-yfinance
-psycopg2-binary
 python-dotenv
-requests
+
+# Data
+yfinance
 pandas
 numpy
+
+# Infra
+psycopg2-binary
 schedule
+pytz

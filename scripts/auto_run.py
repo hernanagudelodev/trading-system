@@ -581,10 +581,15 @@ def execute_recommendations(analysis):
 
 def send_run_summary(market_ctx, analysis, results, run_time):
     """Send push notification with run summary — corto y completo, sin cortar frases."""
+    from executor import current_mode
+    mode    = current_mode()
+    tag     = "🔴 LIVE" if mode == "live" else "📄 PAPER"
     verdict = market_ctx.get("verdict", "N/A") if market_ctx else "N/A"
     vix     = market_ctx["vix"]["current"] if market_ctx else "N/A"
 
-    lines = [f"🤖 Auto-run {datetime.now().strftime('%H:%M')} | {verdict} | VIX {vix}"]
+    # El modo va PRIMERO y con color: con dos workers corriendo, lo primero que
+    # tenés que saber al ver el push es si movió plata real o no.
+    lines = [f"{tag} · Auto-run {datetime.now().strftime('%H:%M')} | {verdict} | VIX {vix}"]
 
     # Headline: frase completa que el LLM escribió para que quepa (no se trunca).
     # Fallback al analysis_summary recortado en límite de palabra si no hay headline.
@@ -625,7 +630,7 @@ def send_run_summary(market_ctx, analysis, results, run_time):
     priority = "high" if results["opened"] or results["closed"] else "default"
 
     send_push(
-        title=f"Auto-run | {len(results['opened'])} abiertos | {len(results['closed'])} cerrados",
+        title=f"{tag} · {len(results['opened'])} abiertos · {len(results['closed'])} cerrados",
         message=message,
         priority=priority
     )
@@ -1007,8 +1012,11 @@ def main():
     start_time = time.time()
     timestamp  = datetime.now().strftime("%Y-%m-%d %H:%M")
 
+    from executor import current_mode
+    RUN_TAG = "🔴 LIVE" if current_mode() == "live" else "📄 PAPER"
+
     print(f"\n{'=' * 55}")
-    print(f"  AUTO RUN — {timestamp}")
+    print(f"  AUTO RUN [{current_mode()}] — {timestamp}")
     print(f"{'=' * 55}")
 
     if not is_market_day():
@@ -1035,7 +1043,7 @@ def main():
         if not ok:  # level == 'abort'
             run_time = time.time() - start_time
             send_push(
-                title="🚨 Auto-run ABORTADO — datos inválidos",
+                title=f"{RUN_TAG} · 🚨 Auto-run ABORTADO — datos inválidos",
                 message=(
                     f"Run {timestamp} abortado ANTES de la IA.\n"
                     f"{reason}\n"
@@ -1053,7 +1061,7 @@ def main():
 
         if level == "warn":
             send_push(
-                title="⚠️ Auto-run — datos sospechosos",
+                title=f"{RUN_TAG} · ⚠️ Auto-run — datos sospechosos",
                 message=f"Run {timestamp}: {reason}\nContinúa, pero revisá.",
                 priority="high",
             )
@@ -1082,7 +1090,7 @@ def main():
             print(f"\n  [event-gate] BLOQUEADO: {ev['event']} VERY_HIGH en "
                   f"{ev['days_away']}d → {dropped} apertura(s) descartada(s)")
             send_push(
-                title="🚫 Aperturas bloqueadas — evento VERY_HIGH",
+                title=f"{RUN_TAG} · 🚫 Aperturas bloqueadas — evento VERY_HIGH",
                 message=(
                     f"{ev['event']} en {ev['days_away']}d (VERY_HIGH).\n"
                     f"El LLM propuso {dropped} apertura(s); la compuerta las descartó.\n"
@@ -1127,7 +1135,7 @@ def main():
 
         # Send failure alert
         send_push(
-            title="🚨 Auto-run FALLÓ",
+            title=f"{RUN_TAG} · 🚨 Auto-run FALLÓ",
             message=(
                 f"Error en auto-run {timestamp}\n"
                 f"Error: {error_msg[:200]}\n"
