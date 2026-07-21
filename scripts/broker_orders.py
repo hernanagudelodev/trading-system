@@ -515,9 +515,12 @@ async def _open_async(intent, dry_run=False):
     try:
         import pricing
         opt = "put" if float(intent.debit) < 0 else "call"
-        q = pricing.get_spread_quote(intent.ticker, intent.strike_low,
-                                     intent.strike_high, intent.expiration,
-                                     option_type=opt, retries=1)
+        # await directo a la versión async — NO get_spread_quote, que hace
+        # asyncio.run() adentro y revienta con "cannot be called from a running
+        # event loop" porque _open_async YA corre dentro de un loop.
+        q = await pricing._fetch_spread_quote_async(
+            intent.ticker, intent.strike_low, intent.strike_high,
+            intent.expiration, opt)
         if q:
             brecha = round(q["ask"] - q["bid"], 2)
             print(f"    quote: bid {q['bid']:.2f} / ask {q['ask']:.2f} / "
