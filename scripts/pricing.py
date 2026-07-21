@@ -20,18 +20,24 @@ import time
 import asyncio
 
 
-def _leg_mid(q):
-    """Mid de una pata. Si falta bid O ask (0/None), devuelve None (sin dato)."""
+def _leg_quote(q):
+    """(bid, ask, mid) de una pata. Si falta bid O ask (0/None), devuelve None."""
     if q is None:
         return None
     bid = float(q.bid_price) if q.bid_price else 0.0
     ask = float(q.ask_price) if q.ask_price else 0.0
     if bid <= 0 or ask <= 0:
         return None
-    return (bid + ask) / 2
+    return (bid, ask, (bid + ask) / 2)
 
 
-async def _fetch_spread_value_async(ticker, strike_low, strike_high,
+def _leg_mid(q):
+    """Solo el mid de una pata, o None. Envuelve a _leg_quote."""
+    lq = _leg_quote(q)
+    return lq[2] if lq else None
+
+
+async def _fetch_spread_quote_async(ticker, strike_low, strike_high,
                                     expiration, option_type):
     from tastytrade import Session, DXLinkStreamer
     from tastytrade.instruments import NestedOptionChain
@@ -94,34 +100,59 @@ async def _fetch_spread_value_async(ticker, strike_low, strike_high,
             except asyncio.TimeoutError:
                 break
 
-    long_mid  = _leg_mid(quotes_map.get(long_sym))
-    short_mid = _leg_mid(quotes_map.get(short_sym))
-    if long_mid is None or short_mid is None:
+    long_q  = _leg_quote(quotes_map.get(long_sym))
+    short_q = _leg_quote(quotes_map.get(short_sym))
+    if long_q is None or short_q is None:
         return None          # sin dato confiable de dos lados => None
 
+    lbid, lask, lmid = long_q
+    sbid, sask, smid = short_q
+
     if option_type == "put":
-        spread_val = round(short_mid - long_mid, 2)   # Bull Put: short - long
+        spread_mid = round(smid - lmid, 2)            # Bull Put: short - long
+        # bid del spread = lo peor al ejecutar; ask = lo mejor. Extremos cruzados.
+        spread_bid = round(sbid - lask, 2)
+        spread_ask = round(sask - lbid, 2)
     else:
-        spread_val = round(long_mid - short_mid, 2)   # Bull Call: long - short
+        spread_mid = round(lmid - smid, 2)            # Bull Call: long - short
+        spread_bid = round(lbid - sask, 2)
+        spread_ask = round(lask - sbid, 2)
 
     # Un spread con 20-40 DTE nunca vale $0.00. <= 0 => sin dato real => None.
-    return spread_val if spread_val > 0 else None
+    if spread_mid <= 0:
+        return None
+    return {"mid": spread_mid, "bid": spread_bid, "ask": spread_ask}
 
 
-def get_spread_value(ticker, strike_low, strike_high, expiration,
+def get_spread_quote(ticker, strike_low, strike_high, expiration,
                      option_type="call", retries=3, delay=2):
     """
-    Wrapper síncrono con reintentos. Cada intento = event loop + sesión frescos.
-    Devuelve el valor del spread por acción (float > 0), o None si falla.
+    Devuelve {"mid","bid","ask"} del spread (floats), o None si falla.
+
+    bid = lo que te pagarían / lo que cuesta al peor precio de ejecución;
+    ask = el otro extremo. La brecha ask-bid dice por qué una orden al mid no
+    llena: si el ask está lejos del mid, ceder de a centavos no cruza el spread.
+    Fuente ÚNICA del quote del spread. get_spread_value delega acá para el mid.
     """
     for attempt in range(retries):
         try:
-            val = asyncio.run(_fetch_spread_value_async(
+            q = asyncio.run(_fetch_spread_quote_async(
                 ticker, strike_low, strike_high, expiration, option_type))
-            if val is not None and val > 0:
-                return val
+            if q is not None and q["mid"] > 0:
+                return q
         except Exception as e:
             print(f"  pricing error ({ticker}): {e}")
         if attempt < retries - 1:
             time.sleep(delay)
     return None
+
+
+def get_spread_value(ticker, strike_low, strike_high, expiration,
+                     option_type="call", retries=3, delay=2):
+    """
+    Mid del spread por acción (float > 0), o None. Envuelve get_spread_quote —
+    la firma y el contrato NO cambian: los ~5 llamadores siguen igual.
+    """
+    q = get_spread_quote(ticker, strike_low, strike_high, expiration,
+                         option_type, retries, delay)
+    return q["mid"] if q else None
