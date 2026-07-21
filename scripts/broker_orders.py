@@ -98,22 +98,17 @@ CIERRE_ESPERA     = 30     # ciclos de POLL_SEGUNDOS por nivel (~60s)
 # Pero $0.44 clavado tampoco: un centavo suele ser la diferencia entre llenar y
 # no llenar. Reacia, no rígida.
 #
-# El TOPE REAL no es este número: es MAX_RISK_DOLLARS. Ceder sube la pérdida
-# máxima en los DOS casos (pagás más débito, o cobrás menos crédito sobre el
-# mismo ancho), así que se cede sólo mientras el trade siga pasando el gate que
-# ya pasó al mid. Ver _concession_allowed.
-APERTURA_PASO       = 0.02   # cuánto se cede por intento
-APERTURA_ESPERA     = 10     # ciclos por nivel (~20s)
+APERTURA_PASO       = 0.02
+APERTURA_ESPERA     = 10
 
-# La cesión de apertura es PROPORCIONAL al ancho del spread, no un valor fijo.
-# Un paso fijo de $0.02 es razonable en un spread de $3 (CCL) y ridículo en uno
-# de $13 (DLTR): en el ancho grande, ceder 2 centavos es ruido frente a un
-# bid/ask de 5-10, y el trade no llena aunque el R/R sea holgado.
-#     spread $3  -> tope $0.03      spread $13 -> tope $0.13
-# Y NADA de esto pisa el gate: _concession_allowed corta antes si el débito
-# cedido sacaría el trade de MAX_RISK_DOLLARS. Gana el que corte primero.
-APERTURA_CESION_PCT = 0.01   # 1% del ancho del spread
-APERTURA_CESION_MIN = 0.02   # piso para spreads angostos
+# ── QUOTE FRESCO DE APERTURA (B1) ─────────────────────────────────────────────
+# El precio de apertura se decide con un quote tomado a segundos de mandar la
+# orden, NO con el mid del scanner (que llega con ~2 min). Si el quote no llega
+# tras QUOTE_INTENTOS, se SALTA el candidato: no se abre con dato viejo ni con un
+# tope ciego. No es reintento infinito — un feed roto en un ticker no puede
+# colgar las aperturas siguientes de la lista.
+QUOTE_INTENTOS = 6
+QUOTE_ESPERA   = 2      # segundos entre intentos
 
 POLL_SEGUNDOS   = 2
 POLL_INTENTOS   = 30           # ~60s: un límite al mid llena o no llena
@@ -498,37 +493,57 @@ async def _open_async(intent, dry_run=False):
     if err:
         return OrderResult("error", detail=err)
 
-    price = _order_price(intent.debit)
     ext_id = client_order_id(intent)
-    order  = _build_order(legs, price, ext_id)
+    opt    = "put" if float(intent.debit) < 0 else "call"
 
-    side = "débito" if float(intent.debit) > 0 else "crédito"
-    print(f"    [{env}] {intent.ticker} ${intent.strike_low}/{intent.strike_high} "
-          f"{intent.expiration} · {side} {abs(float(intent.debit)):.2f} "
-          f"-> price={price} · id={ext_id}")
-
-    # DIAGNÓSTICO: bid/ask del spread. Un límite al mid llena al ASK; si el ask
-    # está lejos del mid, ceder de a centavos no cruza la brecha y la orden no
-    # llena (PNC 21-jul: cedió 6 pasos hasta el tope y no abrió). Sin esta línea,
-    # en el log no se distingue "el mercado no vendió" de "cedí poco". Es sólo
-    # diagnóstico: no cambia ninguna decisión, y si falla no frena la apertura.
-    try:
-        import pricing
-        opt = "put" if float(intent.debit) < 0 else "call"
-        # await directo a la versión async — NO get_spread_quote, que hace
-        # asyncio.run() adentro y revienta con "cannot be called from a running
-        # event loop" porque _open_async YA corre dentro de un loop.
-        q = await pricing._fetch_spread_quote_async(
-            intent.ticker, intent.strike_low, intent.strike_high,
-            intent.expiration, opt)
+    # ── QUOTE FRESCO — REQUISITO, no diagnóstico ──────────────────────────────
+    # 6 intentos. Cada uno abre sesión + streamer propios (secuencial, NO
+    # concurrente) y puede tardar hasta ~12s si el feed va lento. Ese es el peor
+    # caso de espera de este candidato, y solo ocurre cuando el quote falla.
+    import pricing
+    q = None
+    for intento in range(QUOTE_INTENTOS):
+        try:
+            q = await pricing._fetch_spread_quote_async(
+                intent.ticker, intent.strike_low, intent.strike_high,
+                intent.expiration, opt)
+        except Exception as e:
+            print(f"    quote {intento + 1}/{QUOTE_INTENTOS}: error ({e})")
+            q = None
         if q:
             brecha = round(q["ask"] - q["bid"], 2)
-            print(f"    quote: bid {q['bid']:.2f} / ask {q['ask']:.2f} / "
-                  f"mid {q['mid']:.2f} · brecha ${brecha:.2f}")
-        else:
-            print(f"    quote: sin dato de bid/ask en este instante")
-    except Exception as e:
-        print(f"    quote: no se pudo leer bid/ask ({e})")
+            print(f"    quote OK ({intento + 1}/{QUOTE_INTENTOS}): "
+                  f"bid {q['bid']:.2f} / ask {q['ask']:.2f} / mid {q['mid']:.2f} "
+                  f"· brecha ${brecha:.2f}")
+            break
+        print(f"    quote {intento + 1}/{QUOTE_INTENTOS}: sin dato")
+        if intento < QUOTE_INTENTOS - 1:
+            await asyncio.sleep(QUOTE_ESPERA)
+
+    # B1: sin quote, se salta el candidato. No se abre a ciegas.
+    if not q:
+        return OrderResult(
+            "timeout",
+            detail=(f"{intent.ticker}: no se obtuvo quote (bid/ask/mid) tras "
+                    f"{QUOTE_INTENTOS} intentos — se SALTA. No se abre con el mid "
+                    f"del scanner ni con tope ciego."))
+
+    # Precio inicial = MID FRESCO. Piso de cesión = precio marketable real:
+    #   débito (BCS): se compra -> llena al ASK  -> ceder baja price hacia -ask
+    #   crédito (BPS): se vende  -> llena al BID  -> ceder baja price hacia  bid
+    if opt == "call":
+        price       = _order_price(q["mid"])      # -mid
+        price_floor = _order_price(q["ask"])      # -ask (el más negativo)
+    else:
+        price       = Decimal(str(q["mid"]))      # crédito positivo
+        price_floor = Decimal(str(q["bid"]))      # bid (crédito menor)
+
+    order = _build_order(legs, price, ext_id)
+
+    side = "débito" if opt == "call" else "crédito"
+    print(f"    [{env}] {intent.ticker} ${intent.strike_low}/{intent.strike_high} "
+          f"{intent.expiration} · {side} mid {q['mid']:.2f} "
+          f"-> price={price} · piso {price_floor} · id={ext_id}")
 
     # ── 1. DRY RUN — el broker valida ANTES de que exista nada ────────────────
     try:
@@ -555,9 +570,6 @@ async def _open_async(intent, dry_run=False):
     #   BPS: price +1.38 -> +1.36  (cobrás menos crédito)
     initial  = price
     step     = Decimal(str(APERTURA_PASO))
-
-    ancho    = abs(float(intent.strike_high) - float(intent.strike_low))
-    cesion_max = max(APERTURA_CESION_MIN, round(ancho * APERTURA_CESION_PCT, 2))
     attempt  = 0
     order_id = None
 
@@ -608,35 +620,39 @@ async def _open_async(intent, dry_run=False):
             return OrderResult("rejected", order_id=order_id, raw=final,
                                detail=f"el broker la rechazó: {why}")
 
-        # No llenó. ¿Se puede ceder un paso más?
-        next_price = price - step
-        conceded    = abs(float(initial - next_price))
-
-        if conceded > cesion_max + 1e-9:
+        # No llenó. Ceder hacia el precio marketable real (ask/bid del quote).
+        # Dos frenos, corta el primero: el piso ask/bid y el gate de riesgo.
+        if price <= price_floor + Decimal("1e-9"):
+            # Ya estábamos en el ask/bid real y no llenó: el mercado se movió.
+            # No hay a dónde ceder sin pagar de más por algo que no ejecuta.
             cancelled = await _cancel_order(session, account, order_id)
             return OrderResult("timeout", order_id=order_id, raw=final,
-                               detail=(f"no llenó cediendo hasta "
-                                        f"${cesion_max:.2f} (1% de ${ancho:g}) — "
+                               detail=(f"no llenó ni al precio marketable real "
+                                        f"(ask/bid {abs(float(price_floor)):.2f}) — "
                                         + ("cancelled. No pasó nada."
                                            if cancelled else
-                                           "NO SE PUDO CANCELAR, sigue viva en el broker.")))
+                                           "NO SE PUDO CANCELAR, sigue viva.")))
+
+        next_price = price - step
+        if next_price < price_floor:
+            next_price = price_floor      # no pasar del ask/bid real
 
         if not _concession_allowed(intent, next_price):
-            # El precio cedido sacaría al trade de MAX_RISK_DOLLARS. Ya no es la
-            # estructura que option_selector aprobó: es otra, más cara, que nadie
-            # miró. Un límite que cede sin límite no es un límite.
+            # Ceder hasta el ask/bid sacaría el trade de MAX_RISK_DOLLARS: ya no
+            # es la estructura que option_selector aprobó al mid. No se abre.
             cancelled = await _cancel_order(session, account, order_id)
             return OrderResult("timeout", order_id=order_id, raw=final,
-                               detail=("ceder otro step sacaría el trade del gate "
-                                        "de riesgo — no se abre. "
+                               detail=("ceder hasta el ask/bid sacaría el trade "
+                                        "del gate de riesgo — no se abre. "
                                         + ("cancelled." if cancelled else
                                            "NO SE PUDO CANCELAR.")))
 
-        price  = next_price
+        price   = next_price
         order   = _build_order(legs, price, f"{ext_id}-{attempt + 1}")
         attempt += 1
+        conceded = abs(float(initial - price))
         print(f"    no llenó — cediendo a {price} "
-              f"(conceded ${conceded:.2f} de ${cesion_max:.2f})")
+              f"(piso ask/bid {price_floor} · cedido ${conceded:.2f})")
 
 
 def open_spread(intent, dry_run=False) -> OrderResult:
