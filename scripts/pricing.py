@@ -18,6 +18,7 @@ API pública:
 import os
 import time
 import asyncio
+import datetime
 
 
 def _leg_quote(q):
@@ -56,9 +57,16 @@ async def _fetch_spread_quote_async(ticker, strike_low, strike_high,
         return None
     chain = chains[0]
 
+    # La expiración llega como STRING ISO ('2026-08-21') desde intent.expiration,
+    # pero exp.expiration_date del SDK es un datetime.date. `date == str` es
+    # SIEMPRE False aunque impriman igual — por eso el 21-jul fallaba 6/6 con la
+    # expiración correcta en la cadena. Se normaliza a date antes de comparar
+    # (mismo patrón que broker_orders._resolve_legs). Acepta str o date de
+    # entrada: get_spread_value (cierre) pasa un date y sigue funcionando.
+    target = datetime.date.fromisoformat(str(expiration))
     target_exp = None
     for exp in chain.expirations:
-        if exp.expiration_date == expiration:
+        if exp.expiration_date == target:
             target_exp = exp
             break
     if target_exp is None:
