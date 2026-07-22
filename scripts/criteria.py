@@ -639,13 +639,14 @@ def passes_hard_filters(criteria):
     Returns (passed: bool, reasons: list[str])
 
     Filters:
-        1. Trend bearish       → eliminate
-        2. Below SMA50         → eliminate
-        3. IV percentile       → strategy-aware:
+        1. Trend bearish        → eliminate
+        2. Below SMA50          → eliminate
+        2b. Below SMA200        → eliminate (rebote en tendencia bajista larga)
+        3. IV percentile        → strategy-aware:
            - Buying strategies (Long Call, Bull Call Spread): eliminate if IV > 80%
            - Selling strategies (Bull Put Spread): eliminate only if IV > 95% (extreme)
-        4. Earnings < 21 days  → IV crush risk (all strategies)
-        5. Open interest < 200 → insufficient liquidity
+        4. Earnings < 21 days   → IV crush risk (all strategies)
+        5. Open interest < 200  → insufficient liquidity
     """
     if criteria is None:
         return False, ["No data"]
@@ -660,10 +661,31 @@ def passes_hard_filters(criteria):
     if not trend.get("is_bullish", False):
         reasons.append(f"Bearish trend ({trend.get('pct_change', 0):+.1f}% 25d)")
 
-    # 2. SMA50
+    # 2. SMA50 y SMA200 — el precio tiene que estar sobre AMBAS.
+    #
+    # POR QUÉ SMA200 TAMBIÉN — VEEV, 22-jul-2026
+    #     Sólo SMA50 + trend 25d deja pasar el REBOTE dentro de una tendencia
+    #     bajista larga. VEEV entró con trend 25d +16.6% (alcista) y sobre SMA50,
+    #     estando -21.7% desde enero y BAJO la SMA200. La ventana de 25 días vio
+    #     fuerza donde había un rebote técnico. El reporte ya lo mostraba como
+    #     'MAs: Mixed' — el dato estaba a la vista y el LLM abrió igual.
+    #     Las reglas duras van en código, no en el prompt.
+    #
+    #     El dato ya existía: get_moving_averages() calcula above_sma200 desde
+    #     siempre; este filtro simplemente lo usa.
     ma = tech.get("moving_averages", {})
     if not ma.get("above_sma50", False):
         reasons.append("Below SMA50")
+
+    # NaN explícito, no rechazo silencioso: get_all_criteria acepta tickers con
+    # >=50 días de historia, pero SMA200 necesita 200. Con menos, sma200 es NaN
+    # y `price > NaN` da False — rechazaría por "Below SMA200" a una acción que
+    # sólo carece de historia. El motivo del rechazo no puede mentir.
+    sma200 = ma.get("sma200")
+    if sma200 is None or pd.isna(sma200):
+        reasons.append("SMA200 no disponible (histórico < 200 días)")
+    elif not ma.get("above_sma200", False):
+        reasons.append("Below SMA200 — rebote dentro de tendencia bajista larga")
 
     # 3. IV percentile — strategy-aware
     ivp = vol.get("iv_percentile")
