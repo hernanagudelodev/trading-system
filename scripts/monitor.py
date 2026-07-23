@@ -72,6 +72,40 @@ def get_stop_loss_pct(dte):
     else:
         return STOP_LOSS_PCT_LOW_DTE
 
+def auto_close_enabled():
+    """
+    ¿El monitor puede EJECUTAR cierres, o solo alertar?
+
+    MONITOR_AUTO_CLOSE=true   -> alerta Y cierra (comportamiento historico)
+    MONITOR_AUTO_CLOSE=false  -> alerta y NADA MAS. Vos cerras a mano.
+
+    OBLIGATORIA, SIN DEFAULT — a proposito
+        Un interruptor de seguridad que se puede quedar mal por un typo
+        silencioso no es un interruptor de seguridad. Si falta o el valor no se
+        entiende, el proceso MUERE al arrancar: Railway lo muestra caido y el
+        healthcheck se pone rojo. Un default habria sido la forma de terminar
+        operando en automatico creyendo que no.
+        Mismo criterio que EXECUTOR_ENV y MAX_PORTFOLIO_RISK_PCT.
+
+    POR QUE EXISTE — 23-jul
+        PAYX $100/$105 se cerro por STOP_LOSS a 2.02 con el spread valiendo
+        ~1.18 y PAYX plano en $110 todo el dia. El precio que disparo el stop
+        fue tambien el precio limite de la orden: un mid inflado no solo cierra
+        de mas, ademas paga de mas. Mientras el pricing no se audite, el monitor
+        avisa y el humano decide.
+    """
+    raw = os.getenv("MONITOR_AUTO_CLOSE", "").strip().lower()
+    if raw in ("true", "1", "yes", "on"):
+        return True
+    if raw in ("false", "0", "no", "off"):
+        return False
+    raise RuntimeError(
+        f"MONITOR_AUTO_CLOSE ausente o invalida (recibido: {raw!r}). "
+        f"Valores validos: true / false. No tiene default a proposito: "
+        f"decidir si el sistema puede gastar plata sola no se adivina."
+    )
+
+
 MARKET_OPEN_HOUR     = 9
 MARKET_OPEN_MIN      = 30
 MARKET_CLOSE_HOUR    = 16
@@ -630,9 +664,10 @@ def run_position_monitor():
     from executor import current_mode, get_executor
     load_dotenv()
 
-    mode  = current_mode()
-    TABLE = "positions" if mode == "live" else "paper_positions"
-    ex    = get_executor()
+    mode       = current_mode()
+    TABLE      = "positions" if mode == "live" else "paper_positions"
+    auto_close = auto_close_enabled()   # explota si falta: ver el helper
+    ex         = get_executor()
 
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
 
@@ -642,6 +677,10 @@ def run_position_monitor():
     status_label  = {"open": "ABIERTO", "pre": "PRE-MARKET", "closed": "CERRADO"}
     print(f"  Tabla: {TABLE} | Mercado: {status_label.get(market_status, '?')} | "
           f"Intervalo: {get_interval()}min")
+    if auto_close:
+        print(f"  Auto-cierre: ACTIVO — el monitor puede mandar ordenes")
+    else:
+        print(f"  Auto-cierre: DESACTIVADO — SOLO ALERTAS, nada se cierra solo")
     print(f"{'=' * 60}\n")
 
     conn = psycopg2.connect(os.getenv("DATABASE_URL"))
@@ -796,7 +835,24 @@ def run_position_monitor():
         # existía en live: escribir una tabla no le dice nada al broker.
         # Ahora la decisión es la misma para los dos libros y la ejecución la
         # resuelve el executor — paper escribe la DB, live manda una orden real.
-        if close_reason:
+        if close_reason and not auto_close:
+            # SOLO ALERTAS. El criterio disparo, pero el monitor no ejecuta.
+            # Se avisa fuerte y con los numeros necesarios para cerrar a mano;
+            # despues cae al UPDATE de P&L, porque la posicion sigue viva.
+            print(f"  → {close_reason} disparo · AUTO-CIERRE DESACTIVADO — "
+                  f"{ticker} NO se cierra, hay que hacerlo a mano")
+            send_push(
+                title=f"CERRAR A MANO [{mode}]: {ticker} ({close_reason})",
+                message=(f"{ticker} {strategy} ${strike_low}/{strike_high}\n"
+                         f"P&L ${gross_pnl:+.2f} ({pnl_pct:+.1f}%) | DTE {dte}\n"
+                         f"Valor del spread: ${precio:.2f}\n\n"
+                         f"El auto-cierre esta DESACTIVADO.\n"
+                         f"VERIFICA EL PRECIO EN TASTYTRADE antes de cerrar: "
+                         f"este valor sale del mismo pricing que esta en revision."),
+                priority="urgent",
+            )
+
+        elif close_reason:
             print(f"  → AUTO-CIERRE [{mode}]: {close_reason}")
             try:
                 cerrada = ex.close_position(ticker, close_reason)
