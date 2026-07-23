@@ -490,12 +490,65 @@ def insert_position(tt_pos, account_number):
     return pos_id
 
 
-def close_position_in_db(db_pos_id, close_price, close_reason="Closed in Tastytrade"):
-    """
-    Marca una posición real como cerrada.
+MAX_CLOSE_REASON = 50   # ancho real de close_reason en positions y paper_positions
 
-    close_price : prima RECIBIDA por acción al cerrar (float), o None si no se
-                  conoce. NO se inventa. None -> el P&L queda NULL.
+
+def _split_close_reason(close_reason, close_rationale):
+    """
+    Separa el CODIGO de cierre de la PROSA, y garantiza que el codigo entre en
+    la columna.
+
+    POR QUE EXISTE - 23-jul, con plata real
+        LiveExecutor pasaba f"CLOSED_LIVE: {reason}" con el motivo que escribe
+        el LLM (~450 chars) a una columna varchar(50). El UPDATE lanzaba
+        `value too long for type character varying(50)`, la excepcion quedaba
+        atrapada en un `except` que solo imprimia, y el cierre se reportaba como
+        exito. DLTR cerro en el broker a 1.87 y la DB nunca supo el precio.
+
+    POR QUE NO SE ENSANCHA LA COLUMNA
+        `close_reason` es un CODIGO: check_closed.py y las metricas de
+        expectativa agrupan por el (STOP_LOSS, TARGET_REACHED, MANUAL,
+        CLOSED_LIVE...). Meterle prosa rompe todo GROUP BY sin lanzar error.
+        Codigo corto aca; prosa en close_rationale TEXT.
+
+    POR QUE NO SE TRUNCA EN SILENCIO
+        Un codigo truncado ("El Bull Call Spread $127/$140 esta a -50.9% de...")
+        entra a las metricas como una categoria nueva por cada cierre y las
+        vuelve inutiles sin avisar. Se registra CLOSED_REASON_OVERFLOW, que se
+        ve de lejos en check_closed.py, y la prosa se conserva en su columna.
+
+    POR QUE ESTA FUNCION NO LANZA NUNCA
+        Corre DESPUES de que la orden real lleno. Una excepcion aca deja la
+        posicion cerrada en el broker y OPEN en la DB - el hueco de 16.2 y
+        exactamente lo que provoco este bug. Normaliza y sigue.
+    """
+    reason    = (close_reason or "").strip()
+    rationale = close_rationale
+
+    if not reason:
+        reason = "CLOSED_UNSPECIFIED"
+
+    if len(reason) > MAX_CLOSE_REASON:
+        print(f"  ⚠️  close_reason de {len(reason)} chars — esa columna es un "
+              f"CÓDIGO (máx {MAX_CLOSE_REASON}), no texto libre.")
+        print(f"      Se registra CLOSED_REASON_OVERFLOW y el texto va a "
+              f"close_rationale. ARREGLAR EL CALLER.")
+        if rationale is None:
+            rationale = reason
+        reason = "CLOSED_REASON_OVERFLOW"
+
+    return reason, rationale
+
+
+def close_position_in_db(db_pos_id, close_price, close_reason="Closed in Tastytrade",
+                         close_rationale=None):
+    """
+    Marca una posición como cerrada en `positions`.
+
+    close_price     : prima RECIBIDA por acción al cerrar (float), o None si no
+                      se conoce. NO se inventa. None -> el P&L queda NULL.
+    close_reason    : CÓDIGO corto (varchar 50). Las métricas agrupan por él.
+    close_rationale : prosa libre (TEXT), opcional. El porqué del cierre.
     Devuelve el gross_pnl, o None si no se pudo calcular.
 
     EL BUG QUE ESTO ARREGLA — 17-jul, con plata real
@@ -511,6 +564,15 @@ def close_position_in_db(db_pos_id, close_price, close_reason="Closed in Tastytr
         Es el mismo `0.0` que ya cazaste en cmd_paper_close y corregiste ahí.
         Esta copia quedó viva porque nadie había cerrado una posición REAL nunca.
 
+    EL SEGUNDO BUG — 23-jul, también con plata real
+        Arreglado el precio, el cierre seguía sin registrarse: el caller pasaba
+        la prosa del LLM en `close_reason` (varchar 50) y el UPDATE reventaba
+        DESPUÉS del fill. DLTR cerró a 1.87 en el broker y quedó con P&L NULL,
+        marcada CLOSED_PRICE_UNKNOWN por run_sync. Ver _split_close_reason.
+        La lección: esta función corre en el momento más frágil del sistema
+        —orden ya ejecutada, DB todavía no— y no puede lanzar por el contenido
+        de un campo descriptivo.
+
     POR QUÉ NULL Y NO 0
         Que el broker no la tenga es un HECHO: se marca CLOSED. Cuánto se ganó
         NO se sabe: se marca NULL. Un 0 y un -44 son los dos mentiras; NULL es
@@ -522,6 +584,8 @@ def close_position_in_db(db_pos_id, close_price, close_reason="Closed in Tastytr
         la posición ya desapareció y el dato se perdió. Un cierre sincronizado
         a posteriori queda como CLOSED_PRICE_UNKNOWN, a propósito.
     """
+    reason, rationale = _split_close_reason(close_reason, close_rationale)
+
     conn = get_db_connection()
     cur  = conn.cursor()
     cur.execute("""
@@ -539,6 +603,9 @@ def close_position_in_db(db_pos_id, close_price, close_reason="Closed in Tastytr
     contracts  = int(contracts or 1)
 
     # ── Sin precio: se cierra, pero NO se inventa el P&L ──────────────────────
+    # El CÓDIGO se pisa con CLOSED_PRICE_UNKNOWN (el hecho relevante es que no
+    # se sabe el precio, no quién lo pidió), pero la PROSA se conserva: el
+    # porqué del cierre sigue siendo válido aunque el precio se haya perdido.
     if close_price is None:
         cur.execute("""
             UPDATE positions SET
@@ -549,9 +616,10 @@ def close_position_in_db(db_pos_id, close_price, close_reason="Closed in Tastytr
                 gross_pnl        = NULL,
                 net_pnl          = NULL,
                 pnl_pct          = NULL,
-                close_reason     = %s
+                close_reason     = %s,
+                close_rationale  = %s
             WHERE id = %s
-        """, ("CLOSED_PRICE_UNKNOWN", db_pos_id))
+        """, ("CLOSED_PRICE_UNKNOWN", rationale, db_pos_id))
         conn.commit()
         cur.close()
         conn.close()
@@ -571,10 +639,11 @@ def close_position_in_db(db_pos_id, close_price, close_reason="Closed in Tastytr
             gross_pnl        = %s,
             net_pnl          = %s,
             pnl_pct          = %s,
-            close_reason     = %s
+            close_reason     = %s,
+            close_rationale  = %s
         WHERE id = %s
     """, (close_price, total_received, gross_pnl, gross_pnl, pnl_pct,
-          close_reason, db_pos_id))
+          reason, rationale, db_pos_id))
     conn.commit()
     cur.close()
     conn.close()
@@ -1028,7 +1097,23 @@ def cmd_paper_history():
     print()
 
 
-def cmd_paper_close(ticker, close_reason="MANUAL"):
+def cmd_paper_close(ticker, close_reason="MANUAL", close_rationale=None):
+    """
+    Cierra una posición paper.
+
+    close_reason    : CÓDIGO corto (varchar 50).
+    close_rationale : prosa libre (TEXT), opcional.
+
+    Mismo bug del 23-jul que en close_position_in_db: auto_run pasaba el motivo
+    del LLM entero acá y el UPDATE reventaba con
+    `value too long for type character varying(50)`. En paper no había plata en
+    juego, pero el efecto fue el mismo: DLTR y WFC se reportaron como
+    "cierre NO ejecutado (sin precio real)" — un mensaje FALSO, porque el precio
+    se había obtenido bien y el fallo era de esquema. Un error técnico
+    disfrazado de condición de mercado.
+    """
+    reason, rationale = _split_close_reason(close_reason, close_rationale)
+
     ensure_tables()
     conn = get_db_connection()
     cur  = conn.cursor()
@@ -1082,10 +1167,10 @@ def cmd_paper_close(ticker, close_reason="MANUAL"):
             current_spread_value = %s, current_value = %s,
             premium_received = %s, total_received = %s,
             gross_pnl = %s, pnl_pct = %s, profit_pct_of_max = %s,
-            close_reason = %s, last_synced_at = NOW()
+            close_reason = %s, close_rationale = %s, last_synced_at = NOW()
         WHERE id = %s
     """, (spread_value, current_value, spread_value, current_value,
-          gross_pnl, pnl_pct, profit_pct_max, close_reason, pos_id))
+          gross_pnl, pnl_pct, profit_pct_max, reason, rationale, pos_id))
 
     conn.commit()
     cur.close()
