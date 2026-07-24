@@ -60,6 +60,29 @@ MIN_POP_CREDIT   = 60                          # Bull Put Spread: POP mínimo (%
 MIN_SPREAD_WIDTH = 3                           # ancho mínimo ($): evita spreads de $1-2
                                                # donde el stop de -65% salta a -130% entre chequeos
 
+# ── Gates de LIQUIDEZ — la causa raíz del 23-jul ──────────────────────────────
+# PAYX $100/$105 se abrió con un libro que, medido, daba bid 0.15 / ask 2.55
+# sobre un ancho de $5: el valor del spread estaba en cualquier punto de una
+# banda de $2.40. Con esa dispersión el mid no es un precio, es un promedio de
+# dos números que nadie va a pagar. El stop de -65% lo cruzó por ruido y el
+# sistema cerró una posición sana pagando 2.02 por algo que valía ~1.18.
+#
+# Ninguna mejora de pricing arregla eso: el problema es el INSTRUMENTO, no el
+# canal (verificado el 24-jul: REST y DXLink coinciden al centavo). El filtro
+# tiene que estar al ABRIR.
+#
+# OI >= 200 (criteria.py) NO lo detecta: mide contratos vivos, no si hay
+# alguien cotizando hoy. PAYX tenía tamaños de 415/488 con el libro roto.
+MAX_SPREAD_BID_ASK_PCT   = 0.20   # (ask-bid) del spread / ancho de strikes
+MAX_MID_MARK_DIVERGENCE  = 0.10   # |mid - mark| / mark, del spread
+
+# Medido contra datos reales:
+#                    horquilla/ancho   mid vs mark
+#   PAYX  23-jul          48%              16%      -> rechazado por los DOS
+#   WRB   22-jul          21%              n/d      -> rechazado (ya lo habías
+#                                                      marcado a mano: OI 519)
+#   JNJ   24-jul         5.4%               0%      -> pasa
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # EXPIRACIÓN REAL — fuente única de verdad para la fecha (el LLM NO la elige)
@@ -116,7 +139,7 @@ async def _fetch_option_data(session, ticker, price, strategy):
     strategy: 'Long Call' | 'Bull Call Spread' | 'Bull Put Spread'
     """
     from tastytrade.instruments import NestedOptionChain
-    from tastytrade.dxfeed import Greeks, Quote
+    from tastytrade.dxfeed import Greeks
     from tastytrade import DXLinkStreamer
 
     empty = {"long_calls": [], "spreads": [], "put_spreads": [],
@@ -155,19 +178,22 @@ async def _fetch_option_data(session, ticker, price, strategy):
         if not candidate_strikes:
             return empty
 
-        # For Bull Put Spread we need put symbols; others need call symbols
-        if strategy == "Bull Put Spread":
-            symbols = [s.put_streamer_symbol for s in candidate_strikes]
+        # ── SÍMBOLOS ──────────────────────────────────────────────────────────
+        # streamer  -> Greeks (delta/theta/IV). Sólo DXLink los tiene.
+        # OCC       -> precios por REST. Vienen en el mismo objeto Strike
+        #              (s.call / s.put), sin ninguna búsqueda extra.
+        es_put = strategy == "Bull Put Spread"
+        if es_put:
+            symbols     = [s.put_streamer_symbol for s in candidate_strikes]
+            occ_symbols = [s.put for s in candidate_strikes]
         else:
-            symbols = [s.call_streamer_symbol for s in candidate_strikes]
+            symbols     = [s.call_streamer_symbol for s in candidate_strikes]
+            occ_symbols = [s.call for s in candidate_strikes]
 
+        # ── GREEKS · por streamer ─────────────────────────────────────────────
         greeks_map = {}
-        quotes_map = {}
-
         async with DXLinkStreamer(session) as streamer:
             await streamer.subscribe(Greeks, symbols)
-            await streamer.subscribe(Quote, symbols)
-
             for _ in symbols:
                 try:
                     g = await asyncio.wait_for(streamer.get_event(Greeks), timeout=10)
@@ -175,43 +201,83 @@ async def _fetch_option_data(session, ticker, price, strategy):
                 except asyncio.TimeoutError:
                     break
 
-            for _ in symbols:
-                try:
-                    q = await asyncio.wait_for(streamer.get_event(Quote), timeout=10)
-                    quotes_map[q.event_symbol] = q
-                except asyncio.TimeoutError:
-                    break
+        # ── PRECIOS · por REST, en UNA llamada para todos los strikes ─────────
+        # POR QUÉ REST Y NO LA SUSCRIPCIÓN A Quote QUE HABÍA ACÁ
+        #   DXLink publica eventos "as they occur" y la doc de tastytrade avisa
+        #   que en símbolos de baja liquidez puede no haber ninguno por minutos.
+        #   El bucle anterior tomaba el PRIMER evento de cada símbolo y cortaba:
+        #   para una consulta puntual eso es tomar lo primero que aparezca sin
+        #   saber de cuándo es. El endpoint de market data devuelve un snapshot
+        #   con bid, ask, mid, MARK y updated_at, y acepta una lista.
+        #
+        #   Se saca la suscripción a Quote en vez de dejar las dos: dos fuentes
+        #   del mismo precio son dos fuentes que pueden divergir, y este proyecto
+        #   ya pagó ese patrón con el P&L y con el pricing de spreads.
+        #
+        #   NOTA: el mark se usa SÓLO para el gate. El precio de referencia de la
+        #   estructura sigue siendo el mid, porque los fills reales llegan cerca
+        #   del mid (JNJ llenó 0.59 con mark 0.595; PAYX abrió a 1.20). El mark
+        #   es mejor para VALORAR, el mid para EJECUTAR.
+        from tastytrade.market_data import get_market_data_by_type
+        md_map = {}
+        try:
+            datos  = await get_market_data_by_type(session, options=occ_symbols)
+            md_map = {d.symbol: d for d in datos}
+        except Exception as e:
+            # Fail-closed y RUIDOSO: sin precios no se construye nada para este
+            # ticker. Un ticker que desaparece del scanner en silencio es
+            # exactamente el fallo que este proyecto persigue.
+            print(f"  ⛔ {ticker}: no se pudieron traer precios "
+                  f"({type(e).__name__}: {e}) — sin estructuras este run")
+            return empty
 
-        # Build unified strike table
+        # ── TABLA UNIFICADA ───────────────────────────────────────────────────
         strike_table = []
+        sin_precio   = 0
         for s in candidate_strikes:
-            sym = s.put_streamer_symbol if strategy == "Bull Put Spread" \
-                  else s.call_streamer_symbol
+            sym = s.put_streamer_symbol if es_put else s.call_streamer_symbol
+            occ = s.put if es_put else s.call
             g   = greeks_map.get(sym)
-            q   = quotes_map.get(sym)
+            md  = md_map.get(occ)
             if g is None or g.delta is None:
                 continue
+            if md is None:
+                sin_precio += 1
+                continue
 
-            delta        = float(g.delta)
-            strike_price = float(s.strike_price)
-            theta = float(g.theta)       if g.theta      else None
-            iv    = float(g.volatility) * 100 if g.volatility else None
-            bid   = float(q.bid_price)   if q and q.bid_price else 0.0
-            ask   = float(q.ask_price)   if q and q.ask_price else 0.0
-            theo  = float(g.price)       if g.price      else None
-            mid   = round((bid + ask) / 2, 2) if (bid and ask) else (theo or 0.0)
-            spread_pct = round((ask - bid) / ask * 100, 1) if ask > 0 else None
+            bid  = float(md.bid)  if md.bid  is not None else None
+            ask  = float(md.ask)  if md.ask  is not None else None
+            mid  = float(md.mid)  if md.mid  is not None else None
+            mark = float(md.mark) if md.mark is not None else None
+
+            # SIN DATO -> se descarta el strike. NO se inventa 0.0 ni se cae al
+            # precio teórico. La versión anterior hacía:
+            #     mid = (bid+ask)/2 if (bid and ask) else (theo or 0.0)
+            # o sea que una pata sin libro entraba valiendo CERO a los gates de
+            # riesgo. Un cero que parece precio, alimentando MAX_RISK_DOLLARS.
+            if bid is None or ask is None or mid is None or mark is None or ask <= 0:
+                sin_precio += 1
+                continue
+
+            if getattr(md, "trading_halted", False):
+                sin_precio += 1
+                continue
 
             strike_table.append({
-                "strike":     strike_price,
-                "delta":      delta,
-                "theta":      theta,
-                "iv":         iv,
+                "strike":     float(s.strike_price),
+                "delta":      float(g.delta),
+                "theta":      float(g.theta) if g.theta else None,
+                "iv":         float(g.volatility) * 100 if g.volatility else None,
                 "bid":        bid,
                 "ask":        ask,
                 "mid":        mid,
-                "spread_pct": spread_pct,
+                "mark":       mark,
+                "spread_pct": round((ask - bid) / ask * 100, 1) if ask > 0 else None,
+                "updated_at": getattr(md, "updated_at", None),
             })
+
+        if sin_precio:
+            print(f"  {ticker}: {sin_precio} strike(s) descartado(s) sin precio usable")
 
         strike_table.sort(key=lambda x: x["strike"])
 
@@ -224,9 +290,9 @@ async def _fetch_option_data(session, ticker, price, strategy):
             long_calls = _build_long_calls(strike_table, price)
         elif strategy == "Bull Call Spread":
             long_calls = _build_long_calls(strike_table, price)
-            spreads    = _build_call_spreads(strike_table, price)
+            spreads    = _build_call_spreads(strike_table, price, ticker)
         elif strategy == "Bull Put Spread":
-            put_spreads = _build_put_spreads(strike_table, price)
+            put_spreads = _build_put_spreads(strike_table, price, ticker)
 
         return {
             "long_calls":  long_calls,
@@ -240,6 +306,104 @@ async def _fetch_option_data(session, ticker, price, strategy):
     except Exception as e:
         print(f"  option_selector error for {ticker}: {e}")
         return empty
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GATE DE LIQUIDEZ — fuente única para los dos builders de spreads
+# ══════════════════════════════════════════════════════════════════════════════
+
+def spread_liquidity(long_leg, short_leg, width, is_credit):
+    """
+    Mide si el libro de un spread vertical es LEGIBLE.
+
+    Devuelve (ok: bool, info: dict). `info` sirve para el log y para el markdown:
+        bid_ask      horquilla del spread en dólares
+        bid_ask_pct  esa horquilla sobre el ancho de strikes
+        mid          valor del spread por mid  de cada pata
+        mark         valor del spread por mark de cada pata
+        divergence   |mid - mark| / mark
+        motivo       None si pasa; el texto del rechazo si no
+
+    POR QUÉ LA HORQUILLA ES LA SUMA DE LAS PATAS
+        spread_ask - spread_bid = (lask-lbid) + (sask-sbid), tanto para débito
+        como para crédito — los términos cruzados se cancelan. Verificado contra
+        PAYX (1.00 + 1.40 = 2.40, y el spread daba 0.15/2.55) y contra JNJ
+        (0.11 + 0.16 = 0.27, y el spread daba 0.46/0.73). Por eso no hace falta
+        ramificar por dirección acá.
+
+    POR QUÉ DOS CRITERIOS Y NO UNO
+        Son señales independientes. La horquilla dice si el libro es legible;
+        la divergencia mid/mark dice si el broker está de acuerdo con nuestro
+        número. PAYX fallaba las dos; un instrumento puede fallar una sola.
+
+    POR QUÉ NO SE MIRAN LOS TAMAÑOS
+        PAYX tenía bid_size 415 / ask_size 488 con el libro roto, y JNJ tenía 1/1
+        con el libro sano. No discriminan.
+    """
+    lbid, lask = long_leg["bid"],  long_leg["ask"]
+    sbid, sask = short_leg["bid"], short_leg["ask"]
+
+    bid_ask     = round((lask - lbid) + (sask - sbid), 4)
+    bid_ask_pct = bid_ask / width if width else None
+
+    if is_credit:
+        mid  = round(short_leg["mid"]  - long_leg["mid"],  4)
+        mark = round(short_leg["mark"] - long_leg["mark"], 4)
+    else:
+        mid  = round(long_leg["mid"]  - short_leg["mid"],  4)
+        mark = round(long_leg["mark"] - short_leg["mark"], 4)
+
+    divergence = abs(mid - mark) / abs(mark) if mark else None
+
+    info = {"bid_ask": bid_ask, "bid_ask_pct": bid_ask_pct,
+            "mid": mid, "mark": mark, "divergence": divergence,
+            "motivo": None}
+
+    if bid_ask_pct is None or bid_ask_pct > MAX_SPREAD_BID_ASK_PCT:
+        info["motivo"] = (f"horquilla ${bid_ask:.2f} = "
+                          f"{(bid_ask_pct or 0)*100:.0f}% del ancho "
+                          f"(máx {MAX_SPREAD_BID_ASK_PCT*100:.0f}%)")
+        return False, info
+
+    # mark ausente o cero: no se puede contrastar. No se asume que está bien.
+    if divergence is None:
+        info["motivo"] = "sin mark del broker para contrastar el mid"
+        return False, info
+
+    if divergence > MAX_MID_MARK_DIVERGENCE:
+        info["motivo"] = (f"mid {mid:.2f} vs mark {mark:.2f} = "
+                          f"{divergence*100:.0f}% de divergencia "
+                          f"(máx {MAX_MID_MARK_DIVERGENCE*100:.0f}%)")
+        return False, info
+
+    return True, info
+
+
+def _report_descartes(ticker, estrategia, descartes, sobrevivientes):
+    """
+    Imprime cuántas estructuras cortó el gate de liquidez y por qué.
+
+    POR QUÉ EXISTE
+        Un gate que rechaza en silencio no se puede auditar: "no rechazó nada"
+        y "no está corriendo" se ven exactamente igual en el log. criteria.py ya
+        imprime el motivo de cada eliminación ("✗ Below SMA200 — ..."); este
+        gate nace mudo y hay que emparejarlo.
+
+        Importa especialmente cuando un ticker se queda en CERO estructuras: sin
+        esta línea, desaparece del scanner sin explicación y parece que el
+        mercado no ofrecía nada. Es el mismo fallo silencioso que el bug raíz de
+        junio, donde la falta de datos se leyó como "no hay oportunidades".
+
+    Se muestra un ejemplo, no la lista entera: el bucle prueba todas las
+    combinaciones long × short, así que una sola pata con el libro roto genera
+    muchos rechazos. El número dice cuánto se cortó; el ejemplo, por qué.
+    """
+    if not descartes:
+        return
+    marca = " · CERO estructuras" if sobrevivientes == 0 else ""
+    print(f"    {ticker} [{estrategia}]: {len(descartes)} estructura(s) "
+          f"descartada(s) por liquidez{marca}")
+    print(f"      ej: {descartes[0]}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -293,13 +457,14 @@ def _build_long_calls(strike_table, price):
 # BULL CALL SPREAD BUILDER
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _build_call_spreads(strike_table, price):
+def _build_call_spreads(strike_table, price, ticker=""):
     long_cands  = [s for s in strike_table
                    if SPREAD_LONG_DELTA_RANGE[0] <= s["delta"] <= SPREAD_LONG_DELTA_RANGE[1]]
     short_cands = [s for s in strike_table
                    if SPREAD_SHORT_DELTA_RANGE[0] <= s["delta"] <= SPREAD_SHORT_DELTA_RANGE[1]]
 
-    spreads = []
+    spreads   = []
+    descartes = []      # motivos de rechazo por liquidez, para el log
     for long_leg in long_cands:
         for short_leg in short_cands:
             if short_leg["strike"] <= long_leg["strike"]:
@@ -324,7 +489,19 @@ def _build_call_spreads(strike_table, price):
             if rr < MIN_RR_DEBIT:
                 continue
 
+            # Gate de LIQUIDEZ — ver spread_liquidity()
+            liq_ok, liq = spread_liquidity(long_leg, short_leg, spread_width,
+                                           is_credit=False)
+            if not liq_ok:
+                descartes.append(
+                    f"${long_leg['strike']:.1f}/${short_leg['strike']:.1f}: "
+                    f"{liq['motivo']}")
+                continue
+
             spreads.append({
+                "bid_ask":     liq["bid_ask"],
+                "bid_ask_pct": round(liq["bid_ask_pct"] * 100, 1),
+                "mark":        liq["mark"],
                 "long_strike":   long_leg["strike"],
                 "short_strike":  short_leg["strike"],
                 "long_delta":    round(long_leg["delta"], 3),
@@ -341,6 +518,7 @@ def _build_call_spreads(strike_table, price):
                 "within_budget": True,
             })
 
+    _report_descartes(ticker, "Bull Call Spread", descartes, len(spreads))
     spreads.sort(key=lambda x: (not x["within_budget"], -x["risk_reward"]))
     return spreads[:MAX_SPREADS]
 
@@ -349,7 +527,7 @@ def _build_call_spreads(strike_table, price):
 # BULL PUT SPREAD BUILDER
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _build_put_spreads(strike_table, price):
+def _build_put_spreads(strike_table, price, ticker=""):
     """
     Build Bull Put Spread candidates.
 
@@ -377,6 +555,7 @@ def _build_put_spreads(strike_table, price):
                    and s["strike"] < price]  # further OTM
 
     put_spreads = []
+    descartes   = []    # motivos de rechazo por liquidez, para el log
     for short_leg in short_cands:
         for long_leg in long_cands:
             # Long put must have lower strike than short put
@@ -409,7 +588,19 @@ def _build_put_spreads(strike_table, price):
             if pop_approx < MIN_POP_CREDIT:
                 continue
 
+            # Gate de LIQUIDEZ — ver spread_liquidity()
+            liq_ok, liq = spread_liquidity(long_leg, short_leg, spread_width,
+                                           is_credit=True)
+            if not liq_ok:
+                descartes.append(
+                    f"${short_leg['strike']:.1f}/${long_leg['strike']:.1f}: "
+                    f"{liq['motivo']}")
+                continue
+
             put_spreads.append({
+                "bid_ask":     liq["bid_ask"],
+                "bid_ask_pct": round(liq["bid_ask_pct"] * 100, 1),
+                "mark":        liq["mark"],
                 "short_strike":   short_leg["strike"],   # sell this (higher)
                 "long_strike":    long_leg["strike"],    # buy this (lower, protection)
                 "short_delta":    round(short_leg["delta"], 3),
@@ -426,6 +617,7 @@ def _build_put_spreads(strike_table, price):
                 "stop_loss_2x":   round(net_credit * 2 * 100, 0),  # close if spread costs 2x credit
             })
 
+    _report_descartes(ticker, "Bull Put Spread", descartes, len(put_spreads))
     # Sort: best R/R first
     put_spreads.sort(key=lambda x: -x["risk_reward"])
     return put_spreads[:MAX_SPREADS]
