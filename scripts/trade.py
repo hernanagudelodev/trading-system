@@ -257,6 +257,39 @@ def group_spreads(tt_positions):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# OCC OPTION SYMBOL — single source of truth
+# ══════════════════════════════════════════════════════════════════════════════
+
+def build_occ_symbol(ticker, expiration, option_type, strike):
+    """
+    Build an OCC option symbol: 'ROOT  YYMMDD C|P SSSSSSSS'.
+
+        ROOT   : ticker left-justified to 6 chars with spaces  ('JNJ   ')
+        YYMMDD : expiration
+        C|P    : call / put  (anything starting with c -> C, else P)
+        strike : strike * 1000, zero-padded to 8 digits
+
+    Verified against the symbols already stored in `positions`
+    (DLTR/PAYX/JNJ) and against the broker for every open paper row.
+
+    WHY THIS EXISTS IN ONE PLACE
+        The same string was being assembled ad hoc in close_live_manual, in the
+        probes, and now in paper opening. Divergent copies of a format string
+        are the same failure mode this project already paid for with P&L math
+        and spread pricing. One builder, one format.
+
+    accepts expiration as 'YYYY-MM-DD' str or a date; option_type as
+    'call'/'put' or 'Bull Put Spread' (anything containing 'put' -> P).
+    """
+    d = date.fromisoformat(str(expiration))
+    yymmdd = d.strftime("%y%m%d")
+    ot = str(option_type).lower()
+    cp = "P" if "put" in ot or ot.startswith("p") else "C"
+    strike_int = int(round(float(strike) * 1000))
+    return f"{ticker:<6}{yymmdd}{cp}{strike_int:08d}"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # DB HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -877,20 +910,29 @@ def cmd_paper_buy(ticker, strike_low, strike_high, expiration_str, debit,
     if notes:
         auto_notes += f" | {notes}"
 
+    # OCC symbols so the monitor can price paper by REST, exactly like `positions`.
+    # low strike = long leg, high strike = short leg (both spread types).
+    option_type = "put" if debit < 0 else "call"
+    sym_long  = build_occ_symbol(ticker, expiration, option_type, strike_low)
+    sym_short = build_occ_symbol(ticker, expiration, option_type, strike_high)
+
     conn = get_db_connection()
     cur  = conn.cursor()
     cur.execute("""
         INSERT INTO paper_positions
             (ticker, strategy, strike_low, strike_high, contracts,
              expiration, premium_paid, total_cost, price_at_open,
-             status, opened_at, notes)
-        VALUES (%s, %s, %s, %s, 1, %s, %s, %s, 0.0, 'OPEN', NOW(), %s)
+             status, opened_at, notes,
+             tastytrade_symbol, tastytrade_symbol_short)
+        VALUES (%s, %s, %s, %s, 1, %s, %s, %s, 0.0, 'OPEN', NOW(), %s,
+                %s, %s)
         RETURNING id
     """, (
         ticker, strategy,
         strike_low, strike_high,
         expiration, debit, total_cost,
         auto_notes,
+        sym_long, sym_short,
     ))
     pos_id = cur.fetchone()[0]
     conn.commit()
