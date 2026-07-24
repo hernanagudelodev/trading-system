@@ -55,22 +55,55 @@ WATCH_PROFIT_PCT     = 0.30   # 30% of max → WATCH
 MIN_DTE              = 7      # days → ACTION
 WATCH_DTE            = 10     # days → WATCH
 
-# Stop loss escalonado por DTE — más espacio cuando queda más tiempo
-# >15 DTE: -65%  |  8-15 DTE: -55%  |  <8 DTE: -50%
-STOP_LOSS_PCT_HIGH_DTE = 0.65   # >15 DTE
-STOP_LOSS_PCT_MID_DTE  = 0.55   # 8-15 DTE
-STOP_LOSS_PCT_LOW_DTE  = 0.50   # <8 DTE
-STOP_LOSS_WATCH_PCT    = 0.30   # 30% loss → WATCH
+# ── STOP LOSS — measured over REAL MAX LOSS, thresholds per strategy ──────────
+#
+# THE BUG THIS FIXES (24-jul)
+#   pnl_pct = gross_pnl / max_profit, i.e. a % of the CREDIT for a credit spread.
+#   A -65% stop on that is ~21% of the real risk for a BPS (credit $120, max loss
+#   $380). JNJ would have stopped near -$83 instead of a sane level. The number
+#   meant something different depending on the strategy.
+#
+# THE FIX
+#   The denominator is the STRUCTURE's max loss (from spread_pnl), not the credit.
+#   pnl_vs_maxloss = -gross_pnl / max_loss  (0.0 at open, 1.0 at total loss).
+#   Then the threshold table is per strategy, still tiered by DTE.
+#
+#   Credit spreads (BPS) get a tighter stop: closing a credit when it costs ~2x
+#   the credit is standard, which is ~34% of real risk. Debit spreads keep the
+#   historical -65/-55/-50 tier, now correctly over real risk.
+STOP_LOSS_WATCH_PCT = 0.30   # 30% loss (of real max loss) → WATCH
+
+STOP_THRESHOLDS = {
+    # strategy_type -> (>15 DTE, 8-15 DTE, <8 DTE), as fraction of MAX LOSS
+    "debit_spread":  (0.65, 0.55, 0.50),
+    "long_option":   (0.65, 0.55, 0.50),
+    "credit_spread": (0.35, 0.30, 0.25),
+}
+_DEFAULT_STOP_TIER = (0.65, 0.55, 0.50)
 
 
-def get_stop_loss_pct(dte):
-    """Returns stop loss threshold based on DTE."""
+def _dte_tier_index(dte):
     if dte is None or dte > 15:
-        return STOP_LOSS_PCT_HIGH_DTE
-    elif dte >= 8:
-        return STOP_LOSS_PCT_MID_DTE
-    else:
-        return STOP_LOSS_PCT_LOW_DTE
+        return 0
+    if dte >= 8:
+        return 1
+    return 2
+
+
+def get_stop_loss_pct(dte, strategy_type="debit_spread"):
+    """
+    Stop threshold as a fraction of MAX LOSS, by strategy and DTE.
+
+    strategy_type comes from spread_pnl ('debit_spread', 'credit_spread',
+    'long_option'). Unknown types fall back to the debit tier, loudly-ish:
+    a new strategy must add its own row here on purpose, not inherit silently.
+    """
+    tier = STOP_THRESHOLDS.get(strategy_type)
+    if tier is None:
+        print(f"  ⚠️  no stop tier for strategy_type={strategy_type!r} — "
+              f"using debit default. Add it to STOP_THRESHOLDS.")
+        tier = _DEFAULT_STOP_TIER
+    return tier[_dte_tier_index(dte)]
 
 def auto_close_enabled():
     """
@@ -116,19 +149,11 @@ INTERVAL_PRE_MARKET     = 10
 INTERVAL_MARKET_CLOSED  = 30
 
 
-HEARTBEAT_INTERVAL_MIN = 60
-
-_last_heartbeat_time = None
-_market_close_sent   = False
-
-REPORT_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                           "reports", "monitor_report.html")
-
-# Strategy type classification
-DEBIT_SPREADS   = {"Bull Call Spread", "Bear Put Spread"}
-LONG_OPTIONS    = {"Long Call", "Long Put"}
-CREDIT_OPTIONS  = {"Cash Secured Put", "Covered Call"}
-STRADDLES       = {"Long Straddle"}
+# Dead code removed (24-jul): heartbeat globals, REPORT_PATH and the strategy
+# sets fed generate_html_report / send_heartbeat / send_market_close_summary,
+# all orphaned when run_monitor merged into run_position_monitor. The push
+# heartbeat is gone on purpose: healthchecks.io already watches the process and
+# an hourly "still alive" push is noise. Liveness lives in healthcheck_ping().
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -170,49 +195,6 @@ def get_interval():
     elif status == "pre":
         return INTERVAL_PRE_MARKET
     return INTERVAL_MARKET_CLOSED
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# OPTION DELTA — live from yfinance
-# ══════════════════════════════════════════════════════════════════════════════
-
-def get_live_delta(ticker, strike, expiration, option_type="call"):
-    """
-    Fetch live delta for a specific option from yfinance.
-    Returns delta as float, or fallback value if unavailable.
-    """
-    fallback = 0.45 if option_type == "call" else -0.45
-    try:
-        tk = yf.Ticker(ticker)
-
-        available = tk.options
-        if not available:
-            return fallback
-
-        target = expiration
-        closest = min(
-            available,
-            key=lambda e: abs((datetime.strptime(e, "%Y-%m-%d").date() - target).days)
-        )
-
-        chain = tk.option_chain(closest)
-        df = chain.calls if option_type == "call" else chain.puts
-
-        if df is None or df.empty:
-            return fallback
-
-        df = df.copy()
-        df["strike_diff"] = (df["strike"] - strike).abs()
-        row = df.sort_values("strike_diff").iloc[0]
-
-        delta = row.get("delta", None)
-        if delta is None or (hasattr(delta, "__class__") and delta != delta):
-            return fallback
-
-        return float(delta)
-
-    except Exception:
-        return fallback
 
 
 def get_live_option_price(ticker, strike, expiration, option_type="call"):
@@ -270,6 +252,43 @@ def get_spread_value_tastytrade(ticker, strike_low, strike_high, expiration,
 # P&L CALCULATION — strategy-aware
 # ══════════════════════════════════════════════════════════════════════════════
 
+ALERT_WORSEN_POINTS = 10.0   # pnl_pct points of deterioration within a level
+ALERT_REMINDER_HOURS = 1     # re-alert an unchanged level after this many hours
+
+
+def _should_alert(level, pnl_pct, last_level, last_at, last_pnl_pct):
+    """
+    Decide whether to send an alert this cycle, given what was last sent.
+
+        URGENT           -> always (a stop/target must not wait)
+        level changed    -> yes
+        worsened >=N pts  -> yes (pnl_pct dropped ALERT_WORSEN_POINTS since last)
+        >=N hours passed  -> yes (periodic reminder it is still in this level)
+        otherwise         -> no  (deduped)
+
+    Designed to be callable with None fields (first time this row alerts).
+    """
+    if level == "URGENT":
+        return True
+    if last_level != level:
+        return True
+    # same level as last alert:
+    if last_pnl_pct is not None and pnl_pct <= float(last_pnl_pct) - ALERT_WORSEN_POINTS:
+        return True
+    if last_at is not None:
+        try:
+            from datetime import datetime, timezone
+            now = datetime.now(timezone.utc)
+            ref = last_at if last_at.tzinfo else last_at.replace(tzinfo=timezone.utc)
+            if (now - ref).total_seconds() >= ALERT_REMINDER_HOURS * 3600:
+                return True
+        except Exception:
+            return True   # if we can't compute age, err toward alerting
+    else:
+        return True       # no timestamp recorded -> alert
+    return False
+
+
 def evaluate_alert_level(pnl_data):
     profit_pct_of_max = pnl_data["profit_pct_of_max"]
     pnl_pct           = pnl_data["pnl_pct"]
@@ -278,8 +297,8 @@ def evaluate_alert_level(pnl_data):
     reasons           = []
     level             = "NORMAL"
 
-    # Stop loss threshold depends on DTE — more room when more time remains
-    stop_loss_pct = get_stop_loss_pct(dte)
+    # Stop loss threshold depends on strategy and DTE (over real max loss)
+    stop_loss_pct = get_stop_loss_pct(dte, strategy_type)
 
     # ── URGENT conditions ────────────────────────────────────────────────────
     if profit_pct_of_max >= TAKE_PROFIT_MAX_PCT:
@@ -361,271 +380,36 @@ def send_alert_notification(position, pnl_data, alert_level, reasons, mode="pape
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CONSOLE REPORT
+# ENVIRONMENT GUARD
 # ══════════════════════════════════════════════════════════════════════════════
 
-def print_position_report(position, pnl_data, alert_level, reasons):
-    icon     = level_icon(alert_level)
-    ticker   = position["ticker"]
-    strategy = position.get("strategy", "")
+def _validate_env():
+    """
+    Fail loudly at startup if anything the monitor needs is missing.
 
-    print(f"\n{icon} {ticker} — {strategy} — {alert_level}")
-    print(f"{'─' * 55}")
-    print(f"  Strike(s):      ${position['strike_low']} / ${position['strike_high']}")
-    print(f"  Expiracion:     {position['expiration']} ({pnl_data['dte']} dias)")
-    print(f"  Precio accion:  ${pnl_data['current_price']:.2f}")
+    WHY
+        The monitor is now the ONLY thing that can close a position. It cannot
+        run half-configured. Before, a missing TRADING_MODE silently defaulted
+        to 'paper' and, on the live service, that means watching the WRONG table
+        while reporting success -- the exact silent-failure this project fights.
+        Missing Tastytrade creds are worse: pricing returns None, everything
+        looks 'no data', nothing alerts or closes, and the process reports fine.
 
-    if pnl_data.get("delta") is not None:
-        print(f"  Delta actual:   {pnl_data['delta']:.3f}")
-
-    print(f"  Costo total:    ${float(position.get('total_cost') or 0):.2f}")
-    print(f"  Ganancia/Perd:  ${pnl_data['gross_pnl']:.2f} ({pnl_data['pnl_pct']:.1f}%)")
-    print(f"  % del maximo:   {pnl_data['profit_pct_of_max']*100:.1f}%")
-    print(f"  Ganancia max:   ${pnl_data['max_profit']:.2f}")
-
-    print(f"\n  Alertas:")
-    for reason in reasons:
-        print(f"    - {reason}")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# HTML REPORT
-# ══════════════════════════════════════════════════════════════════════════════
-
-def generate_html_report(positions_data, timestamp):
-    """Generate monitor_report.html — mobile-friendly dashboard."""
-
-    next_interval = get_interval()
-
-    if not positions_data:
-        cards_html = """
-        <div style="text-align:center;padding:60px 20px;color:#6b7280;">
-            <div style="font-size:48px;margin-bottom:16px;">📭</div>
-            <div style="font-size:18px;font-weight:600;color:#9ca3af;">Sin posiciones abiertas</div>
-            <div style="font-size:13px;margin-top:8px;">El scanner buscara oportunidades automaticamente</div>
-        </div>"""
-    else:
-        cards = []
-        for pd in positions_data:
-            pos      = pd["position"]
-            pnl      = pd["pnl_data"]
-            level    = pd["alert_level"]
-            reasons  = pd["reasons"]
-            strategy = pos.get("strategy", "")
-
-            level_colors = {
-                "NORMAL": "#22c55e",
-                "WATCH":  "#eab308",
-                "ACTION": "#f97316",
-                "URGENT": "#ef4444",
-            }
-            bar_color = level_colors.get(level, "#6b7280")
-            pnl_color = "#22c55e" if pnl["gross_pnl"] >= 0 else "#ef4444"
-
-            pct_of_max = pnl["profit_pct_of_max"] * 100
-            bar_width  = max(0, min(100, pct_of_max))
-
-            reasons_html = "".join(
-                f'<div style="color:#9ca3af;font-size:12px;padding:3px 0;">'
-                f'  {r}</div>'
-                for r in reasons
-            )
-
-            delta_html = ""
-            if pnl.get("delta") is not None:
-                delta_html = f'<span>Delta: {pnl["delta"]:.3f}</span>'
-
-            cards.append(f"""
-            <div style="background:#111827;border-radius:16px;padding:16px;
-                        margin-bottom:16px;border-left:4px solid {bar_color};">
-                <div style="display:flex;justify-content:space-between;
-                            align-items:center;margin-bottom:12px;">
-                    <div>
-                        <span style="font-size:22px;font-weight:900;color:#f9fafb;">
-                            {pos['ticker']}
-                        </span>
-                        <span style="font-size:12px;color:#6b7280;margin-left:8px;">
-                            {strategy}
-                        </span>
-                    </div>
-                    <div style="background:{bar_color};color:white;padding:4px 10px;
-                                border-radius:8px;font-size:12px;font-weight:700;">
-                        {level}
-                    </div>
-                </div>
-
-                <div style="display:grid;grid-template-columns:1fr 1fr;
-                            gap:12px;margin-bottom:14px;">
-                    <div style="background:#1a1a1a;border-radius:10px;padding:12px;">
-                        <div style="font-size:10px;color:#6b7280;letter-spacing:2px;
-                                    text-transform:uppercase;margin-bottom:4px;">P&L</div>
-                        <div style="font-size:22px;font-weight:900;color:{pnl_color};">
-                            ${pnl['gross_pnl']:+.0f}
-                        </div>
-                        <div style="font-size:12px;color:{pnl_color};">
-                            {pnl['pnl_pct']:+.1f}%
-                        </div>
-                    </div>
-                    <div style="background:#1a1a1a;border-radius:10px;padding:12px;">
-                        <div style="font-size:10px;color:#6b7280;letter-spacing:2px;
-                                    text-transform:uppercase;margin-bottom:4px;">DEL MAXIMO</div>
-                        <div style="font-size:22px;font-weight:900;color:{bar_color};">
-                            {pct_of_max:.0f}%
-                        </div>
-                        <div style="font-size:12px;color:#6b7280;">
-                            max: ${pnl['max_profit']:.0f}
-                        </div>
-                    </div>
-                </div>
-
-                <div style="background:#1a1a1a;border-radius:8px;
-                            height:8px;margin-bottom:14px;">
-                    <div style="background:{bar_color};width:{bar_width:.1f}%;
-                                height:8px;border-radius:8px;transition:width 0.5s;"></div>
-                </div>
-
-                <div style="background:#0d1117;border-radius:10px;padding:12px;">
-                    {reasons_html}
-                </div>
-
-                <div style="margin-top:10px;display:flex;justify-content:space-between;
-                            font-size:11px;color:#4b5563;font-family:monospace;">
-                    <span>Precio: ${pnl['current_price']:.2f}</span>
-                    {delta_html}
-                    <span>Costo: ${float(pos.get('total_cost') or 0):.0f}</span>
-                    <span>{pnl['dte']}d restantes</span>
-                </div>
-            </div>""")
-
-        cards_html = "\n".join(cards)
-
-    html = f"""<!DOCTYPE html>
-<html lang="es">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta http-equiv="refresh" content="300">
-    <title>Monitor — {timestamp}</title>
-    <style>
-        * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-        body {{
-            background: #0d1117;
-            color: #f9fafb;
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-            max-width: 480px;
-            margin: 0 auto;
-            padding: 16px;
-        }}
-    </style>
-</head>
-<body>
-    <div style="display:flex;justify-content:space-between;align-items:center;
-                margin-bottom:20px;padding-bottom:12px;border-bottom:1px solid #1f2937;">
-        <div>
-            <div style="font-size:18px;font-weight:800;color:#f9fafb;">
-                Monitor de Posiciones
-            </div>
-            <div style="font-size:11px;color:#6b7280;font-family:monospace;">
-                {timestamp}
-            </div>
-        </div>
-        <div style="text-align:right;font-size:11px;color:#6b7280;">
-            {len(positions_data)} {'posicion' if len(positions_data) == 1 else 'posiciones'} abiertas
-        </div>
-    </div>
-
-    {cards_html}
-
-    <div style="text-align:center;color:#374151;font-size:11px;
-                padding:16px 0;margin-top:8px;font-family:monospace;">
-        Se actualiza cada {next_interval} min · Auto-refresh cada 5 min
-    </div>
-</body>
-</html>"""
-
-    os.makedirs(os.path.dirname(REPORT_PATH), exist_ok=True)
-    with open(REPORT_PATH, "w", encoding="utf-8") as f:
-        f.write(html)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# HEARTBEAT & MARKET CLOSE NOTIFICATIONS
-# ══════════════════════════════════════════════════════════════════════════════
-
-def should_send_heartbeat():
-    global _last_heartbeat_time
-    if not is_market_open():
-        return False
-    now = datetime.now()
-    if _last_heartbeat_time is None:
-        return True
-    elapsed = (now - _last_heartbeat_time).total_seconds() / 60
-    return elapsed >= HEARTBEAT_INTERVAL_MIN
-
-
-def send_heartbeat(positions_data, timestamp):
-    global _last_heartbeat_time
-    _last_heartbeat_time = datetime.now()
-
-    positions_with_alerts = [
-        pd for pd in positions_data
-        if pd["alert_level"] in ("WATCH", "ACTION", "URGENT")
-    ]
-
-    if not positions_with_alerts:
-        return  # Todo OK — silencio total
-
-    lines = []
-    for pd in positions_with_alerts:
-        pos   = pd["position"]
-        pnl   = pd["pnl_data"]
-        level = pd["alert_level"]
-        icon  = level_icon(level)
-        pct   = pnl["profit_pct_of_max"] * 100
-        strat = pos.get("strategy", "")
-        lines.append(
-            f"{icon} {pos['ticker']} ({strat}) | "
-            f"P&L: ${pnl['gross_pnl']:+.0f} ({pct:.0f}% max) | {pnl['dte']}d"
+    current_mode() and auto_close_enabled() already raise on their own vars;
+    this covers DATABASE_URL and the broker credentials so the failure happens
+    HERE, at startup, not deep inside a pricing call three functions down.
+    """
+    missing = [v for v in (
+        "DATABASE_URL",
+        "TASTYTRADE_CLIENT_SECRET",
+        "TASTYTRADE_REFRESH_TOKEN",
+    ) if not os.getenv(v)]
+    if missing:
+        raise RuntimeError(
+            f"monitor cannot start: missing env vars {missing}. "
+            f"It is the only component that can close a position; running it "
+            f"half-configured is how a silent failure looks like success."
         )
-
-    send_push(
-        title=f"Monitor — {len(positions_with_alerts)} posicion(es) requieren atencion",
-        message="\n".join(lines) + f"\n{timestamp}",
-        priority="default",
-    )
-
-
-def send_market_close_summary(positions_data, timestamp):
-    global _market_close_sent
-    if _market_close_sent:
-        return
-    _market_close_sent = True
-
-    if not positions_data:
-        send_push(
-            title="Mercado cerrado - Sin posiciones",
-            message=f"Mercado cerrado.\n{timestamp}",
-            priority="low",
-        )
-        return
-
-    lines = []
-    for pd in positions_data:
-        pos   = pd["position"]
-        pnl   = pd["pnl_data"]
-        level = pd["alert_level"]
-        icon  = level_icon(level)
-        pct   = pnl["profit_pct_of_max"] * 100
-        lines.append(
-            f"{icon} {pos['ticker']} ${pnl['gross_pnl']:+.0f} "
-            f"({pct:.0f}% max) | {pnl['dte']}d al venc."
-        )
-
-    send_push(
-        title=f"Cierre de mercado — {len(positions_data)} posicion(es)",
-        message="\n".join(lines) + f"\n{timestamp}",
-        priority="default",
-    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -664,6 +448,7 @@ def run_position_monitor():
     from executor import current_mode, get_executor
     load_dotenv()
 
+    _validate_env()                     # dies loudly if anything is missing
     mode       = current_mode()
     TABLE      = "positions" if mode == "live" else "paper_positions"
     auto_close = auto_close_enabled()   # explota si falta: ver el helper
@@ -689,7 +474,9 @@ def run_position_monitor():
         SELECT id, ticker, strategy, strike_low, strike_high,
                expiration, contracts, total_cost, premium_paid,
                current_spread_value, gross_pnl, pnl_pct,
-               profit_pct_of_max, opened_at
+               profit_pct_of_max, opened_at,
+               tastytrade_symbol, tastytrade_symbol_short,
+               last_alert_level, last_alert_at, last_alert_pnl_pct
         FROM {TABLE}
         WHERE UPPER(status) = 'OPEN'
         ORDER BY opened_at
@@ -719,21 +506,35 @@ def run_position_monitor():
 
         print(f"  Revisando {ticker} [{mode}]...", end=" ", flush=True)
 
-        # El precio viene de fuentes distintas según la estrategia:
-        #   spreads   -> valor del spread por la cadena de Tastytrade
-        #   Long Call -> precio de la opción sola por yfinance
-        # Son campos separados en spread_pnl porque son mediciones distintas.
+        # PRICING (24-jul): spreads are valued by MARK via the REST endpoint,
+        # the same channel the option_selector uses, so the two never disagree
+        # on the same instrument. MARK is the broker's own valuation and stays
+        # stable when a wide-book mid does not -- the mid is what tripped PAYX.
+        # Long options keep the existing per-leg path for now.
         spread_value = None
         long_value   = None
         if is_long:
             opt_type   = "call" if strategy == "Long Call" else "put"
             long_value = get_live_option_price(ticker, strike_low, expiration, opt_type)
         else:
-            opt_type     = "put" if premium < 0 else "call"   # el signo manda
-            spread_value = get_spread_value_tastytrade(ticker, strike_low, strike_high,
-                                                       expiration, opt_type)
+            sym_long  = pos.get("tastytrade_symbol")
+            sym_short = pos.get("tastytrade_symbol_short")
+            is_credit = premium < 0                      # the sign is the source
+            if sym_long and sym_short:
+                from pricing import get_spread_mark_by_symbols
+                q = get_spread_mark_by_symbols(sym_long, sym_short, is_credit)
+                if q is not None and q.get("halted"):
+                    print("(trading halted) ", end="")
+                    q = None
+                spread_value = q["mark"] if q else None
+            else:
+                # No OCC symbols on the row: cannot price by REST. Do NOT fall
+                # back to a different channel silently -- leave it None and let
+                # the stale-price path handle it, visibly.
+                print("(no OCC symbols) ", end="")
+                spread_value = None
 
-        time.sleep(0.5)   # no saturar DXLinkStreamer
+        time.sleep(0.3)
 
         # `precio` es el valor actual: spread_value para spreads, long_value para
         # longs. price_fresh gobierna si se puede CERRAR — nunca con precio viejo.
@@ -810,13 +611,25 @@ def run_position_monitor():
             print(f"    - {motivo}")
         print()
 
-        # ── ALERTA (lo que antes hacía run_monitor) ───────────────────────────
-        # Con mercado cerrado no podés actuar: silencio hasta apertura, para no
-        # despertar el teléfono de noche por algo que no se puede tocar.
-        if alert_level in ("WATCH", "ACTION", "URGENT") and price_fresh:
-            if get_market_status() in ("open", "pre"):
-                send_alert_notification(pos, {**pnl_data, "gross_pnl": gross_pnl},
-                                        alert_level, reasons, mode)
+        # ── ALERT with DEDUP (24-jul) ─────────────────────────────────────────
+        # Market closed -> silence (can't act on it at night). Stale price ->
+        # silence (we don't alert on a number we don't trust). Otherwise decide
+        # whether this alert is NEW enough to send:
+        #   URGENT              -> always (a stop/target won't wait an hour)
+        #   level changed       -> send  (WATCH -> ACTION, NORMAL -> WATCH...)
+        #   worsened >=10 pts    -> send  (same level, pnl_pct 10 points worse)
+        #   >=1h since last      -> send  (periodic reminder it's still there)
+        # NORMAL resets the dedup state so a re-entry to WATCH alerts again.
+        alerted_now = False
+        if price_fresh and get_market_status() in ("open", "pre"):
+            if alert_level in ("WATCH", "ACTION", "URGENT"):
+                if _should_alert(alert_level, pnl_pct,
+                                 pos.get("last_alert_level"),
+                                 pos.get("last_alert_at"),
+                                 pos.get("last_alert_pnl_pct")):
+                    send_alert_notification(pos, {**pnl_data, "gross_pnl": gross_pnl},
+                                            alert_level, reasons, mode)
+                    alerted_now = True
 
         # ── Cierre determinista — el worker es el ÚNICO dueño de stops de paper ─
         # Usa las mismas constantes canónicas que el monitor real (sin inventar
@@ -827,7 +640,7 @@ def run_position_monitor():
                 close_reason = "TIME_EXPIRED"
             elif profit_pct_max >= TAKE_PROFIT_MAX_PCT:
                 close_reason = "TARGET_REACHED"
-            elif pnl_pct <= -(get_stop_loss_pct(dte) * 100):
+            elif pnl_pct <= -(get_stop_loss_pct(dte, strategy_type) * 100):
                 close_reason = "STOP_LOSS"
 
         # ── EL CIERRE PASA POR EL EXECUTOR ────────────────────────────────────
@@ -885,20 +698,67 @@ def run_position_monitor():
             )
             # Cae al UPDATE de P&L: la posición sigue viva y su estado importa.
 
-        # Sin cierre (o cierre fallido) — solo actualizar P&L
+        # ── PERSIST P&L (+ dedup state) ───────────────────────────────────────
+        # PIECE C: last_synced_at is only stamped NOW() when the price is FRESH.
+        # A stale price (pricing failed, using last known) must NOT masquerade as
+        # a fresh sync -- that timestamp is read by reports and by auto_run.
+        # When stale, last_synced_at is left untouched.
+        #
+        # Dedup columns are written only when we actually alerted this cycle;
+        # when alert_level is NORMAL we CLEAR them so a future re-entry alerts.
         conn2 = psycopg2.connect(os.getenv("DATABASE_URL"))
         cur2  = conn2.cursor()
-        cur2.execute(f"""
-            UPDATE {TABLE} SET
-                current_spread_value = %s,
-                current_value        = %s,
-                gross_pnl            = %s,
-                pnl_pct              = %s,
-                profit_pct_of_max    = %s,
-                last_synced_at       = NOW()
-            WHERE id = %s AND UPPER(status) = 'OPEN'
-        """, (spread_value, current_value, gross_pnl, pnl_pct,
-              profit_pct_max, pos["id"]))
+
+        synced_clause = "last_synced_at = NOW()," if price_fresh else ""
+
+        if alert_level == "NORMAL":
+            # reset dedup state
+            cur2.execute(f"""
+                UPDATE {TABLE} SET
+                    current_spread_value = %s,
+                    current_value        = %s,
+                    gross_pnl            = %s,
+                    pnl_pct              = %s,
+                    profit_pct_of_max    = %s,
+                    {synced_clause}
+                    last_alert_level     = NULL,
+                    last_alert_at        = NULL,
+                    last_alert_pnl_pct   = NULL
+                WHERE id = %s AND UPPER(status) = 'OPEN'
+            """, (spread_value, current_value, gross_pnl, pnl_pct,
+                  profit_pct_max, pos["id"]))
+        elif alerted_now:
+            # record what we just alerted, so we can dedup next cycle
+            cur2.execute(f"""
+                UPDATE {TABLE} SET
+                    current_spread_value = %s,
+                    current_value        = %s,
+                    gross_pnl            = %s,
+                    pnl_pct              = %s,
+                    profit_pct_of_max    = %s,
+                    {synced_clause}
+                    last_alert_level     = %s,
+                    last_alert_at        = NOW(),
+                    last_alert_pnl_pct   = %s
+                WHERE id = %s AND UPPER(status) = 'OPEN'
+            """, (spread_value, current_value, gross_pnl, pnl_pct,
+                  profit_pct_max, alert_level, pnl_pct, pos["id"]))
+        else:
+            # alert level is WATCH/ACTION/URGENT but we didn't re-alert
+            # (deduped): update P&L only, leave dedup state as-is.
+            # synced_clause carries its own trailing comma when fresh, so it goes
+            # at the FRONT of the SET list -- same pattern as the other branches.
+            cur2.execute(f"""
+                UPDATE {TABLE} SET
+                    {synced_clause}
+                    current_spread_value = %s,
+                    current_value        = %s,
+                    gross_pnl            = %s,
+                    pnl_pct              = %s,
+                    profit_pct_of_max    = %s
+                WHERE id = %s AND UPPER(status) = 'OPEN'
+            """, (spread_value, current_value, gross_pnl, pnl_pct,
+                  profit_pct_max, pos["id"]))
         conn2.commit()
         cur2.close()
         conn2.close()
