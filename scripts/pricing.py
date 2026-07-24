@@ -164,3 +164,107 @@ def get_spread_value(ticker, strike_low, strike_high, expiration,
     q = get_spread_quote(ticker, strike_low, strike_high, expiration,
                          option_type, retries, delay)
     return q["mid"] if q else None
+
+# ══════════════════════════════════════════════════════════════════════════════
+# REST PRICING BY OCC SYMBOL — single source for the monitor
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# WHY THIS EXISTS, SEPARATE FROM get_spread_quote (DXLink)
+#   The 23-jul PAYX incident: the monitor priced by DXLink, took the FIRST Quote
+#   event of each leg and used it. On a wide/illiquid book that mid was noise and
+#   it tripped a stop that closed a healthy position at 2.02 vs a real ~1.18.
+#
+#   The 24-jul comparison proved DXLink was reading the book correctly -- the
+#   book itself was the problem -- and that the REST endpoint returns `mark`,
+#   the broker's own valuation, which stays stable when the mid does not
+#   (PAYX mid 0.55 vs mark 0.90 at close; JNJ mid==mark when the book is tight).
+#   `mark` is what Tastytrade uses to show position P&L.
+#
+#   The option_selector already moved to REST for the same reason. This puts the
+#   monitor on the same channel so the two never diverge on the same instrument.
+#
+# WHAT IT RETURNS
+#   dict with the spread valued by MARK (the reference), plus bid/ask so the
+#   caller can see how wide the book is, or None if data is missing.
+#   No 0.0 fallback: missing data -> None, never a zero that looks valid.
+
+async def _fetch_spread_mark_async(symbol_long, symbol_short, is_credit):
+    from tastytrade import Session
+    from tastytrade.market_data import get_market_data_by_type
+
+    client_secret = os.getenv("TASTYTRADE_CLIENT_SECRET")
+    refresh_token = os.getenv("TASTYTRADE_REFRESH_TOKEN")
+    if not client_secret or not refresh_token:
+        return None
+
+    session = Session(client_secret, refresh_token)
+    data = await get_market_data_by_type(session, options=[symbol_long, symbol_short])
+    md = {d.symbol: d for d in data}
+
+    long_md  = md.get(symbol_long)
+    short_md = md.get(symbol_short)
+    if long_md is None or short_md is None:
+        return None
+
+    def _num(v):
+        return float(v) if v is not None else None
+
+    l_mark = _num(getattr(long_md,  "mark", None))
+    s_mark = _num(getattr(short_md, "mark", None))
+    l_bid  = _num(getattr(long_md,  "bid",  None))
+    l_ask  = _num(getattr(long_md,  "ask",  None))
+    s_bid  = _num(getattr(short_md, "bid",  None))
+    s_ask  = _num(getattr(short_md, "ask",  None))
+
+    # mark is the reference. Without it there is nothing to value -> None.
+    if l_mark is None or s_mark is None:
+        return None
+
+    if is_credit:                       # Bull Put: short - long
+        mark = round(s_mark - l_mark, 2)
+        bid  = round((s_bid - l_ask), 2) if None not in (s_bid, l_ask) else None
+        ask  = round((s_ask - l_bid), 2) if None not in (s_ask, l_bid) else None
+    else:                               # Bull Call: long - short
+        mark = round(l_mark - s_mark, 2)
+        bid  = round((l_bid - s_ask), 2) if None not in (l_bid, s_ask) else None
+        ask  = round((l_ask - s_bid), 2) if None not in (l_ask, s_bid) else None
+
+    halted = bool(getattr(long_md, "trading_halted", False) or
+                  getattr(short_md, "trading_halted", False))
+
+    return {
+        "mark":    mark,
+        "bid":     bid,
+        "ask":     ask,
+        "halted":  halted,
+        "updated_at": getattr(short_md, "updated_at", None),
+    }
+
+
+def get_spread_mark_by_symbols(symbol_long, symbol_short, is_credit,
+                               retries=3, delay=2):
+    """
+    Value a 2-leg spread by MARK using the REST snapshot endpoint.
+
+    symbol_long  : OCC symbol of the LONG leg  (low strike)
+    symbol_short : OCC symbol of the SHORT leg (high strike)
+    is_credit    : True for Bull Put (credit), False for Bull Call (debit)
+
+    Returns {"mark","bid","ask","halted","updated_at"} or None.
+
+    `mark` is the spread value the monitor should use for P&L and stops.
+    `bid`/`ask` are provided so the caller can gauge book width, but they are
+    NOT the reference price -- a wide book has a meaningless mid, which is the
+    whole reason this exists.
+    """
+    for attempt in range(retries):
+        try:
+            r = asyncio.run(_fetch_spread_mark_async(
+                symbol_long, symbol_short, is_credit))
+            if r is not None and r["mark"] is not None:
+                return r
+        except Exception as e:
+            print(f"  pricing REST error ({symbol_long}/{symbol_short}): {e}")
+        if attempt < retries - 1:
+            time.sleep(delay)
+    return None
