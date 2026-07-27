@@ -300,12 +300,12 @@ Empieza tu respuesta directamente con el carácter {{
 2. Considera el contexto macro y eventos de la semana.
 3. Evalúa cada candidato con criterio conservador. Conservador significa elegir bien y respetar los gates —NO significa abstenerse de operar cuando hay un buen candidato. Si el scanner trae una estructura viable con señal clara, ábrela.
 4. Decide cuáles abrir como paper trade y cuáles ignorar.
-5. Decide si alguna posición abierta debe cerrarse anticipadamente por cambio de tesis.
+5. Si alguna posición abierta MERECERÍA revisión para cierre anticipado (cambio de tesis, deterioro claro), SEÑALALA como SUGERENCIA con tu razonamiento. NO la cierres: el auto_run ya no ejecuta cierres. El humano revisa tu sugerencia y decide; el cierre automático lo maneja el monitor por reglas deterministas (stop/target/DTE).
 
 Reglas:
 - debit positivo = Bull Call Spread (pagas), negativo = Bull Put Spread (cobras crédito)
 - Solo recomendar trades con señal clara y contexto favorable
-- Si hay evento macro VERY_HIGH en 2 días o menos, NO abrir ninguna posición nueva (regla dura: el sistema descarta cualquier apertura igual). Los cierres sí están permitidos.
+- Si hay evento macro VERY_HIGH en 2 días o menos, NO abrir ninguna posición nueva (regla dura: el sistema descarta cualquier apertura igual). Un evento próximo NO es motivo para sugerir cerrar posiciones sanas: una posición con tiempo restante tiene su stop determinista; cerrar antes de cada evento del calendario convertiría pérdidas temporales en permanentes.
 - Eventos HIGH o MEDIUM (CPI, PPI, NFP, etc.) NO prohíben abrir. Son contexto para elegir mejor, no motivo para abstenerte. NO inventes reglas duras de evento: la ÚNICA prohibición por evento es la de VERY_HIGH del punto anterior, que ya aplica el sistema por código. Con un HIGH podés y debés operar si hay un candidato con señal clara.
 - No abrir trades con earnings del subyacente en menos de 21 días (riesgo de IV crush)
 - No hay límite de CANTIDAD de trades por run. Lo que limita es el RIESGO AGREGADO: el sistema rechaza toda apertura que haga que la pérdida máxima combinada de la cartera supere el {_pct:.0f}% del capital.
@@ -327,10 +327,10 @@ Responde SOLO con este JSON (sin texto adicional, sin markdown):
       "rationale": "Párrafo explicando por qué este trade"
     }}
   ],
-  "close_positions": [
+  "close_suggestions": [
     {{
       "ticker": "CRM",
-      "reason": "Razón para cerrar anticipadamente"
+      "reason": "Razonamiento COMPLETO de por qué esta posición merecería revisión para cierre. El humano lo lee y decide — esto NO se ejecuta."
     }}
   ],
   "no_trade_reason": "Si no hay trades nuevos, explicar por qué"
@@ -409,39 +409,44 @@ Responde SOLO con este JSON (sin texto adicional, sin markdown):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def execute_recommendations(analysis):
-    """Execute Claude's recommendations — open new trades, close positions."""
-    if not analysis:
-        return {"opened": [], "closed": [], "errors": []}
+    """
+    Execute Claude's recommendations — OPEN new trades only.
 
-    results = {"opened": [], "closed": [], "errors": []}
+    The LLM NO LONGER CLOSES positions (24-jul decision, adelanto de la decision 2
+    de la reforma §26). It only OPENS. Any close reasoning the LLM produces is
+    collected as a SUGGESTION and pushed to the human, who decides by hand; the
+    deterministic monitor handles real closes by rule (stop/target/DTE).
+
+    WHY (CFG, 27-jul): the LLM closed a healthy live BCS at -13.8% the day before
+    FOMC, with sound-sounding prose ("regionals vulnerable to a hawkish repricing")
+    but on a rule that does NOT exist in the system. It turned an unrealized -$41
+    into a permanent loss on a position with 25 DTE and a real stop at -65%. Third
+    such discretionary close (VEEV 23-jul, PAYX-context, now CFG). A systematic
+    system closes by rule, not by market reads — reads aren't auditable or
+    repeatable. So: the LLM's read becomes a suggestion, never a trigger.
+    """
+    if not analysis:
+        return {"opened": [], "closed": [], "errors": [], "close_suggestions": []}
+
+    results = {"opened": [], "closed": [], "errors": [], "close_suggestions": []}
 
     # El executor se elige UNA vez (paper/live según TRADING_MODE). auto_run
     # emite intenciones y no vuelve a preguntar el modo.
     from executor import get_executor, OpenIntent
     executor = get_executor()
 
-    # Close positions Claude recommends closing
-    for close_rec in analysis.get("close_positions", []):
-        ticker = close_rec.get("ticker", "").upper()
-        reason = close_rec.get("reason", "AUTO_CLOSE_AI")
-        print(f"\n  Closing {ticker}: {reason}")
-        try:
-            # close_position devuelve True solo si el cierre se ejecutó.
-            # Si no consiguió precio real, se niega y devuelve False:
-            # NO reportarlo como cerrado (antes el log/push mentía — caso DAL).
-            ok = executor.close_position(ticker, reason)
-            if ok:
-                results["closed"].append({
-                    "ticker": ticker,
-                    "reason": reason
-                })
-            else:
-                msg = f"{ticker}: cierre NO ejecutado (sin precio real) — sigue ABIERTA"
-                print(f"  ⚠️  {msg}")
-                results["errors"].append(f"Close {msg}")
-        except Exception as e:
-            print(f"  Error closing {ticker}: {e}")
-            results["errors"].append(f"Close {ticker}: {e}")
+    # The LLM's close reasoning is collected as SUGGESTIONS, never executed.
+    # Accept both keys: the new close_suggestions and the legacy close_positions
+    # (in case a cached/older response still uses it) — either way, NO close runs.
+    suggestions = (analysis.get("close_suggestions")
+                   or analysis.get("close_positions") or [])
+    for s in suggestions:
+        ticker = s.get("ticker", "").upper()
+        reason = s.get("reason", "")
+        if not ticker:
+            continue
+        print(f"\n  💡 SUGERENCIA de cierre (NO ejecutada): {ticker} — {reason}")
+        results["close_suggestions"].append({"ticker": ticker, "reason": reason})
 
     # Open new trades
     new_trades = analysis.get("new_trades", [])
@@ -607,18 +612,15 @@ def send_run_summary(market_ctx, analysis, results, run_time):
             strategy_short = "BCS" if "Bull Call" in t["strategy"] else "BPS"
             sign = "db" if t["debit"] > 0 else "cr"
             lines.append(f"  • {t['ticker']} {strategy_short} {t['strikes']} ${abs(t['debit']):.2f}{sign}")
-    elif not results["closed"]:
-        # Sin aperturas ni cierres: el headline ya explica el porqué; no repetir
+    else:
+        # Sin aperturas: el headline ya explica el porqué; no repetir
         # el no_trade_reason largo (queda completo en el log/DB).
         lines.append("\n⏸ Sin trades nuevos")
 
-    # Closed positions (motivo recortado en límite de palabra, no a la mitad)
-    if results["closed"]:
-        lines.append(f"\n🔴 Cerré {len(results['closed'])} posición(es):")
-        for c in results["closed"]:
-            r = c["reason"]
-            r = r if len(r) <= 60 else r[:57].rsplit(" ", 1)[0] + "…"
-            lines.append(f"  • {c['ticker']}: {r}")
+    # El auto_run YA NO cierra. Si el LLM sugirió revisar algún cierre, va en una
+    # ALERTA SEPARADA con el razonamiento COMPLETO, para que el humano decida.
+    # (results["closed"] queda siempre vacío por diseño — se conserva por
+    # compatibilidad con el logging/DB de abajo.)
 
     # Errors
     if results["errors"]:
@@ -627,13 +629,27 @@ def send_run_summary(market_ctx, analysis, results, run_time):
     lines.append(f"\n⏱ Completado en {run_time:.0f}s")
 
     message = "\n".join(lines)
-    priority = "high" if results["opened"] or results["closed"] else "default"
+    priority = "high" if results["opened"] else "default"
 
     send_push(
-        title=f"{tag} · {len(results['opened'])} abiertos · {len(results['closed'])} cerrados",
+        title=f"{tag} · {len(results['opened'])} abiertos",
         message=message,
         priority=priority
     )
+
+    # ── ALERTA SEPARADA · sugerencias de cierre del LLM (NO ejecutadas) ────────
+    # Va aparte del resumen para que no se pierda, y con el rationale ENTERO
+    # (no recortado) porque es lo que necesitás para decidir si cerrás a mano.
+    for s in results.get("close_suggestions", []):
+        send_push(
+            title=f"{tag} · 💡 SUGERENCIA: revisar {s['ticker']}",
+            message=(f"El LLM sugiere REVISAR el cierre de {s['ticker']} "
+                     f"(NO se cerró solo).\n\n"
+                     f"Razonamiento:\n{s['reason']}\n\n"
+                     f"Si estás de acuerdo, cerrá a mano (close_live_manual.py). "
+                     f"Si no, la posición sigue con su stop determinista."),
+            priority="high",
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
