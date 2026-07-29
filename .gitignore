@@ -10,3 +10,4 @@ trading_env/
 backtest_errors.log
 
 reports/
+trading.code-workspace
