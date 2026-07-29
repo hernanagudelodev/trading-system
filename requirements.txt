@@ -1,0 +1,15 @@
+# Core
+tastytrade==13.2.0
+anthropic
+requests
+python-dotenv
+
+# Data
+yfinance
+pandas
+numpy
+
+# Infra
+psycopg2-binary
+schedule
+pytz
