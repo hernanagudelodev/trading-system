@@ -315,7 +315,7 @@ Reglas:
 
 Responde SOLO con este JSON (sin texto adicional, sin markdown):
 {{
-  "headline": "Frase corta y COMPLETA (máximo 120 caracteres) que resuma la decisión del día para una notificación push. Debe entenderse sola y NO cortarse a la mitad. Ej: 'Abrí TGT y MSFT; resto sin señal clara' o 'Sin aperturas: ningún candidato pasó los filtros hoy'.",
+  "headline": "Frase corta y COMPLETA (máximo 120 caracteres) que resuma el CONTEXTO y tu lectura del día para una notificación push. Debe entenderse sola y NO cortarse a la mitad. NO afirmes qué se abrió o cerró — de eso se encarga el sistema con el resultado REAL de la ejecución; tus propuestas pueden ser rechazadas por los gates después de que escribas esto. Describe el porqué, no la acción. Ej: 'Contexto favorable pero pocos candidatos con estructura viable' o 'VIX bajo, mercado alcista; señales débiles hoy'.",
   "analysis_summary": "Párrafo breve del contexto del día y decisiones tomadas",
   "new_trades": [
     {{
@@ -599,16 +599,11 @@ def send_run_summary(market_ctx, analysis, results, run_time):
     # tenés que saber al ver el push es si movió plata real o no.
     lines = [f"{tag} · Auto-run {datetime.now().strftime('%H:%M')} | {verdict} | VIX {vix}"]
 
-    # Headline: frase completa que el LLM escribió para que quepa (no se trunca).
-    # Fallback al analysis_summary recortado en límite de palabra si no hay headline.
-    headline = (analysis.get("headline") if analysis else "") or ""
-    if not headline and analysis and analysis.get("analysis_summary"):
-        s = analysis["analysis_summary"]
-        headline = s if len(s) <= 140 else s[:137].rsplit(" ", 1)[0] + "…"
-    if headline:
-        lines.append(f"\n📊 {headline}")
-
-    # Opened trades (líneas cortas y completas)
+    # HECHOS PRIMERO: qué se abrió sale SOLO del resultado real del executor
+    # (results["opened"]), nunca del texto del LLM. El LLM propone; los gates
+    # deterministas deciden; esto reporta lo que REALMENTE pasó. Antes el
+    # headline del LLM ("Abrí CMG") se ponía arriba y contradecía este bloque
+    # cuando un gate rechazaba la propuesta — un mensaje que afirmaba algo falso.
     if results["opened"]:
         lines.append(f"\n✅ Abrí {len(results['opened'])} posición(es):")
         for t in results["opened"]:
@@ -616,9 +611,17 @@ def send_run_summary(market_ctx, analysis, results, run_time):
             sign = "db" if t["debit"] > 0 else "cr"
             lines.append(f"  • {t['ticker']} {strategy_short} {t['strikes']} ${abs(t['debit']):.2f}{sign}")
     else:
-        # Sin aperturas: el headline ya explica el porqué; no repetir
-        # el no_trade_reason largo (queda completo en el log/DB).
         lines.append("\n⏸ Sin trades nuevos")
+
+    # CONTEXTO DESPUÉS: el headline del LLM es su LECTURA del día (el porqué),
+    # no una afirmación de acciones. Va debajo de los hechos para que nunca
+    # los contradiga como titular. Fallback al analysis_summary recortado.
+    headline = (analysis.get("headline") if analysis else "") or ""
+    if not headline and analysis and analysis.get("analysis_summary"):
+        s = analysis["analysis_summary"]
+        headline = s if len(s) <= 140 else s[:137].rsplit(" ", 1)[0] + "…"
+    if headline:
+        lines.append(f"\n📊 {headline}")
 
     # El auto_run YA NO cierra. Si el LLM sugirió revisar algún cierre, va en una
     # ALERTA SEPARADA con el razonamiento COMPLETO, para que el humano decida.
