@@ -27,7 +27,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from option_selector import CAPITAL, position_max_loss, portfolio_risk_pct
+from option_selector import get_account_nlv, position_max_loss, portfolio_risk_pct
 
 # El libro entra por ARGUMENTO, no por el modo del proceso. Este script lo corre
 # el bot (servicio propio en `main`, TRADING_MODE=paper): mirar current_mode()
@@ -35,6 +35,10 @@ from option_selector import CAPITAL, position_max_loss, portfolio_risk_pct
 MODE  = "live" if "live" in [a.lower() for a in sys.argv[1:]] else "paper"
 TABLE = "positions" if MODE == "live" else "paper_positions"
 
+# CAPITAL ahora sale del broker (última fila de account_snapshots), no de una
+# constante fija — misma fuente que el gate de auto_run. Se lee una vez acá y el
+# resto del script lo usa como antes.
+CAPITAL  = get_account_nlv()
 PCT      = portfolio_risk_pct()
 MAX_RISK = CAPITAL * PCT / 100.0
 

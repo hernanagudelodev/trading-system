@@ -870,12 +870,27 @@ def get_options_for_tickers(session, tickers_data):
 async def _get_options_async(session, tickers_data):
     from criteria import select_strategy
 
+    # THROTTLE entre tickers — evita el 429 de Tastytrade (3-ago).
+    #   Cada ticker dispara ~3 operaciones al broker (cadena + streamer +
+    #   market_data). 14 tickers sin pausa = ~42 requests en ráfaga, muy por
+    #   encima del límite del broker (~2 req/s, referencia empírica). El 429
+    #   resultante se disfrazaba de "sin estructura viable" y el LLM lo
+    #   racionalizaba como si no hubiera trades — un fallo técnico reportado
+    #   como condición de mercado, con errors=0.
+    #   Un sleep entre tickers espacia las llamadas. asyncio.sleep (no time.sleep)
+    #   porque estamos en async: time.sleep bloquearía el event loop.
+    #   Configurable; default 1.0s. Va ENTRE tickers, no tras el último.
+    throttle = float(os.getenv("SCANNER_TICKER_DELAY", "1.0"))
+
     results = {}
-    for ticker, criteria in tickers_data.items():
+    items = list(tickers_data.items())
+    for i, (ticker, criteria) in enumerate(items):
         strategy = select_strategy(criteria)
         results[ticker] = await _fetch_option_data(session, ticker,
                                                     criteria.get("price", 0),
                                                     strategy)
+        if i < len(items) - 1:          # no dormir tras el último
+            await asyncio.sleep(throttle)
     return _build_markdown(tickers_data, results)
 
 def position_max_loss(strike_low, strike_high, debit, contracts=1) -> float:
