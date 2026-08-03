@@ -51,10 +51,79 @@ MAX_LONG_CALLS = 4
 MAX_SPREADS    = 4
 
 # ── Gates de riesgo / calidad — RECHAZAN, no solo advierten ───────────────────
-# Pérdida máxima por trade ≤ X% del capital. Atado a env var para escalar solo.
-CAPITAL          = float(os.getenv("ACCOUNT_NLV", "14100"))   # net liquidating value
-MAX_RISK_PCT     = 0.03                       # 3% del capital
-MAX_RISK_DOLLARS = CAPITAL * MAX_RISK_PCT     # ~$423 con $14,100
+# Pérdida máxima por trade ≤ X% del capital.
+#
+# EL CAPITAL SALE DEL BROKER, NO DE UNA CONSTANTE (3-ago).
+#   `account_snapshots` ya guarda net_liquidating_value con timestamp, poblada
+#   por run_sync. En vez de un ACCOUNT_NLV fijo (que envejecía: el default 14100
+#   quedó $300 por debajo del capital real ~14400), se lee la última fila cada
+#   vez. SIN caché: el proceso de Railway vive entre runs, así que un valor
+#   cacheado en el run de la mañana quedaría pegado toda la tarde — justo el bug
+#   que esto elimina. La consulta es trivial (tabla chica, LIMIT 1).
+#   Fallback: si la tabla está vacía o la lectura falla, ACCOUNT_NLV env (14100).
+#
+# MAX_RISK_PCT: por env var, default 0.03 (3%), conservador a propósito. Valida
+#   el rango: un typo (0.3 = 30% por trade) se rechaza y cae al default.
+_ACCOUNT_NLV_FALLBACK = float(os.getenv("ACCOUNT_NLV", "14100"))
+
+
+def get_account_nlv():
+    """
+    Net Liquidating Value REAL, de la última fila de account_snapshots.
+
+    Sin caché — se lee fresco en cada llamada (el NLV cambia dentro de la vida
+    del proceso). Si la tabla está vacía o la lectura falla, cae al fallback
+    (env ACCOUNT_NLV, default 14100): un capital conocido es mejor que abortar,
+    y si el broker está caído la última fila SIGUE siendo el mejor dato que hay.
+    Loguea la fecha del snapshot para que un valor viejo sea visible.
+    """
+    try:
+        import psycopg2
+        conn = psycopg2.connect(os.getenv("DATABASE_URL"))
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT net_liquidating_value, snapshot_at
+            FROM account_snapshots
+            ORDER BY snapshot_at DESC
+            LIMIT 1
+        """)
+        row = cur.fetchone()
+        cur.close(); conn.close()
+        if row and row[0] is not None:
+            nlv = float(row[0])
+            print(f"  [capital] NLV ${nlv:,.2f} (snapshot {row[1]})")
+            return nlv
+        print(f"  ⚠️  [capital] account_snapshots vacía — "
+              f"usando fallback ${_ACCOUNT_NLV_FALLBACK:,.2f}")
+        return _ACCOUNT_NLV_FALLBACK
+    except Exception as e:
+        print(f"  ⚠️  [capital] no se pudo leer account_snapshots ({e}) — "
+              f"usando fallback ${_ACCOUNT_NLV_FALLBACK:,.2f}")
+        return _ACCOUNT_NLV_FALLBACK
+
+
+def _load_max_risk_pct():
+    raw = os.getenv("MAX_RISK_PCT", "0.03")
+    try:
+        pct = float(raw)
+    except ValueError:
+        print(f"  ⚠️  MAX_RISK_PCT='{raw}' no es número — usando 0.03 (3%).")
+        return 0.03
+    if not (0.0 < pct <= 0.20):
+        print(f"  ⚠️  MAX_RISK_PCT={pct} fuera de rango (0, 0.20] — "
+              f"¿un typo? usando 0.03 (3%).")
+        return 0.03
+    return pct
+
+
+MAX_RISK_PCT = _load_max_risk_pct()           # fracción del capital por trade
+
+
+def max_risk_dollars():
+    """Pérdida máxima por trade en dólares = NLV real × MAX_RISK_PCT. Fresco."""
+    return get_account_nlv() * MAX_RISK_PCT
+
+
 MIN_RR_DEBIT     = 1.0                         # Bull Call Spread / Long Call: R/R mínimo
 MIN_POP_CREDIT   = 60                          # Bull Put Spread: POP mínimo (%)
 MIN_SPREAD_WIDTH = 3                           # ancho mínimo ($): evita spreads de $1-2
@@ -412,6 +481,7 @@ def _report_descartes(ticker, estrategia, descartes, sobrevivientes):
 
 def _build_long_calls(strike_table, price):
     results = []
+    max_risk = max_risk_dollars()          # NLV real × pct, una vez por build
     for s in strike_table:
         delta = s["delta"]
         if not (DELTA_MIN <= delta <= DELTA_MAX):
@@ -423,7 +493,7 @@ def _build_long_calls(strike_table, price):
         premium_total = round(mid * 100, 0)
 
         # Gate de riesgo: la prima ES la pérdida máxima de un Long Call
-        if premium_total > MAX_RISK_DOLLARS:
+        if premium_total > max_risk:
             continue
 
         profit_50     = round(mid * 0.50 * 100, 0)
@@ -458,6 +528,7 @@ def _build_long_calls(strike_table, price):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _build_call_spreads(strike_table, price, ticker=""):
+    max_risk    = max_risk_dollars()       # NLV real × pct, una vez por build
     long_cands  = [s for s in strike_table
                    if SPREAD_LONG_DELTA_RANGE[0] <= s["delta"] <= SPREAD_LONG_DELTA_RANGE[1]]
     short_cands = [s for s in strike_table
@@ -484,7 +555,7 @@ def _build_call_spreads(strike_table, price, ticker=""):
             rr            = round(max_profit / max_loss, 2) if max_loss > 0 else 0
 
             # Gates: riesgo ≤ tope y R/R mínimo (débito)
-            if max_loss > MAX_RISK_DOLLARS:
+            if max_loss > max_risk:
                 continue
             if rr < MIN_RR_DEBIT:
                 continue
@@ -546,6 +617,7 @@ def _build_put_spreads(strike_table, price, ticker=""):
     """
     # For puts: delta is negative, abs(delta) is what we compare
     # Puts with higher absolute delta = closer to ATM = higher strike
+    max_risk    = max_risk_dollars()       # NLV real × pct, una vez por build
     short_cands = [s for s in strike_table
                    if PUT_SHORT_DELTA_RANGE[0] <= abs(s["delta"]) <= PUT_SHORT_DELTA_RANGE[1]
                    and s["strike"] < price]  # must be OTM (below price)
@@ -583,7 +655,7 @@ def _build_put_spreads(strike_table, price, ticker=""):
             pop_approx  = round((1 - abs(short_leg["delta"])) * 100, 0)
 
             # Gates: riesgo ≤ tope y POP mínimo (crédito)
-            if max_loss > MAX_RISK_DOLLARS:
+            if max_loss > max_risk:
                 continue
             if pop_approx < MIN_POP_CREDIT:
                 continue
@@ -798,12 +870,27 @@ def get_options_for_tickers(session, tickers_data):
 async def _get_options_async(session, tickers_data):
     from criteria import select_strategy
 
+    # THROTTLE entre tickers — evita el 429 de Tastytrade (3-ago).
+    #   Cada ticker dispara ~3 operaciones al broker (cadena + streamer +
+    #   market_data). 14 tickers sin pausa = ~42 requests en ráfaga, muy por
+    #   encima del límite del broker (~2 req/s, referencia empírica). El 429
+    #   resultante se disfrazaba de "sin estructura viable" y el LLM lo
+    #   racionalizaba como si no hubiera trades — un fallo técnico reportado
+    #   como condición de mercado, con errors=0.
+    #   Un sleep entre tickers espacia las llamadas. asyncio.sleep (no time.sleep)
+    #   porque estamos en async: time.sleep bloquearía el event loop.
+    #   Configurable; default 1.0s. Va ENTRE tickers, no tras el último.
+    throttle = float(os.getenv("SCANNER_TICKER_DELAY", "1.0"))
+
     results = {}
-    for ticker, criteria in tickers_data.items():
+    items = list(tickers_data.items())
+    for i, (ticker, criteria) in enumerate(items):
         strategy = select_strategy(criteria)
         results[ticker] = await _fetch_option_data(session, ticker,
                                                     criteria.get("price", 0),
                                                     strategy)
+        if i < len(items) - 1:          # no dormir tras el último
+            await asyncio.sleep(throttle)
     return _build_markdown(tickers_data, results)
 
 def position_max_loss(strike_low, strike_high, debit, contracts=1) -> float:
