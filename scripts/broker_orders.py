@@ -233,10 +233,10 @@ def _concession_allowed(intent, price) -> bool:
     MAX_RISK_DOLLARS, ya no es el trade que se aprobó — es otro, más caro, que
     nadie miró. No se abre.
     """
-    from option_selector import MAX_RISK_DOLLARS, position_max_loss
+    from option_selector import max_risk_dollars, position_max_loss
     debit_real = -float(price)          # volver a la convención del sistema
     ml = position_max_loss(intent.strike_low, intent.strike_high, debit_real)
-    return ml <= MAX_RISK_DOLLARS
+    return ml <= max_risk_dollars()
 
 
 def _order_price(debit) -> Decimal:

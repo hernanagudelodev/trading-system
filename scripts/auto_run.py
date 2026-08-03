@@ -456,12 +456,15 @@ def execute_recommendations(analysis):
     # La tabla depende del libro. Antes 'paper_positions' estaba hardcodeado —
     # en live habría leído el libro equivocado sin decir nada.
     from executor import current_mode
-    from option_selector import CAPITAL, position_max_loss, portfolio_risk_pct
+    from option_selector import get_account_nlv, position_max_loss, portfolio_risk_pct
 
     _mode  = current_mode()
     _table = "positions" if _mode == "live" else "paper_positions"
 
     # Tope agregado: obligatorio en los DOS libros. Sin default silencioso.
+    # CAPITAL ahora sale del broker (última fila de account_snapshots), no de una
+    # constante fija — misma fuente que el gate por-trade del option_selector.
+    CAPITAL            = get_account_nlv()
     PCT                = portfolio_risk_pct()
     MAX_PORTFOLIO_RISK = CAPITAL * PCT / 100.0
 
