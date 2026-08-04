@@ -79,14 +79,115 @@ class Executor:
         pass
 
 
+class CarteraRechazo(Exception):
+    """Un gate determinista de cartera rechazó la apertura. NO es un error: es el
+    sistema funcionando. Lleva el motivo para loguearlo."""
+    def __init__(self, motivo):
+        self.motivo = motivo
+        super().__init__(motivo)
+
+
+def _cartera_gates(table, ticker, strike_low, strike_high, debit):
+    """
+    Gates DETERMINISTAS de cartera, movidos desde auto_run.execute_recommendations
+    (probados en produccion). Compartidos entre paper y live: cada executor llama
+    con SU tabla ('paper_positions' o 'positions').
+
+    STATELESS: lee la cartera FRESCA de la DB en cada llamada. Una posicion abierta
+    hace segundos en el mismo run ya esta en la tabla (cmd_paper_buy / run_sync la
+    escribio), asi que leer fresco captura tambien lo de este run — no hace falta un
+    set en memoria. La DB es la unica verdad.
+
+    Aplica, en orden:
+      1. Lectura de cartera. Si la DB no responde -> FAIL-CLOSED (rechaza).
+      2. Concentracion: el ticker ya OPEN en este libro -> rechaza (no apilar nombre).
+      3. Riesgo agregado: riesgo_actual + riesgo_nuevo > tope -> rechaza.
+
+    Levanta CarteraRechazo(motivo) si algun gate corta. Devuelve None si todo pasa.
+    El CAPITAL sale del broker (get_account_nlv), misma fuente que el gate por-trade.
+    """
+    import os
+    import psycopg2
+    from option_selector import get_account_nlv, position_max_loss, portfolio_risk_pct
+
+    CAPITAL            = get_account_nlv()
+    PCT                = portfolio_risk_pct()
+    MAX_PORTFOLIO_RISK = CAPITAL * PCT / 100.0
+
+    open_tickers = set()
+    current_risk = 0.0
+    try:
+        conn = psycopg2.connect(os.getenv("DATABASE_URL"))
+        cur  = conn.cursor()
+        cur.execute(f"""
+            SELECT UPPER(ticker), strike_low, strike_high, premium_paid, contracts
+            FROM {table}
+            WHERE UPPER(status) = 'OPEN'
+        """)
+        for _tkr, _sl, _sh, _prem, _n in cur.fetchall():
+            open_tickers.add(_tkr)
+            current_risk += position_max_loss(_sl, _sh, _prem, _n)
+        cur.close(); conn.close()
+    except Exception as e:
+        # FAIL-CLOSED: no poder ver la exposicion es exactamente cuando NO se abre.
+        raise CarteraRechazo(f"no se pudo leer la cartera ({table}): {e} — no se abre")
+
+    ticker = ticker.upper()
+    if ticker in open_tickers:
+        raise CarteraRechazo(f"{ticker} ya tiene posicion abierta — no apilar mismo nombre")
+
+    new_risk = position_max_loss(strike_low, strike_high, debit)
+    if current_risk + new_risk > MAX_PORTFOLIO_RISK:
+        raise CarteraRechazo(
+            f"{ticker} supera el tope de cartera: "
+            f"${current_risk:,.0f} + ${new_risk:,.0f} > ${MAX_PORTFOLIO_RISK:,.0f}")
+
+    return None
+
+
+# Slippage simulado del paper: 1 centavo EN CONTRA, por spread (no por pata).
+# BCS (debit>0) paga 1c mas; BPS (debit<0, credito) cobra 1c menos. Los dos casos
+# son debit + 0.01: sumar acerca el credito negativo a cero (cobrar menos) y aleja
+# el debito positivo (pagar mas). Asumir fill perfecto al mid fue el sesgo que inflo
+# el mes de paper (§25); el centavo es chico pero honesto — ejecutar cuesta algo.
+PAPER_SLIPPAGE = 0.01
+
+
 class PaperExecutor(Executor):
     """
-    Ejecución paper: delega en las funciones de trade.py que ya existen y ya
-    están endurecidas (fix del $0.00, retorno booleano de cierre).
+    Ejecucion paper. A diferencia del executor viejo (que solo delegaba en
+    cmd_paper_buy), este es AUTONOMO: lee su propia cartera, aplica sus propios
+    gates deterministas, y simula el slippage — todo lo que antes vivia en
+    auto_run.execute_recommendations. auto_run pasa a ser solo orquestador.
+
+    ORDEN de open_position:
+      1. Gates de cartera (concentracion + riesgo agregado), stateless, sobre
+         paper_positions. Si rechazan -> False, NO registra.
+      2. Slippage mid + 1c en contra sobre el debit.
+      3. Registro vía cmd_paper_buy (que ya esta endurecida: fix del $0.00).
+
+    POR QUE LOS GATES ACA Y NO EN auto_run
+        Que paper abra y live no (o al reves) debe ser por un gate DETERMINISTA de
+        cartera, nunca por el LLM pensando distinto. El LLM decide UNA vez (selector,
+        idem para ambos); la divergencia legitima entre libros ocurre despues, en
+        estos gates. Por eso viven en el executor de cada libro, con su propia tabla.
     """
     mode = "paper"
+    TABLE = "paper_positions"
 
     def open_position(self, intent: OpenIntent) -> bool:
+        # 1. Gates de cartera (stateless, fail-closed). Rechazo != error.
+        try:
+            _cartera_gates(self.TABLE, intent.ticker,
+                           intent.strike_low, intent.strike_high, intent.debit)
+        except CarteraRechazo as rej:
+            print(f"  [paper] {intent.ticker} NO abierta: {rej.motivo}")
+            return False
+
+        # 2. Slippage: mid + 1c en contra (mismo signo para BCS y BPS).
+        debit_fill = round(intent.debit + PAPER_SLIPPAGE, 2)
+
+        # 3. Registro. cmd_paper_buy no devuelve valor: si no lanza, registro.
         import trade as trade_module
         try:
             trade_module.cmd_paper_buy(
@@ -94,10 +195,12 @@ class PaperExecutor(Executor):
                 intent.strike_low,
                 intent.strike_high,
                 intent.expiration,
-                intent.debit,
+                debit_fill,
                 context_json=intent.context_json,
                 rationale=intent.rationale,
             )
+            print(f"  [paper] {intent.ticker} registrada · debit_mid={intent.debit} "
+                  f"-> fill={debit_fill} (slippage +{PAPER_SLIPPAGE})")
             return True
         except Exception as e:
             print(f"  [paper] error abriendo {intent.ticker}: {e}")
@@ -106,24 +209,24 @@ class PaperExecutor(Executor):
     def close_position(self, ticker: str, reason: str) -> bool:
         """
         `reason` llega como PROSA del LLM. Se parte:
-            close_reason    = "MANUAL"  -> código, entra en varchar(50)
+            close_reason    = "MANUAL"  -> codigo, entra en varchar(50)
             close_rationale = reason    -> texto completo, columna TEXT
 
-        POR QUÉ "MANUAL" Y NO UN CÓDIGO NUEVO
-            Es el código que este camino viene usando desde siempre: los 19
-            cierres "MANUAL (LLM)" de las métricas de paper salieron de acá.
-            Estrenar un código parte la serie histórica en dos sin ganar nada.
+        POR QUE "MANUAL" Y NO UN CODIGO NUEVO
+            Es el codigo que este camino viene usando desde siempre: los 19
+            cierres "MANUAL (LLM)" de las metricas de paper salieron de aca.
+            Estrenar un codigo parte la serie historica en dos sin ganar nada.
 
         EL BUG DEL 23-jul
             Antes esto pasaba `close_reason=reason` con la prosa entera. El
             UPDATE reventaba con `value too long for type character
             varying(50)`, el except de abajo lo capturaba, y auto_run reportaba
             "cierre NO ejecutado (sin precio real)" — un mensaje FALSO: el
-            precio se había obtenido bien y el fallo era de esquema.
+            precio se habia obtenido bien y el fallo era de esquema.
             DLTR y WFC quedaron abiertas por eso.
         """
         import trade as trade_module
-        # cmd_paper_close ya devuelve True/False (True solo si cerró de verdad)
+        # cmd_paper_close ya devuelve True/False (True solo si cerro de verdad)
         try:
             return bool(trade_module.cmd_paper_close(
                 ticker,
