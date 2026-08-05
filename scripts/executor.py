@@ -304,6 +304,83 @@ def _alertar_desync(ticker, fill_price, order_id, detalle):
           f"order={order_id} · {detalle}")
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# INTERRUPTOR DE LIVE TRADING — cascada de dos capas, fail-safe a APAGADO
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Ninguna capa ENCIENDE por ausencia: lo unico que hace operar es un permiso
+# EXPLICITO en cada capa. Cualquier duda -> apagado. El sistema opera dinero real;
+# el default de un interruptor roto/ausente/ilegible es NO operar.
+#
+#   Capa 1 — env var maestra LIVE_TRADING_ENABLED
+#       Debe ser exactamente "true" (lowercase, tras strip). Ausente, vacia,
+#       "false", "1", "yes" = APAGADO. Cambiarla exige DEPLOY -> friccion
+#       deliberada: no se apaga/enciende el sistema en caliente por accidente.
+#       Si esta capa no permite, NI se consulta la DB (corta antes).
+#
+#   Capa 2 — kill-flag en DB (tabla system_state, key='live_kill')
+#       Un FRENO, no un acelerador. La capa 1 ya decidio que el sistema opera;
+#       este flag solo puede DETENERLO en caliente (lo setea un script / Telegram
+#       post-FASE 4). Semantica:
+#           fila ausente o value != 'off'  -> sigue (capa 1 mando)
+#           value == 'off'                 -> frena
+#           DB ilegible                    -> FRENA (no poder leer el freno es
+#                                             exactamente cuando no se arriesga)
+#       Se lee FRESCO en cada apertura, sin cache (mismo patron que get_account_nlv
+#       y account_snapshots): el proceso vive entre runs, un valor cacheado en la
+#       mañana quedaria pegado toda la tarde.
+
+LIVE_ENABLED_ENV = "LIVE_TRADING_ENABLED"
+KILL_KEY         = "live_kill"
+
+
+def _live_enabled_env() -> bool:
+    """Capa 1. True SOLO si LIVE_TRADING_ENABLED == 'true' exacto."""
+    return os.getenv(LIVE_ENABLED_ENV, "").strip().lower() == "true"
+
+
+def _live_kill_active() -> tuple:
+    """
+    Capa 2. Lee system_state[key='live_kill'] fresco. Devuelve (frena?, motivo).
+
+    frena=True  si value=='off' O si la DB no responde (fail-safe).
+    frena=False si la fila no existe o value!='off' (la capa 1 ya permitio).
+    """
+    import psycopg2
+    try:
+        conn = psycopg2.connect(os.getenv("DATABASE_URL"))
+        cur  = conn.cursor()
+        cur.execute("SELECT value FROM system_state WHERE key = %s", (KILL_KEY,))
+        row = cur.fetchone()
+        cur.close(); conn.close()
+    except Exception as e:
+        # No poder leer el freno -> frenar. Incluye tabla inexistente.
+        return True, f"no se pudo leer system_state ({e}) — fail-safe: no se opera"
+
+    if row is not None and str(row[0]).strip().lower() == "off":
+        return True, "kill-flag 'live_kill'=off en system_state — live detenido a mano"
+    return False, ""
+
+
+def live_trading_allowed() -> tuple:
+    """
+    Cascada completa. Devuelve (permitido: bool, motivo: str).
+
+    permitido=True SOLO si: capa 1 explicita 'true' Y capa 2 no frena Y DB legible.
+    Cualquier otra combinacion -> False con el motivo, para loguearlo.
+
+    Independiente del executor a proposito: se puede testear aislada sin mandar
+    una sola orden al broker.
+    """
+    if not _live_enabled_env():
+        return False, (f"{LIVE_ENABLED_ENV} no es 'true' — live deshabilitado por "
+                       f"env (capa 1). Cambiarlo exige deploy.")
+    frena, motivo = _live_kill_active()
+    if frena:
+        return False, motivo
+    return True, ""
+
+
 class LiveExecutor(Executor):
     """
     Ejecución REAL. El ciclo de vida de la orden vive en broker_orders.py; acá
@@ -333,6 +410,14 @@ class LiveExecutor(Executor):
     mode = "live"
 
     def open_position(self, intent: OpenIntent) -> bool:
+        # INTERRUPTOR: tres compuertas fail-safe ANTES de tocar el broker.
+        # Si el sistema no esta habilitado (env) o esta frenado (kill-flag/DB),
+        # NO se manda ninguna orden real. Loguea el motivo y devuelve False.
+        allowed, motivo = live_trading_allowed()
+        if not allowed:
+            print(f"  [live] {intent.ticker} NO abierta — interruptor: {motivo}")
+            return False
+
         from broker_orders import open_spread
 
         r = open_spread(intent)
