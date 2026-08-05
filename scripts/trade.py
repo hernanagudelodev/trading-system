@@ -141,6 +141,45 @@ def fetch_tastytrade_data():
     return asyncio.run(_fetch_tastytrade_data())
 
 
+async def _get_spots_async(tickers):
+    """
+    Precio (mark) del subyacente de varios tickers en UNA sola llamada batch.
+    Se usa en run_sync para llenar price_at_open al importar posiciones nuevas.
+    Una llamada para todos los tickers nuevos, no una por ticker → mínimo riesgo
+    de rate limit. Si falla, devuelve {} y los inserts caen a 0.0 (backfill luego).
+    """
+    if not tickers:
+        return {}
+    from tastytrade import Session
+    from tastytrade.market_data import get_market_data_by_type
+    cs = os.getenv("TASTYTRADE_CLIENT_SECRET")
+    rt = os.getenv("TASTYTRADE_REFRESH_TOKEN")
+    if not cs or not rt:
+        return {}
+    session = Session(cs, rt)
+    out = {}
+    try:
+        md = await get_market_data_by_type(session, equities=list(tickers))
+        for d in md:
+            sym = getattr(d, "symbol", None)
+            raw = getattr(d, "mark", None) or getattr(d, "last", None)
+            if sym and raw is not None:
+                out[sym.upper()] = round(float(raw), 2)
+    except Exception as e:
+        print(f"  [spot] no se pudieron leer precios de subyacentes ({e}) "
+              f"— price_at_open quedará en 0, lo completa el backfill")
+    return out
+
+
+def get_spots(tickers):
+    """Wrapper sync de _get_spots_async."""
+    try:
+        return asyncio.run(_get_spots_async(tickers))
+    except Exception as e:
+        print(f"  [spot] get_spots error ({e})")
+        return {}
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # SPREAD GROUPING
 # ══════════════════════════════════════════════════════════════════════════════
@@ -467,13 +506,16 @@ def insert_spread(spread, account_number):
              tastytrade_symbol, tastytrade_symbol_short,
              option_type, notes)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                'OPEN', NOW(), 0.0, %s, %s, %s, %s)
+                'OPEN', NOW(), %s, %s, %s, %s, %s)
         RETURNING id
     """, (
         spread["ticker"], spread["type"], "tastytrade", False,
         spread["strike_low"], spread["strike_high"],
         spread["contracts"], spread["expiration"],
         spread["premium_paid"], spread["total_cost"],
+        # price_at_open: spot del subyacente al abrir. Si el dict no lo trae
+        # (llamador viejo), cae a 0.0 y lo completa el backfill — no rompe.
+        float(spread.get("price_at_open") or 0.0),
         spread["tastytrade_symbol"], spread["tastytrade_symbol_short"],
         "CALL", notes,
     ))
@@ -506,7 +548,7 @@ def insert_position(tt_pos, account_number):
              status, opened_at, price_at_open,
              tastytrade_symbol, option_type, notes)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                'OPEN', NOW(), 0.0, %s, %s, %s)
+                'OPEN', NOW(), %s, %s, %s, %s)
         RETURNING id
     """, (
         tt_pos["ticker"], strategy, "tastytrade", False,
@@ -514,6 +556,8 @@ def insert_position(tt_pos, account_number):
         abs(tt_pos["quantity"]), tt_pos["expiration"],
         tt_pos["avg_open_price"],
         abs(tt_pos["avg_open_price"]) * abs(tt_pos["quantity"]) * 100,
+        # price_at_open: spot del subyacente al abrir. Fallback 0.0 si no viene.
+        float(tt_pos.get("price_at_open") or 0.0),
         tt_pos["symbol"], tt_pos["option_type"], notes,
     ))
     pos_id = cur.fetchone()[0]
@@ -871,7 +915,8 @@ def _read_context_from_reports(ticker):
 
 
 def cmd_paper_buy(ticker, strike_low, strike_high, expiration_str, debit,
-                  notes=None, context_json=None, rationale=None):
+                  notes=None, context_json=None, rationale=None,
+                  price_at_open=0.0):
     """
     Register a new paper spread position and save trade context.
     Debit > 0 → Bull Call Spread
@@ -924,13 +969,14 @@ def cmd_paper_buy(ticker, strike_low, strike_high, expiration_str, debit,
              expiration, premium_paid, total_cost, price_at_open,
              status, opened_at, notes,
              tastytrade_symbol, tastytrade_symbol_short)
-        VALUES (%s, %s, %s, %s, 1, %s, %s, %s, 0.0, 'OPEN', NOW(), %s,
+        VALUES (%s, %s, %s, %s, 1, %s, %s, %s, %s, 'OPEN', NOW(), %s,
                 %s, %s)
         RETURNING id
     """, (
         ticker, strategy,
         strike_low, strike_high,
         expiration, debit, total_cost,
+        float(price_at_open or 0.0),
         auto_notes,
         sym_long, sym_short,
     ))
@@ -1272,8 +1318,16 @@ def run_sync():
 
     new_count = 0
 
+    # Spot del subyacente para los spreads NUEVOS, en UNA llamada batch.
+    # Alimenta price_at_open (antes 0.0 hardcodeado). Si falla, dict vacío →
+    # insert_spread cae a 0.0 y lo completa el backfill. Nunca bloquea el sync.
+    nuevos_tickers = {s["ticker"] for s in spreads
+                      if s["tastytrade_symbol"] not in db_symbols}
+    spots = get_spots(nuevos_tickers) if nuevos_tickers else {}
+
     for spread in spreads:
         if spread["tastytrade_symbol"] not in db_symbols:
+            spread["price_at_open"] = spots.get(spread["ticker"].upper(), 0.0)
             pos_id = insert_spread(spread, account_number)
             print(f"\n  NEW spread imported:")
             print(f"    {spread['ticker']} Bull Call Spread "
