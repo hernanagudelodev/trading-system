@@ -4,8 +4,10 @@ executor.py  ·  RAMA `live` (dinero real)
 Separa la DECISIÓN (auto_run decide qué hacer) de la EJECUCIÓN (cómo se hace).
 
 auto_run produce INTENCIONES neutras ("abrir spread X", "cerrar Y") que no saben
-nada de paper ni live. Un Executor las ejecuta. La bandera TRADING_MODE elige QUÉ
-executor se instancia UNA sola vez — no hay 'if paper' desperdigado por el código.
+nada de paper ni live. Un Executor las ejecuta. En `def` NO hay TRADING_MODE: un
+solo proceso instancia LiveExecutor y PaperExecutor y corre los dos libros con la
+MISMA decision del LLM — el interruptor de live decide si live opera, no una bandera
+de modo. No hay 'if paper' desperdigado por el código.
 
     PaperExecutor : escribe en la DB
     LiveExecutor  : manda ÓRDENES REALES al broker. En ESTA rama está
@@ -17,12 +19,14 @@ executor se instancia UNA sola vez — no hay 'if paper' desperdigado por el có
    "operar en real" ejecutando un placeholder. Todo cambio se aplica A MANO en
    las dos ramas. Ver CONTEXTO_PROYECTO.md §23.
 
-Uso desde auto_run:
-    from executor import get_executor, OpenIntent
-    ex = get_executor()                      # lee TRADING_MODE, default 'paper'
-    ok = ex.open_position(OpenIntent(...))   # bool: ejecutado o no
-    ok = ex.close_position(ticker, reason)   # bool
-    ex.sync_after_opens()                    # una vez por run, tras las aperturas
+Uso desde auto_run (def: UN proceso corre los DOS libros, sin TRADING_MODE):
+    from executor import LiveExecutor, PaperExecutor, OpenIntent
+    live  = LiveExecutor()                   # opera solo si el interruptor lo permite
+    paper = PaperExecutor()
+    ok = live.open_position(OpenIntent(...))  # interruptor + gates live + broker
+    live.sync_after_opens()                   # baja a positions lo que abrio live
+    ok = paper.open_position(OpenIntent(...)) # gates paper + copia fill / mid+1c
+    ok = live.close_position(ticker, reason)  # cerrar NO pasa por el interruptor
 
 SOBRE `reason` EN close_position
     auto_run pasa el motivo que escribe el LLM: PROSA de ~450 caracteres.
@@ -68,7 +72,7 @@ class Executor:
                `positions`: quedaría sin stop loss hasta el próximo run.
 
         POR QUÉ ES UN MÉTODO Y NO UN `if mode == "live"` EN auto_run
-            Porque la bandera vive en get_executor() y en ningún otro lado.
+            En `def` no hay bandera: cada executor se instancia directo.
             auto_run llama esto sin preguntar de qué modo es; cada executor sabe
             si tiene algo que sincronizar. Una bandera chequeada en dos lugares
             son dos lugares donde puede discrepar.
@@ -569,33 +573,3 @@ class LiveExecutor(Executor):
         import trade as trade_module
         print("  [live] sincronizando la DB con el broker...")
         trade_module.run_sync()
-
-
-VALID_MODES = ("paper", "live")
-
-def current_mode() -> str:
-    """
-    Fuente ÚNICA de TRADING_MODE. Ausente -> 'paper' (default seguro).
-    Presente pero inválido -> explota: un typo no se adivina.
-    """
-    mode = os.getenv("TRADING_MODE", "paper").strip().lower()
-    if mode not in VALID_MODES:
-        raise RuntimeError(
-            f"TRADING_MODE='{mode}' inválido. Válidos: {VALID_MODES}."
-        )
-    return mode
-
-
-def get_executor() -> Executor:
-    mode = current_mode()
-    if mode == "live":
-        # OJO: en la rama `live` este executor SÍ opera con plata real. El
-        # mensaje anterior decía "no implementado, abortará" — heredado del stub
-        # de la rama main. Leer eso en un log y creer que no pasó nada es
-        # exactamente el fallo que este proyecto persigue: el log mintiendo
-        # sobre lo que el sistema hizo.
-        from broker_orders import executor_env
-        print(f"  ⚠️  TRADING_MODE=live · EXECUTOR_ENV={executor_env()} — "
-              f"LiveExecutor OPERA de verdad.")
-        return LiveExecutor()
-    return PaperExecutor()
