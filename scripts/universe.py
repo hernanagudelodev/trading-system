@@ -40,32 +40,18 @@ warnings.filterwarnings("ignore")
 SP500_GITHUB_CSV = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
 SP500_WIKI_URL   = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
 
-# Cache file to avoid re-fetching every run
-SP500_CACHE = "sp500_tickers.txt"
-
-
-def get_sp500_tickers(use_cache=True):
+def get_sp500_tickers():
     """
     Fetch the current S&P 500 constituent tickers.
 
-    Tries GitHub CSV first, then Wikipedia with headers, then cache.
-    Caches the result to sp500_tickers.txt.
+    Siempre FRESCO: GitHub CSV primero, Wikipedia como respaldo. Sin cache a disco
+    — un universo cacheado podia servir constituyentes de hasta 7 dias de antiguedad
+    (dato viejo disfrazado de fresco). Si ambas fuentes caen, devuelve [] y el scan
+    falla RUIDOSAMENTE: mejor no escanear que escanear un universo viejo.
 
     Returns:
         list[str] — ticker symbols (e.g. ['AAPL', 'MSFT', ...])
     """
-    import os
-
-    # Try cache first if requested
-    if use_cache and os.path.exists(SP500_CACHE):
-        cache_age = time.time() - os.path.getmtime(SP500_CACHE)
-        if cache_age < 7 * 24 * 3600:
-            with open(SP500_CACHE) as f:
-                tickers = [line.strip() for line in f if line.strip()]
-            if tickers:
-                print(f"  S&P 500 from cache: {len(tickers)} tickers")
-                return tickers
-
     # ── Try GitHub CSV first (most reliable) ──────────────────────────────────
     try:
         import urllib.request
@@ -79,9 +65,6 @@ def get_sp500_tickers(use_cache=True):
         df = pd.read_csv(io.StringIO(content))
         tickers = df["Symbol"].tolist()
         tickers = [t.replace(".", "-").strip() for t in tickers]
-
-        with open(SP500_CACHE, "w") as f:
-            f.write("\n".join(tickers))
 
         print(f"  S&P 500 from GitHub: {len(tickers)} tickers")
         return tickers
@@ -103,21 +86,13 @@ def get_sp500_tickers(use_cache=True):
         tickers = df["Symbol"].tolist()
         tickers = [t.replace(".", "-").strip() for t in tickers]
 
-        with open(SP500_CACHE, "w") as f:
-            f.write("\n".join(tickers))
-
         print(f"  S&P 500 from Wikipedia: {len(tickers)} tickers")
         return tickers
     except Exception as e:
         print(f"  Wikipedia failed: {e}")
 
-    # ── Fall back to stale cache ──────────────────────────────────────────────
-    if os.path.exists(SP500_CACHE):
-        with open(SP500_CACHE) as f:
-            tickers = [line.strip() for line in f if line.strip()]
-        print(f"  Using stale cache: {len(tickers)} tickers")
-        return tickers
-
+    # Ambas fuentes cayeron: sin universo. Devuelve [] -> el scan falla ruidoso.
+    print("  ⛔ no se pudo obtener el universo (GitHub y Wikipedia fallaron).")
     return []
 
 
@@ -285,14 +260,14 @@ def fast_prefilter(tickers, batch_size=50, min_price=5.0, max_price=2000.0,
 # CONVENIENCE — full universe pipeline
 # ══════════════════════════════════════════════════════════════════════════════
 
-def get_scanner_candidates(use_cache=True):
+def get_scanner_candidates():
     """
     Full pipeline: S&P 500 → fast pre-filter → candidates.
 
     Returns:
         list[str] — candidate tickers ready for the full scanner
     """
-    tickers    = get_sp500_tickers(use_cache=use_cache)
+    tickers    = get_sp500_tickers()
     if not tickers:
         return []
     candidates = fast_prefilter(tickers)
