@@ -160,23 +160,25 @@ PAPER_SLIPPAGE = 0.01
 def _fill_de_live(ticker, strike_low, strike_high, expiration):
     """
     Busca en `positions` (libro LIVE) una posicion OPEN con la MISMA estructura
-    (ticker + strikes + expiracion) que live abrio en este run. Devuelve el
-    premium_paid REAL de live, o None si no existe.
+    (ticker + strikes + expiracion) que live abrio en este run.
+
+    Devuelve (premium_paid, price_at_open) REALES de live, o None si no existe.
+    price_at_open puede venir 0.0/None si live todavia no lo capturo — el caller
+    lo trata como "sin spot" y cae al fallback.
 
     POR QUE
         Cuando live y paper abren la misma estructura, paper NO debe simular:
-        debe reflejar el fill REAL de live para que el P&L de ambos libros sea
-        comparable. El mid+1c es solo el fallback para cuando paper abre en
-        SOLITARIO (live apagado, o un gate de live rechazo lo que paper acepto).
-        Depende de que run_sync ya haya poblado `positions` -> por eso el orden
-        del orquestador es live -> run_sync -> paper.
+        refleja el fill REAL de live (premium Y spot de apertura) para que ambos
+        libros sean comparables. El mid+1c (premium) y get_spots (spot) son el
+        fallback para cuando paper abre en SOLITARIO. Depende de que run_sync ya
+        haya poblado `positions` -> por eso el orden es live -> run_sync -> paper.
     """
     import os, psycopg2
     try:
         conn = psycopg2.connect(os.getenv("DATABASE_URL"))
         cur  = conn.cursor()
         cur.execute("""
-            SELECT premium_paid FROM positions
+            SELECT premium_paid, price_at_open FROM positions
             WHERE UPPER(ticker) = %s
               AND strike_low  = %s
               AND strike_high = %s
@@ -191,7 +193,27 @@ def _fill_de_live(ticker, strike_low, strike_high, expiration):
         # No poder leer no debe bloquear paper: cae a simulacion, avisando.
         print(f"  [paper] no se pudo consultar el fill de live ({e}) — se simula.")
         return None
-    return float(row[0]) if row and row[0] is not None else None
+    if row and row[0] is not None:
+        premium = float(row[0])
+        spot    = float(row[1]) if row[1] is not None else 0.0
+        return premium, spot
+    return None
+
+
+def _spot_actual(ticker):
+    """
+    Spot del subyacente AHORA, para paper en solitario (live no abrio esto).
+    Desactualizado por segundos/minutos, pero REAL — mejor que 0.0, que es un
+    fallo silencioso disfrazado de dato. Reusa get_spots de trade.py (Tastytrade).
+    Devuelve float o 0.0 si no se pudo.
+    """
+    try:
+        import trade as trade_module
+        spots = trade_module.get_spots([ticker.upper()])
+        return float(spots.get(ticker.upper(), 0.0) or 0.0)
+    except Exception as e:
+        print(f"  [paper] no se pudo obtener spot de {ticker} ({e}) — queda 0.0")
+        return 0.0
 
 
 class PaperExecutor(Executor):
@@ -225,16 +247,19 @@ class PaperExecutor(Executor):
             print(f"  [paper] {intent.ticker} NO abierta: {rej.motivo}")
             return False
 
-        # 2. Fill: copiar el de LIVE si live abrio esta misma estructura este run;
-        #    si no (paper en solitario), simular mid + 1c en contra.
-        fill_live = _fill_de_live(intent.ticker, intent.strike_low,
-                                  intent.strike_high, intent.expiration)
-        if fill_live is not None:
-            debit_fill = fill_live
-            origen = f"copiado de live ({fill_live})"
+        # 2. Fill + spot: copiar de LIVE si live abrio esta misma estructura este
+        #    run; si no (paper en solitario), simular premium (mid+1c) y consultar
+        #    el spot actual a Tastytrade (real aunque desactualizado por minutos).
+        copia = _fill_de_live(intent.ticker, intent.strike_low,
+                              intent.strike_high, intent.expiration)
+        if copia is not None:
+            debit_fill, price_at_open = copia
+            origen = f"copiado de live (premium={debit_fill}, spot={price_at_open})"
         else:
             debit_fill = round(intent.debit + PAPER_SLIPPAGE, 2)
-            origen = f"simulado mid+{PAPER_SLIPPAGE} (paper en solitario)"
+            price_at_open = _spot_actual(intent.ticker)
+            origen = (f"simulado mid+{PAPER_SLIPPAGE}, spot consultado "
+                      f"({price_at_open}) (paper en solitario)")
 
         # 3. Registro. cmd_paper_buy no devuelve valor: si no lanza, registro.
         import trade as trade_module
@@ -247,6 +272,7 @@ class PaperExecutor(Executor):
                 debit_fill,
                 context_json=intent.context_json,
                 rationale=intent.rationale,
+                price_at_open=price_at_open,
             )
             print(f"  [paper] {intent.ticker} registrada · debit_mid={intent.debit} "
                   f"-> fill={debit_fill} ({origen})")
