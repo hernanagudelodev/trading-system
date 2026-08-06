@@ -216,6 +216,35 @@ def _spot_actual(ticker):
         return 0.0
 
 
+def _persistir_sector(table, ticker):
+    """
+    Escribe el sector en la fila OPEN mas reciente de `ticker` en `table`.
+    Se llama DESPUES de que la fila existe (paper: tras cmd_paper_buy; live: tras
+    run_sync). El sector sale de criteria.get_sector() — la FUENTE UNICA del
+    sistema, yfinance, nunca un mapeo estatico.
+
+    Best-effort: si falla, la fila queda con sector NULL y el warning de
+    concentracion la trata como "Other". No bloquea la apertura — el sector es
+    para un aviso informativo, no para operar.
+    """
+    try:
+        import os, psycopg2
+        from criteria import get_sector
+        sector = get_sector(ticker)
+        conn = psycopg2.connect(os.getenv("DATABASE_URL"))
+        cur  = conn.cursor()
+        cur.execute(f"""
+            UPDATE {table} SET sector = %s
+            WHERE id = (SELECT id FROM {table}
+                        WHERE UPPER(ticker) = %s AND UPPER(status) = 'OPEN'
+                        ORDER BY id DESC LIMIT 1)
+        """, (sector, ticker.upper()))
+        conn.commit(); cur.close(); conn.close()
+        print(f"  [sector] {ticker} -> {sector} ({table})")
+    except Exception as e:
+        print(f"  [sector] no se pudo persistir {ticker} en {table} ({e}) — queda NULL")
+
+
 class PaperExecutor(Executor):
     """
     Ejecucion paper. A diferencia del executor viejo (que solo delegaba en
@@ -276,6 +305,7 @@ class PaperExecutor(Executor):
             )
             print(f"  [paper] {intent.ticker} registrada · debit_mid={intent.debit} "
                   f"-> fill={debit_fill} ({origen})")
+            _persistir_sector(self.TABLE, intent.ticker)
             return True
         except Exception as e:
             print(f"  [paper] error abriendo {intent.ticker}: {e}")
@@ -644,3 +674,20 @@ class LiveExecutor(Executor):
         import trade as trade_module
         print("  [live] sincronizando la DB con el broker...")
         trade_module.run_sync()
+
+        # Poblar el sector de las posiciones live OPEN que aun no lo tengan.
+        # run_sync ya creo/actualizo las filas; aca les ponemos el sector desde
+        # la fuente unica (criteria.get_sector). Solo las que estan en NULL, para
+        # no re-consultar yfinance de posiciones viejas ya pobladas.
+        try:
+            import os, psycopg2
+            conn = psycopg2.connect(os.getenv("DATABASE_URL"))
+            cur  = conn.cursor()
+            cur.execute("SELECT DISTINCT UPPER(ticker) FROM positions "
+                        "WHERE UPPER(status)='OPEN' AND sector IS NULL")
+            pendientes = [r[0] for r in cur.fetchall()]
+            cur.close(); conn.close()
+            for tk in pendientes:
+                _persistir_sector("positions", tk)
+        except Exception as e:
+            print(f"  [sector] no se pudo poblar sectores live ({e})")

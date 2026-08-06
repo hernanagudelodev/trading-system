@@ -76,17 +76,10 @@ def _open_browser(path):
         pass
 
 # Sector map for concentration warnings
-TICKER_SECTOR = {
-    "AAPL": "Tech",  "MSFT": "Tech",  "GOOGL": "Tech", "META": "Tech",
-    "AMZN": "Tech",  "NVDA": "Tech",  "TSLA": "Tech",  "AVGO": "Tech",
-    "AMD":  "Tech",  "TXN":  "Tech",  "QCOM": "Tech",  "CRM":  "Tech",
-    "NOW":  "Tech",  "ADBE": "Tech",  "INTU": "Tech",
-    "JPM": "Financials", "V": "Financials", "MA": "Financials",
-    "GS":  "Financials", "BAC": "Financials",
-    "HD":   "Consumer",  "WMT":  "Consumer", "COST": "Consumer",
-    "MCD":  "Consumer",  "NKE":  "Consumer",
-    "JNJ":  "Health",    "UNH":  "Health",   "LLY":  "Health",
-}
+# TICKER_SECTOR (dict hardcodeado de ~30 tickers) eliminado: el sector ahora
+# sale de criteria.get_sector() (yfinance), fuente unica. Las abiertas usan la
+# columna 'sector' (el executor la persiste al abrir); los candidatos usan
+# criteria['sector'] del scan. Ver check_sector_concentration.
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -212,15 +205,21 @@ def format_criteria_md(ticker, criteria):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def check_sector_concentration(open_positions, passed_criteria):
+    """
+    Sector de las ABIERTAS: de la columna `sector` (poblada por el executor al
+    abrir, desde criteria.get_sector). NULL en filas viejas -> "Other" transitorio.
+    Sector de los CANDIDATOS: de criteria['sector'] (viene del scan).
+    Sin diccionario hardcodeado: fuente unica yfinance.
+    """
     warnings = []
     open_sectors = {}
     for p in open_positions:
         ticker = p.get("ticker", "")
-        sector = TICKER_SECTOR.get(ticker, "Other")
+        sector = p.get("sector") or "Other"
         open_sectors.setdefault(sector, []).append(ticker)
 
-    for ticker in passed_criteria:
-        sector = TICKER_SECTOR.get(ticker, "Other")
+    for ticker, criteria in passed_criteria.items():
+        sector = criteria.get("sector", "Other")
         if sector in open_sectors:
             existing = ", ".join(open_sectors[sector])
             warnings.append(

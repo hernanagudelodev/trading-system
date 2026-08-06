@@ -393,29 +393,57 @@ def get_iv_percentile(closes, iv_current):
 # EARNINGS, VOLUME, FUNDAMENTALS
 # ══════════════════════════════════════════════════════════════════════════════
 
+def get_sector(ticker):
+    """
+    FUENTE UNICA del sector de un ticker en todo el sistema. Sale de yfinance
+    (tk.info["sector"]), asi que es el sector ACTUAL — nunca se desactualiza como
+    un diccionario hardcodeado. Reemplaza los mapeos estaticos que habia en
+    scanner.py (TICKER_SECTOR) y market_context.py (TICKER_SECTOR_MAP), que solo
+    cubrian ~30 tickers y mandaban el resto a "Other".
+
+    Devuelve el nombre del sector, "ETF" para ETFs, o "Other" si no se pudo.
+    Cualquier consumidor que necesite el sector llama ESTA funcion — no se repite
+    la logica de yfinance en ningun otro lado.
+    """
+    old = _silence_stderr()
+    try:
+        info = yf.Ticker(ticker).info
+        _restore_stderr(old)
+        if info.get("quoteType", "") == "ETF":
+            return "ETF"
+        return info.get("sector") or "Other"
+    except Exception:
+        _restore_stderr(old)
+        return "Other"
+
+
 def get_earnings_info(ticker):
     old = _silence_stderr()
     try:
         tk   = yf.Ticker(ticker)
         info = tk.info
         is_etf = info.get("quoteType", "") == "ETF"
+        # Sector: de la MISMA info ya cargada (sin segunda llamada). La logica
+        # canonica vive en get_sector(); aca se replica el extract sobre el info
+        # que ya tenemos en mano para no pedir tk.info dos veces en el mismo scan.
+        sector = "ETF" if is_etf else (info.get("sector") or "Other")
         _restore_stderr(old)
         if is_etf:
-            return {"days_to_earnings": None, "is_etf": True}
+            return {"days_to_earnings": None, "is_etf": True, "sector": sector}
         calendar = tk.calendar
         if not calendar or "Earnings Date" not in calendar:
-            return {"days_to_earnings": None, "is_etf": False}
+            return {"days_to_earnings": None, "is_etf": False, "sector": sector}
         dates = calendar["Earnings Date"]
         if not dates:
-            return {"days_to_earnings": None, "is_etf": False}
+            return {"days_to_earnings": None, "is_etf": False, "sector": sector}
         d    = dates[0] if isinstance(dates, list) else dates
         days = (d - datetime.date.today()).days
         if days < 0 or days > 365:
-            return {"days_to_earnings": None, "is_etf": False}
-        return {"days_to_earnings": int(days), "is_etf": False}
+            return {"days_to_earnings": None, "is_etf": False, "sector": sector}
+        return {"days_to_earnings": int(days), "is_etf": False, "sector": sector}
     except Exception:
         _restore_stderr(old)
-        return {"days_to_earnings": None, "is_etf": False}
+        return {"days_to_earnings": None, "is_etf": False, "sector": "Other"}
 
 
 def get_volume(data):
@@ -551,6 +579,7 @@ def get_all_criteria(ticker):
         "ticker":    ticker,
         "timestamp": datetime.datetime.now().isoformat(timespec="minutes"),
         "price":     round(price, 2),
+        "sector":    earnings_info.get("sector", "Other"),
 
         "technical": {
             "trend_25d":          get_trend_25d(closes),

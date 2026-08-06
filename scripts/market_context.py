@@ -28,6 +28,7 @@ Dependencies:
 """
 
 import os
+from criteria import get_sector
 import sys
 import json
 import asyncio
@@ -331,18 +332,10 @@ def get_upcoming_earnings():
     except Exception:
         metrics_map = {}
 
-    TICKER_SECTOR_MAP = {
-        "NVDA": "Semiconductors", "AVGO": "Semiconductors",
-        "AMD":  "Semiconductors", "TSM":  "Semiconductors",
-        "MU":   "Semiconductors", "INTC": "Semiconductors",
-        "AAPL": "Mega-cap Tech",  "MSFT": "Mega-cap Tech",
-        "GOOGL":"Mega-cap Tech",  "META": "Mega-cap Tech",
-        "AMZN": "Mega-cap Tech",
-        "JPM":  "Financials",     "GS":   "Financials",   "BAC": "Financials",
-        "WMT":  "Consumer",       "COST": "Consumer",     "HD":  "Consumer",
-        "JNJ":  "Health",         "UNH":  "Health",       "LLY": "Health",
-        "XOM":  "Energy",         "CVX":  "Energy",
-    }
+    # TICKER_SECTOR_MAP eliminado: el sector sale de criteria.get_sector()
+    # (yfinance), fuente unica del sistema. Se pierde la granularidad fina
+    # (antes 'Semiconductors'/'Mega-cap Tech'; ahora 'Technology'), a cambio
+    # de UNA sola taxonomia de sector en todo el sistema en vez de dos mapas.
 
     for ticker, m in metrics_map.items():
         try:
@@ -356,10 +349,10 @@ def get_upcoming_earnings():
             if 0 <= days_away <= EARNINGS_RISK_DAYS:
                 upcoming.append({
                     "ticker":    ticker,
-                    "sector":    TICKER_SECTOR_MAP.get(ticker, "Other"),
+                    "sector":    get_sector(ticker),
                     "date":      str(exp_date),
                     "days_away": days_away,
-                    "warning":   f"⚠️ {ticker} ({TICKER_SECTOR_MAP.get(ticker, '?')}) reporta en {days_away}d — riesgo de contagio sectorial"
+                    "warning":   f"⚠️ {ticker} ({get_sector(ticker)}) reporta en {days_away}d — riesgo de contagio sectorial"
                 })
         except Exception:
             continue
