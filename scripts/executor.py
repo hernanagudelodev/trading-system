@@ -157,6 +157,43 @@ def _cartera_gates(table, ticker, strike_low, strike_high, debit):
 PAPER_SLIPPAGE = 0.01
 
 
+def _fill_de_live(ticker, strike_low, strike_high, expiration):
+    """
+    Busca en `positions` (libro LIVE) una posicion OPEN con la MISMA estructura
+    (ticker + strikes + expiracion) que live abrio en este run. Devuelve el
+    premium_paid REAL de live, o None si no existe.
+
+    POR QUE
+        Cuando live y paper abren la misma estructura, paper NO debe simular:
+        debe reflejar el fill REAL de live para que el P&L de ambos libros sea
+        comparable. El mid+1c es solo el fallback para cuando paper abre en
+        SOLITARIO (live apagado, o un gate de live rechazo lo que paper acepto).
+        Depende de que run_sync ya haya poblado `positions` -> por eso el orden
+        del orquestador es live -> run_sync -> paper.
+    """
+    import os, psycopg2
+    try:
+        conn = psycopg2.connect(os.getenv("DATABASE_URL"))
+        cur  = conn.cursor()
+        cur.execute("""
+            SELECT premium_paid FROM positions
+            WHERE UPPER(ticker) = %s
+              AND strike_low  = %s
+              AND strike_high = %s
+              AND expiration  = %s
+              AND UPPER(status) = 'OPEN'
+            ORDER BY id DESC
+            LIMIT 1
+        """, (ticker.upper(), strike_low, strike_high, expiration))
+        row = cur.fetchone()
+        cur.close(); conn.close()
+    except Exception as e:
+        # No poder leer no debe bloquear paper: cae a simulacion, avisando.
+        print(f"  [paper] no se pudo consultar el fill de live ({e}) — se simula.")
+        return None
+    return float(row[0]) if row and row[0] is not None else None
+
+
 class PaperExecutor(Executor):
     """
     Ejecucion paper. A diferencia del executor viejo (que solo delegaba en
@@ -188,8 +225,16 @@ class PaperExecutor(Executor):
             print(f"  [paper] {intent.ticker} NO abierta: {rej.motivo}")
             return False
 
-        # 2. Slippage: mid + 1c en contra (mismo signo para BCS y BPS).
-        debit_fill = round(intent.debit + PAPER_SLIPPAGE, 2)
+        # 2. Fill: copiar el de LIVE si live abrio esta misma estructura este run;
+        #    si no (paper en solitario), simular mid + 1c en contra.
+        fill_live = _fill_de_live(intent.ticker, intent.strike_low,
+                                  intent.strike_high, intent.expiration)
+        if fill_live is not None:
+            debit_fill = fill_live
+            origen = f"copiado de live ({fill_live})"
+        else:
+            debit_fill = round(intent.debit + PAPER_SLIPPAGE, 2)
+            origen = f"simulado mid+{PAPER_SLIPPAGE} (paper en solitario)"
 
         # 3. Registro. cmd_paper_buy no devuelve valor: si no lanza, registro.
         import trade as trade_module
@@ -204,7 +249,7 @@ class PaperExecutor(Executor):
                 rationale=intent.rationale,
             )
             print(f"  [paper] {intent.ticker} registrada · debit_mid={intent.debit} "
-                  f"-> fill={debit_fill} (slippage +{PAPER_SLIPPAGE})")
+                  f"-> fill={debit_fill} ({origen})")
             return True
         except Exception as e:
             print(f"  [paper] error abriendo {intent.ticker}: {e}")
