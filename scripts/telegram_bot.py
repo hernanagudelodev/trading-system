@@ -76,6 +76,8 @@ COMANDOS = {
                  "razonamiento de los runs - arg: N | fecha | --log"),
     "/health":  (os.path.join(_TOOLS, "check_operational.py"), True,  False,
                  "salud del auto_run - arg: N"),
+    "/equity":  (os.path.join(_TOOLS, "equity_change.py"),      True,  False,
+                 "cambio de patrimonio NLV - arg: fecha | N dias (default 30d)"),
 }
 
 # NO están en el repo, aunque CONTEXTO_PROYECTO.md los liste en la tabla de
