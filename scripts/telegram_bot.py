@@ -103,7 +103,10 @@ def _ayuda():
     for cmd, (_, acepta, _dobla, desc) in COMANDOS.items():
         arg = " <arg>" if acepta else ""
         lineas.append(f"{cmd}{arg}\n    {desc}")
-    lineas += ["", "/help — esta lista"]
+    lineas += ["", "-- ACCION (cierra plata real) --",
+               "/close TICKER\n    dry-run + pide /confirmar. Solo LIVE.",
+               "/confirmar\n    ejecuta el cierre pendiente (ventana 60s).",
+               "", "/help - esta lista"]
     return "\n".join(lineas)
 
 
@@ -147,6 +150,53 @@ def _correr(script, args):
     return salida
 
 
+# CIERRE POR COMANDO — confirmacion de dos pasos (solo LIVE) ────────────────
+# /close <TICKER> -> DRY-RUN (close_live commit=False): precia e informa, NO
+# cierra; guarda un pendiente. /confirmar dentro de la ventana ejecuta el cierre
+# REAL (commit=True). Cualquier otro comando entremedio cancela. El estado vive
+# EN MEMORIA: si el bot se reinicia, el pendiente se pierde (correcto).
+
+_CIERRE_PENDIENTE = {"ticker": None, "ts": 0.0}
+_CONFIRM_VENTANA_S = 60
+TICKER_RE = re.compile(r"^[A-Za-z]{1,5}$")
+
+
+def _cmd_close(partes):
+    if len(partes) < 2:
+        return ("close", "Uso: /close TICKER (solo live). Ej: /close SCHW", False)
+    ticker = partes[1].upper()
+    if not TICKER_RE.match(ticker):
+        return ("close", f"'{partes[1]}' no parece un ticker valido.", False)
+    from close_live_manual import close_live
+    ok, detalle = close_live(ticker, commit=False)
+    if not ok:
+        _CIERRE_PENDIENTE["ticker"] = None
+        return ("close", detalle, False)
+    _CIERRE_PENDIENTE["ticker"] = ticker
+    _CIERRE_PENDIENTE["ts"]     = time.time()
+    return ("close",
+            f"{detalle}\n\nEsto CERRARIA {ticker} en LIVE (plata real).\n"
+            f"Manda /confirmar en los proximos {_CONFIRM_VENTANA_S}s para ejecutar.\n"
+            f"Cualquier otra cosa lo cancela.", False)
+
+
+def _cmd_confirmar():
+    tk = _CIERRE_PENDIENTE["ticker"]
+    edad = time.time() - _CIERRE_PENDIENTE["ts"]
+    if not tk:
+        return ("confirmar", "No hay cierre pendiente. Manda /close TICKER primero.", False)
+    if edad > _CONFIRM_VENTANA_S:
+        _CIERRE_PENDIENTE["ticker"] = None
+        return ("confirmar",
+                f"El cierre de {tk} expiro ({int(edad)}s). Volve a /close {tk}.", False)
+    _CIERRE_PENDIENTE["ticker"] = None
+    from close_live_manual import close_live
+    ok, detalle = close_live(tk, commit=True)
+    estado = "CERRADA" if ok else "NO se pudo cerrar"
+    return ("confirmar", f"{estado}: {tk}\n\n{detalle}", ok)
+
+
+
 def _manejar(texto):
     partes = texto.strip().split()
     if not partes:
@@ -158,6 +208,14 @@ def _manejar(texto):
 
     if cmd in ("/help", "/start"):
         return ("Trading bot", _ayuda(), False)
+
+    if cmd == "/confirmar":
+        return _cmd_confirmar()
+    if cmd == "/close":
+        return _cmd_close(partes)
+    # Cualquier comando que NO sea /confirmar cancela un pendiente vivo.
+    if _CIERRE_PENDIENTE["ticker"] and cmd != "/confirmar":
+        _CIERRE_PENDIENTE["ticker"] = None
 
     if cmd not in COMANDOS:
         return ("Comando desconocido", f"{cmd} no existe.\n\n{_ayuda()}", False)
