@@ -368,7 +368,7 @@ def ejecutar_aperturas(intents):
         print(f"\n  [aperturas] SYNC — bajando {res['live_abiertas']} apertura(s) "
               f"de live a positions...")
         try:
-            live.sync_after_opens()
+            live.sync_after_opens(intents)   # pasa los intents para guardar su rationale
         except Exception as e:
             print(f"  [aperturas] WARN sync fallo ({e}) — paper simulara en vez de "
                   f"copiar el fill de live este run.")

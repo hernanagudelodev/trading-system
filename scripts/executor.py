@@ -654,7 +654,7 @@ class LiveExecutor(Executor):
 
         return True
 
-    def sync_after_opens(self) -> None:
+    def sync_after_opens(self, intents=None) -> None:
         """
         Baja del broker lo que auto_run acaba de abrir.
 
@@ -691,3 +691,53 @@ class LiveExecutor(Executor):
                 _persistir_sector("positions", tk)
         except Exception as e:
             print(f"  [sector] no se pudo poblar sectores live ({e})")
+
+        # Guardar el CONTEXTO/rationale de cada apertura. run_sync crea la fila
+        # desde el broker (que NO conoce el rationale del LLM); aca lo enganchamos
+        # buscando la fila OPEN de cada intent y guardando su rationale en
+        # trade_context. Automatiza el --save-context manual que en un sistema
+        # autonomo nunca se ejecutaba.
+        if intents:
+            self._guardar_contexto_aperturas(intents)
+
+    def _guardar_contexto_aperturas(self, intents):
+        """
+        Para cada intent, encuentra su fila OPEN recien creada por run_sync
+        (match ticker+strikes+expiration) y guarda el rationale en trade_context.
+        Idempotente: si la fila ya tiene contexto, no duplica.
+        """
+        import os, psycopg2
+        import trade as trade_module
+        try:
+            conn = psycopg2.connect(os.getenv("DATABASE_URL"))
+            cur  = conn.cursor()
+            for it in intents:
+                if not getattr(it, "rationale", None):
+                    continue
+                cur.execute("""
+                    SELECT id FROM positions
+                    WHERE UPPER(ticker) = UPPER(%s)
+                      AND strike_low  = %s
+                      AND strike_high = %s
+                      AND expiration  = %s
+                      AND UPPER(status) = 'OPEN'
+                    ORDER BY opened_at DESC
+                    LIMIT 1
+                """, (it.ticker, it.strike_low, it.strike_high, it.expiration))
+                row = cur.fetchone()
+                if not row:
+                    print(f"  [contexto] {it.ticker}: no encontre la fila OPEN para el rationale")
+                    continue
+                pos_id = row[0]
+                cur.execute("SELECT 1 FROM trade_context WHERE position_id = %s", (pos_id,))
+                if cur.fetchone():
+                    continue
+                trade_module.save_trade_context(
+                    position_id=pos_id,
+                    context_json=getattr(it, "context_json", None),
+                    rationale=it.rationale,
+                )
+                print(f"  [contexto] {it.ticker} (id {pos_id}): rationale guardado")
+            cur.close(); conn.close()
+        except Exception as e:
+            print(f"  [contexto] no se pudo guardar el contexto ({e})")
