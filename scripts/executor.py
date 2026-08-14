@@ -513,8 +513,22 @@ class LiveExecutor(Executor):
         del mensaje, que es el dato irrecuperable.
     """
     mode = "live"
+    TABLE = "positions"   # libro real — el gate de cartera mira esta tabla
 
     def open_position(self, intent: OpenIntent) -> bool:
+        # GATES DE CARTERA (stateless, fail-closed) — MISMO gate que paper.
+        # Concentracion/duplicados: si el ticker ya esta OPEN en `positions`,
+        # NO se apila otra posicion del mismo nombre. Este gate faltaba en el
+        # camino de LIVE (estaba solo en paper); por eso el 14-ago se abrieron
+        # ANET y BX que YA estaban abiertos, duplicando exposicion real. Va
+        # PRIMERO, antes del interruptor: si ya esta abierto, ni evaluamos abrir.
+        try:
+            _cartera_gates(self.TABLE, intent.ticker,
+                           intent.strike_low, intent.strike_high, intent.debit)
+        except CarteraRechazo as rej:
+            print(f"  [live] {intent.ticker} NO abierta: {rej.motivo}")
+            return False
+
         # INTERRUPTOR: tres compuertas fail-safe ANTES de tocar el broker.
         # Si el sistema no esta habilitado (env) o esta frenado (kill-flag/DB),
         # NO se manda ninguna orden real. Loguea el motivo y devuelve False.
