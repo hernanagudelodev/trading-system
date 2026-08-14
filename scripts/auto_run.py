@@ -361,7 +361,7 @@ def ejecutar_aperturas(intents):
     print(f"\n  [aperturas] LIVE — {len(intents)} intent(s)")
     for it in intents:
         ok = live.open_position(it)
-        res["live"].append((it.ticker, ok))
+        res["live"].append((it, ok))   # intent completo (resumen con detalle)
         if ok: res["live_abiertas"] += 1
 
     if res["live_abiertas"] > 0:
@@ -378,7 +378,7 @@ def ejecutar_aperturas(intents):
     print(f"\n  [aperturas] PAPER — {len(intents)} intent(s)")
     for it in intents:
         ok = paper.open_position(it)
-        res["paper"].append((it.ticker, ok))
+        res["paper"].append((it, ok))   # intent completo (resumen con detalle)
         if ok: res["paper_abiertas"] += 1
 
     print(f"\n  [aperturas] resumen · live: {res['live_abiertas']}/{len(intents)} "
@@ -405,14 +405,36 @@ def send_run_summary(market_ctx, analysis, results, run_time):
     # deterministas deciden; esto reporta lo que REALMENTE pasó. Antes el
     # headline del LLM ("Abrí CMG") se ponía arriba y contradecía este bloque
     # cuando un gate rechazaba la propuesta — un mensaje que afirmaba algo falso.
-    if results["opened"]:
-        lines.append(f"\n✅ Abrí {len(results['opened'])} posición(es):")
-        for t in results["opened"]:
-            strategy_short = "BCS" if "Bull Call" in t["strategy"] else "BPS"
-            sign = "db" if t["debit"] > 0 else "cr"
-            lines.append(f"  • {t['ticker']} {strategy_short} {t['strikes']} ${abs(t['debit']):.2f}{sign}")
+    # Cada intent abierto se muestra con detalle: ticker, tipo (BCS/BPS segun el
+    # signo del debit), strikes y monto. Los intents son OpenIntent (acceso por
+    # atributo, NO por clave — antes se trataba como dict y crasheaba el resumen
+    # tras un trade que SI se ejecuto).
+    def _fmt_intent(it):
+        tipo = "BCS" if it.debit > 0 else "BPS"
+        sign = "db" if it.debit > 0 else "cr"
+        strikes = f"${it.strike_low:.0f}/${it.strike_high:.0f}"
+        return f"  \u2022 {it.ticker} {tipo} {strikes} ${abs(it.debit):.2f}{sign}"
+
+    live_opened  = results.get("live_opened", [])
+    paper_opened = results.get("opened", [])
+
+    if live_opened or paper_opened:
+        n = max(len(live_opened), len(paper_opened))
+        lines.append(f"\n\u2705 Abri {n} posicion(es):")
+        base = live_opened or paper_opened
+        for it in base:
+            try:
+                lines.append(_fmt_intent(it))
+            except Exception:
+                tk = getattr(it, "ticker", str(it))
+                lines.append(f"  \u2022 {tk}")
+        libros = []
+        if live_opened:  libros.append(f"live {len(live_opened)}")
+        if paper_opened: libros.append(f"paper {len(paper_opened)}")
+        if libros:
+            lines.append(f"    ({' \u00b7 '.join(libros)})")
     else:
-        lines.append("\n⏸ Sin trades nuevos")
+        lines.append("\n\u23f8 Sin trades nuevos")
 
     # CONTEXTO DESPUÉS: el headline del LLM es su LECTURA del día (el porqué),
     # no una afirmación de acciones. Va debajo de los hechos para que nunca
@@ -436,10 +458,11 @@ def send_run_summary(market_ctx, analysis, results, run_time):
     lines.append(f"\n⏱ Completado en {run_time:.0f}s")
 
     message = "\n".join(lines)
-    priority = "high" if results["opened"] else "default"
+    _n_open = max(len(results.get("opened", [])), len(results.get("live_opened", [])))
+    priority = "high" if _n_open else "default"
 
     send_push(
-        title=f"{tag} · {len(results['opened'])} abiertos",
+        title=f"{tag} · {_n_open} abiertos",
         message=message,
         priority=priority
     )
@@ -514,8 +537,9 @@ def _save_log_to_db(market_ctx, analysis, results, run_time, slot="unknown"):
             lines += [f"ANALYSIS:\n{summary}", ""]
 
         lines.append(f"OPENED ({len(results['opened'])}):")
-        for t in results["opened"]:
-            lines.append(f"  {t['ticker']} {t['strategy']} {t['strikes']} debit={t['debit']}")
+        for it in results["opened"]:
+            _tipo = "BCS" if it.debit > 0 else "BPS"
+            lines.append(f"  {it.ticker} {_tipo} ${it.strike_low:.0f}/${it.strike_high:.0f} debit={it.debit}")
 
         lines.append(f"\nCLOSED ({len(results['closed'])}):")
         for c in results["closed"]:
@@ -594,8 +618,9 @@ def save_log(market_ctx, analysis, results, run_time, slot="unknown"):
                 f.write(f"ANALYSIS SUMMARY:\n{analysis.get('analysis_summary', 'N/A')}\n\n")
 
             f.write(f"OPENED ({len(results['opened'])}):\n")
-            for t in results["opened"]:
-                f.write(f"  {t['ticker']} {t['strategy']} {t['strikes']} debit={t['debit']}\n")
+            for it in results["opened"]:
+                _tipo = "BCS" if it.debit > 0 else "BPS"
+                f.write(f"  {it.ticker} {_tipo} ${it.strike_low:.0f}/${it.strike_high:.0f} debit={it.debit}\n")
 
             f.write(f"\nCLOSED ({len(results['closed'])}):\n")
             for c in results["closed"]:
