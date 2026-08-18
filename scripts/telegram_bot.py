@@ -1,25 +1,36 @@
 """
 telegram_bot.py
 ===============
-Bot de SOLO LECTURA. Escucha comandos en Telegram, corre un script de auditoría
-de la whitelist, y devuelve su salida.
+Bot de lectura + ACCIONES CONTROLADAS. Escucha comandos en Telegram, corre un
+script de la whitelist (lectura) o ejecuta una accion con salvaguardas, y
+devuelve la salida.
 
 QUÉ CAMBIA ESTO EN EL SISTEMA
-    Hasta hoy el sistema era solo-salida: hablaba con brokers, DB y Telegram, y
-    nada de afuera podía pedirle nada. Esto abre un canal de ENTRADA. El bot es
-    público: cualquiera que descubra su username puede escribirle, y Telegram
-    acepta mensajes de cualquiera. Por eso la primera línea del handler es el
-    filtro de chat_id, y por eso NO hay ningún comando que escriba nada.
+    El sistema era solo-salida; esto abre un canal de ENTRADA. El bot es publico:
+    cualquiera que descubra su username puede escribirle. Por eso la primera
+    linea del handler es el filtro de chat_id: solo el chat autorizado opera.
 
-TRES REGLAS QUE NO SE NEGOCIAN
-    1. Whitelist, no interpretación. COMANDOS es un dict fijo comando->script.
-       Nunca se arma un comando con texto del usuario.
+    Los comandos de LECTURA (whitelist) no modifican nada. Los comandos de
+    ACCION (close/pause/resume) SI tocan el sistema, y por eso cada uno tiene su
+    salvaguarda: /close y /resume piden /confirm (2 pasos); /pause frena y es
+    seguro por definicion (frenar no arriesga).
+
+REGLAS QUE NO SE NEGOCIAN
+    1. Whitelist, no interpretación (para lectura). COMANDOS es un dict fijo
+       comando->script. Nunca se arma un comando con texto del usuario.
     2. subprocess con LISTA, nunca shell=True. El argumento viaja como un argv
-       literal: la inyección de shell es imposible por construcción, no por
-       validación.
-    3. Solo lectura. Ningún comando cierra, abre ni modifica una posición.
-       /close sería un control de plata real desde un teléfono que se puede
-       perder. Es una decisión distinta a ésta.
+       literal: la inyección de shell es imposible por construcción.
+    3. Las acciones son POCAS, EXPLICITAS y con salvaguarda. No hay una via
+       generica de escritura: cada accion (close/pause/resume) es una funcion
+       dedicada, no un script parametrizable por el usuario.
+
+    ACCIONES ACTUALES
+      /close TICKER -> cierra en LIVE (dry-run + /confirm).
+      /pause        -> frena aperturas live (kill_live.py off). Directo.
+      /resume       -> reactiva aperturas (kill_live.py on). Pide /confirm.
+    /pause y /resume escriben el kill-flag system_state['live_kill'], que el
+    executor lee antes de cada apertura (live_trading_allowed). NO tocan el
+    auto-cierre (eso es MONITOR_AUTO_CLOSE, mecanismo aparte).
 
 UN SOLO DUEÑO DE getUpdates
     Telegram entrega cada update UNA vez. Si dos procesos hacen getUpdates, se
@@ -105,9 +116,11 @@ def _ayuda():
     for cmd, (_, acepta, _dobla, desc) in COMANDOS.items():
         arg = " <arg>" if acepta else ""
         lineas.append(f"{cmd}{arg}\n    {desc}")
-    lineas += ["", "-- ACCION (cierra plata real) --",
-               "/close TICKER\n    dry-run + pide /confirmar. Solo LIVE.",
-               "/confirmar\n    ejecuta el cierre pendiente (ventana 60s).",
+    lineas += ["", "-- ACCION (control del sistema) --",
+               "/close TICKER\n    dry-run + pide /confirm. Cierra en LIVE.",
+               "/pause\n    frena las aperturas live YA (el auto-cierre sigue).",
+               "/resume\n    reactiva aperturas + pide /confirm.",
+               "/confirm\n    ejecuta el pendiente (cierre o resume, ventana 60s).",
                "", "/help - esta lista"]
     return "\n".join(lineas)
 
@@ -154,11 +167,13 @@ def _correr(script, args):
 
 # CIERRE POR COMANDO — confirmacion de dos pasos (solo LIVE) ────────────────
 # /close <TICKER> -> DRY-RUN (close_live commit=False): precia e informa, NO
-# cierra; guarda un pendiente. /confirmar dentro de la ventana ejecuta el cierre
+# cierra; guarda un pendiente. /confirm dentro de la ventana ejecuta el cierre
 # REAL (commit=True). Cualquier otro comando entremedio cancela. El estado vive
 # EN MEMORIA: si el bot se reinicia, el pendiente se pierde (correcto).
 
-_CIERRE_PENDIENTE = {"ticker": None, "ts": 0.0}
+# Pendiente unificado de confirmacion: cierre ("close"+ticker) o reactivacion
+# ("resume"). /confirm ejecuta lo que este pendiente. Vive EN MEMORIA.
+_PENDIENTE = {"tipo": None, "dato": None, "ts": 0.0}
 _CONFIRM_VENTANA_S = 60
 TICKER_RE = re.compile(r"^[A-Za-z]{1,5}$")
 
@@ -172,30 +187,60 @@ def _cmd_close(partes):
     from close_live_manual import close_live
     ok, detalle = close_live(ticker, commit=False)
     if not ok:
-        _CIERRE_PENDIENTE["ticker"] = None
+        _PENDIENTE["tipo"] = None
         return ("close", detalle, False)
-    _CIERRE_PENDIENTE["ticker"] = ticker
-    _CIERRE_PENDIENTE["ts"]     = time.time()
+    _PENDIENTE["tipo"] = "close"
+    _PENDIENTE["dato"] = ticker
+    _PENDIENTE["ts"]   = time.time()
     return ("close",
             f"{detalle}\n\nEsto CERRARIA {ticker} en LIVE (plata real).\n"
-            f"Manda /confirmar en los proximos {_CONFIRM_VENTANA_S}s para ejecutar.\n"
+            f"Manda /confirm en los proximos {_CONFIRM_VENTANA_S}s para ejecutar.\n"
             f"Cualquier otra cosa lo cancela.", False)
 
 
 def _cmd_confirmar():
-    tk = _CIERRE_PENDIENTE["ticker"]
-    edad = time.time() - _CIERRE_PENDIENTE["ts"]
-    if not tk:
-        return ("confirmar", "No hay cierre pendiente. Manda /close TICKER primero.", False)
+    tipo = _PENDIENTE["tipo"]
+    edad = time.time() - _PENDIENTE["ts"]
+    if not tipo:
+        return ("confirmar", "No hay nada pendiente. Manda /close TICKER o /resume primero.", False)
     if edad > _CONFIRM_VENTANA_S:
-        _CIERRE_PENDIENTE["ticker"] = None
-        return ("confirmar",
-                f"El cierre de {tk} expiro ({int(edad)}s). Volve a /close {tk}.", False)
-    _CIERRE_PENDIENTE["ticker"] = None
-    from close_live_manual import close_live
-    ok, detalle = close_live(tk, commit=True)
-    estado = "CERRADA" if ok else "NO se pudo cerrar"
-    return ("confirmar", f"{estado}: {tk}\n\n{detalle}", ok)
+        _PENDIENTE["tipo"] = None
+        return ("confirmar", f"El pendiente expiro ({int(edad)}s). Volve a empezar.", False)
+
+    if tipo == "close":
+        tk = _PENDIENTE["dato"]
+        _PENDIENTE["tipo"] = None
+        from close_live_manual import close_live
+        ok, detalle = close_live(tk, commit=True)
+        estado = "CERRADA" if ok else "NO se pudo cerrar"
+        return ("confirmar", f"{estado}: {tk}\n\n{detalle}", ok)
+
+    if tipo == "resume":
+        _PENDIENTE["tipo"] = None
+        salida = _correr(os.path.join(_TOOLS, "kill_live.py"), ["on"])
+        return ("confirmar", salida, False)
+
+    _PENDIENTE["tipo"] = None
+    return ("confirmar", "Pendiente de tipo desconocido — cancelado.", False)
+
+
+def _cmd_pause():
+    """Frena las aperturas live YA (sin confirmacion — frenar es seguro)."""
+    _PENDIENTE["tipo"] = None   # un pause cancela cualquier pendiente vivo
+    salida = _correr(os.path.join(_TOOLS, "kill_live.py"), ["off"])
+    return ("pause", salida, False)
+
+
+def _cmd_resume():
+    """Reactivar habilita plata real -> pide /confirm (2 pasos)."""
+    _PENDIENTE["tipo"] = "resume"
+    _PENDIENTE["dato"] = None
+    _PENDIENTE["ts"]   = time.time()
+    return ("resume",
+            "Esto REACTIVA las aperturas live (el sistema volvera a abrir plata "
+            f"real en los proximos slots).\nManda /confirm en los proximos "
+            f"{_CONFIRM_VENTANA_S}s para reactivar.\nCualquier otra cosa lo cancela.",
+            False)
 
 
 
@@ -211,13 +256,17 @@ def _manejar(texto):
     if cmd in ("/help", "/start"):
         return ("Trading bot", _ayuda(), False)
 
-    if cmd == "/confirmar":
+    if cmd == "/confirm":
         return _cmd_confirmar()
     if cmd == "/close":
         return _cmd_close(partes)
-    # Cualquier comando que NO sea /confirmar cancela un pendiente vivo.
-    if _CIERRE_PENDIENTE["ticker"] and cmd != "/confirmar":
-        _CIERRE_PENDIENTE["ticker"] = None
+    if cmd == "/pause":
+        return _cmd_pause()
+    if cmd == "/resume":
+        return _cmd_resume()
+    # Cualquier comando que NO sea /confirm cancela un pendiente vivo.
+    if _PENDIENTE["tipo"] and cmd != "/confirm":
+        _PENDIENTE["tipo"] = None
 
     if cmd not in COMANDOS:
         return ("Comando desconocido", f"{cmd} no existe.\n\n{_ayuda()}", False)
