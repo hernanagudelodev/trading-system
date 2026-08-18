@@ -11,3 +11,10 @@ backtest_errors.log
 
 reports/
 trading.code-workspace
+
+# Scripts temporales de diagnostico/cirugia (convencion: empiezan con _)
+scripts/_*.py
+_*.py
+
+# Carpeta de scripts temporales — no se versiona
+temp_scripts/
