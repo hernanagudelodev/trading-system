@@ -120,6 +120,7 @@ def _ayuda():
                "/close TICKER\n    dry-run + pide /confirm. Cierra en LIVE.",
                "/pause\n    frena las aperturas live YA (el auto-cierre sigue).",
                "/resume\n    reactiva aperturas + pide /confirm.",
+               "/paper_alerts on|off\n    prende/apaga las alertas de nivel de paper.",
                "/confirm\n    ejecuta el pendiente (cierre o resume, ventana 60s).",
                "", "/help - esta lista"]
     return "\n".join(lineas)
@@ -243,6 +244,14 @@ def _cmd_resume():
             False)
 
 
+def _cmd_paper_alerts(partes):
+    """Prende/apaga las alertas de nivel de paper. Directo (silenciar es seguro)."""
+    if len(partes) < 2 or partes[1].lower() not in ("on", "off"):
+        return ("paper_alerts", "Uso: /paper_alerts on | off", False)
+    arg = partes[1].lower()
+    salida = _correr(os.path.join(_TOOLS, "paper_alerts.py"), [arg])
+    return ("paper_alerts", salida, False)
+
 
 def _manejar(texto):
     partes = texto.strip().split()
@@ -264,6 +273,8 @@ def _manejar(texto):
         return _cmd_pause()
     if cmd == "/resume":
         return _cmd_resume()
+    if cmd == "/paper_alerts":
+        return _cmd_paper_alerts(partes)
     # Cualquier comando que NO sea /confirm cancela un pendiente vivo.
     if _PENDIENTE["tipo"] and cmd != "/confirm":
         _PENDIENTE["tipo"] = None

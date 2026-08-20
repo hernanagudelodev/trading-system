@@ -351,7 +351,33 @@ def level_icon_emoji(level):
 
 
 
+def _paper_alerts_enabled() -> bool:
+    """
+    Lee system_state['paper_alerts']. Devuelve False SOLO si el flag == 'off'.
+    Fail-safe INVERSO al de live_kill: si la DB no responde o no hay fila, se
+    ASUME activo (True) — ante la duda, notificar. Perder una alerta por una DB
+    caida es peor que una notificacion de mas.
+    """
+    import psycopg2
+    try:
+        conn = psycopg2.connect(os.getenv("DATABASE_URL"))
+        cur  = conn.cursor()
+        cur.execute("SELECT value FROM system_state WHERE key = %s", ("paper_alerts",))
+        row = cur.fetchone()
+        cur.close(); conn.close()
+    except Exception:
+        return True   # DB ilegible -> ante la duda, notificar
+    if row is not None and str(row[0]).strip().lower() == "off":
+        return False
+    return True
+
+
 def send_alert_notification(position, pnl_data, alert_level, reasons, mode="paper"):
+    # Filtro de alertas paper: si system_state['paper_alerts']=='off', las alertas
+    # de nivel de PAPER (WATCH/ACTION/URGENT/take-profit) se silencian. Las de LIVE
+    # nunca se tocan. Se controla con /paper_alerts on|off desde el bot.
+    if mode == "paper" and not _paper_alerts_enabled():
+        return
     ticker   = position["ticker"]
     strategy = position.get("strategy", "")
     pnl      = pnl_data["gross_pnl"]
