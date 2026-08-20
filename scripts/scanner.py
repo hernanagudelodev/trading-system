@@ -465,9 +465,11 @@ def generate_html(market_ctx, open_positions, passed_criteria,
     eliminated_cards = "".join(ticker_card(t, all_criteria.get(t, {}), False, r)
                                 for t, r in eliminated.items())
 
-    vix_val       = market_ctx["vix"]["current"]  if market_ctx else "N/A"
-    spy_val       = market_ctx["spy"]["price"]    if market_ctx else "N/A"
-    spy_trend     = market_ctx["spy"]["trend"]    if market_ctx else "N/A"
+    _vix = (market_ctx.get("vix") or {}) if market_ctx else {}
+    _spy = (market_ctx.get("spy") or {}) if market_ctx else {}
+    vix_val       = _vix.get("current", "N/A")
+    spy_val       = _spy.get("price", "N/A")
+    spy_trend     = _spy.get("trend", "N/A")
     verdict       = market_ctx["verdict"]         if market_ctx else "N/A"
     verdict_color = {"FAVORABLE": "#22c55e", "CAUTION": "#eab308",
                      "DO_NOT_TRADE": "#ef4444"}.get(verdict, "#6b7280")
@@ -572,9 +574,12 @@ def run_scan(tickers, expand_to_universe=False):
     print(f"\n{'=' * 65}")
     print(f"  SCANNER — {timestamp}")
     if market_ctx:
+        _vix_c = (market_ctx.get('vix') or {}).get('current')
+        _vix_s = f"{_vix_c:.1f}" if _vix_c is not None else "N/D"
+        _spy_t = (market_ctx.get('spy') or {}).get('trend', 'N/D')
         print(f"  Context: {market_ctx.get('verdict', 'N/A')} | "
-              f"VIX {market_ctx['vix']['current']:.1f} | "
-              f"SPY {market_ctx['spy']['trend']}")
+              f"VIX {_vix_s} | "
+              f"SPY {_spy_t}")
     print(f"{'=' * 65}\n")
 
     tt_session = None

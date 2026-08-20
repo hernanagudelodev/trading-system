@@ -139,39 +139,103 @@ def _pct_change(series, n):
 # MARKET DATA — VIX & SPY
 # ══════════════════════════════════════════════════════════════════════════════
 
-def get_vix():
-    old = _silence()
+def _vix_from_cache(max_age_hours=6):
+    """
+    Fallback: ultimo VIX conocido de auto_run_logs, si es reciente (< max_age).
+    Cuando Yahoo rate-limitea a Railway (IP de datacenter), un VIX de hace 1-2h
+    es representativo — el VIX varia <3% entre corridas casi siempre (validado
+    con 40 corridas historicas). Un cache rancio (> max_age) no sirve, y ahi
+    preferimos abortar. Devuelve un dict con forma de get_vix (marcado
+    stale=True) o None si no hay cache utilizable.
+    """
+    import os, psycopg2
+    from datetime import datetime, timezone
     try:
-        import yfinance as yf
-        data = yf.download("^VIX", period="20d", interval="1d",
-                           progress=False, auto_adjust=True)
-        _restore(old)
-        if data.empty:
-            return None
-
-        closes  = data["Close"].squeeze().dropna()
-        current = float(closes.iloc[-1])
-        avg_5d  = float(closes.iloc[-5:].mean())
-        avg_10d = float(closes.iloc[-10:].mean())
-
-        trend = "FALLING" if current < avg_5d * 0.95 else \
-                "RISING"  if current > avg_5d * 1.05 else "STABLE"
-
-        if current < VIX_CALM:
-            level, score = "CALM", 2
-        elif current < VIX_ELEVATED:
-            level, score = "ELEVATED", 1
-        elif current < VIX_FEAR:
-            level, score = "HIGH", -1
-        else:
-            level, score = "EXTREME", -2
-
-        return {"current": round(current, 2), "avg_5d": round(avg_5d, 2),
-                "avg_10d": round(avg_10d, 2), "trend": trend,
-                "level": level, "score": score}
+        conn = psycopg2.connect(os.getenv("DATABASE_URL"))
+        cur  = conn.cursor()
+        cur.execute("""SELECT vix, run_at FROM auto_run_logs
+                       WHERE vix IS NOT NULL ORDER BY run_at DESC LIMIT 1""")
+        row = cur.fetchone()
+        cur.close(); conn.close()
     except Exception:
-        _restore(old)
         return None
+    if not row or row[0] is None:
+        return None
+    current = float(row[0])
+    run_at  = row[1]
+    now = datetime.now(timezone.utc)
+    if run_at.tzinfo is None:
+        run_at = run_at.replace(tzinfo=timezone.utc)
+    age_h = (now - run_at).total_seconds() / 3600.0
+    if age_h > max_age_hours:
+        return None   # cache rancio -> que aborte
+    if current < VIX_CALM:
+        level, score = "CALM", 2
+    elif current < VIX_ELEVATED:
+        level, score = "ELEVATED", 1
+    elif current < VIX_FEAR:
+        level, score = "HIGH", -1
+    else:
+        level, score = "EXTREME", -2
+    return {"current": round(current, 2), "avg_5d": round(current, 2),
+            "avg_10d": round(current, 2), "trend": "STABLE",
+            "level": level, "score": score,
+            "stale": True, "stale_age_h": round(age_h, 1)}
+
+
+def get_vix():
+    """
+    VIX con resiliencia a fallos de Yahoo (rate-limit a IPs de datacenter como
+    Railway). Cascada:
+      1. Hasta 3 intentos a yfinance con espera corta (cubre hipos momentaneos).
+      2. Si todos fallan, fallback al ultimo VIX de la DB si es reciente (< 6h).
+      3. Si no hay cache utilizable, None -> el guard aborta el run (seguro).
+    """
+    import time
+    for intento in range(3):
+        old = _silence()
+        try:
+            import yfinance as yf
+            data = yf.download("^VIX", period="20d", interval="1d",
+                               progress=False, auto_adjust=True)
+            _restore(old)
+            if data.empty:
+                raise ValueError("yfinance devolvio vacio para ^VIX")
+
+            closes  = data["Close"].squeeze().dropna()
+            current = float(closes.iloc[-1])
+            avg_5d  = float(closes.iloc[-5:].mean())
+            avg_10d = float(closes.iloc[-10:].mean())
+
+            trend = "FALLING" if current < avg_5d * 0.95 else \
+                    "RISING"  if current > avg_5d * 1.05 else "STABLE"
+
+            if current < VIX_CALM:
+                level, score = "CALM", 2
+            elif current < VIX_ELEVATED:
+                level, score = "ELEVATED", 1
+            elif current < VIX_FEAR:
+                level, score = "HIGH", -1
+            else:
+                level, score = "EXTREME", -2
+
+            return {"current": round(current, 2), "avg_5d": round(avg_5d, 2),
+                    "avg_10d": round(avg_10d, 2), "trend": trend,
+                    "level": level, "score": score}
+        except Exception as e:
+            _restore(old)
+            if intento < 2:
+                time.sleep(3)   # hipo corto -> reintentar
+                continue
+            # agotados los intentos: fallback al cache de la DB
+            cached = _vix_from_cache(max_age_hours=6)
+            if cached:
+                print(f"  VIX: yfinance fallo ({type(e).__name__}) -> usando "
+                      f"cache de hace {cached['stale_age_h']}h (VIX {cached['current']})")
+                return cached
+            print(f"  VIX: yfinance fallo ({type(e).__name__}) y no hay cache "
+                  f"reciente (< 6h) -> None (el run abortara)")
+            return None
 
 
 def get_spy_context():
