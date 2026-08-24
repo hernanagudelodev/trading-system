@@ -487,6 +487,46 @@ def save_account_snapshot(balances):
     return snapshot_id
 
 
+async def _fetch_balances_only():
+    """
+    Solo los balances de la cuenta (sin posiciones). Version liviana de
+    _fetch_tastytrade_data para cuando solo se quiere el NLV — p.ej. el monitor
+    tomando un snapshot periodico de capital, sin necesitar la lista de opciones.
+    """
+    from tastytrade import Session
+    from tastytrade.account import Account
+    session  = Session(os.getenv("TASTYTRADE_CLIENT_SECRET"),
+                       os.getenv("TASTYTRADE_REFRESH_TOKEN"))
+    account  = (await Account.get(session))[0]
+    bal = await account.get_balances(session)
+    return {
+        "account_number":          account.account_number,
+        "net_liquidating_value":   float(bal.net_liquidating_value or 0),
+        "equity_buying_power":     float(bal.equity_buying_power or 0),
+        "derivative_buying_power": float(bal.derivative_buying_power or 0),
+        "cash_balance":            float(bal.cash_balance or 0),
+        "pending_cash":            float(bal.pending_cash or 0),
+        "long_derivative_value":   float(bal.long_derivative_value or 0),
+        "maintenance_excess":      float(bal.maintenance_excess or 0),
+    }
+
+
+def snapshot_now():
+    """
+    Toma UN snapshot de capital ya: trae balances de Tastytrade y lo guarda en
+    account_snapshots. Pensado para llamarse desde el monitor (capital fresco
+    entre runs). Devuelve el NLV guardado, o None si algo falla — NUNCA lanza,
+    para no romper al que la llama (el monitor prioriza cerrar posiciones).
+    """
+    try:
+        balances = asyncio.run(_fetch_balances_only())
+        save_account_snapshot(balances)
+        return balances["net_liquidating_value"]
+    except Exception as e:
+        print(f"  [snapshot] no se pudo guardar snapshot de capital ({e})")
+        return None
+
+
 def insert_spread(spread, account_number):
     conn = get_db_connection()
     cur  = conn.cursor()

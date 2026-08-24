@@ -863,6 +863,33 @@ def scheduled_run():
         except Exception as e:
             print(f"  monitor [{label}] error: {e}")
 
+    # Snapshot de capital: mantiene account_snapshots fresco entre runs del
+    # auto_run (antes el NLV solo se guardaba en run_sync, 2x al dia -> el
+    # dashboard mostraba capital viejo). snapshot_now() NUNCA lanza: si falla,
+    # el monitor ya hizo lo importante (priceo y cerro posiciones).
+    _maybe_snapshot_capital()
+
+
+# El monitor corre cada 5min (mercado abierto). Guardar un snapshot en CADA
+# corrida son ~12/hora; con SNAPSHOT_EVERY_N=3 -> uno cada ~15min, capital
+# razonablemente fresco sin inflar la tabla. El contador vive en memoria: un
+# reinicio lo resetea (y toma un snapshot en la primer corrida, que esta bien).
+SNAPSHOT_EVERY_N = 3
+_snapshot_counter = 0
+
+
+def _maybe_snapshot_capital():
+    global _snapshot_counter
+    if _snapshot_counter % SNAPSHOT_EVERY_N == 0:
+        try:
+            from trade import snapshot_now
+            nlv = snapshot_now()
+            if nlv is not None:
+                print(f"  [snapshot] capital guardado: ${nlv:,.2f}")
+        except Exception as e:
+            print(f"  [snapshot] error no critico: {e}")
+    _snapshot_counter += 1
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ENTRY POINT
