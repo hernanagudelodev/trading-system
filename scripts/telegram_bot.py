@@ -121,6 +121,7 @@ def _ayuda():
                "/pause\n    frena las aperturas live YA (el auto-cierre sigue).",
                "/resume\n    reactiva aperturas + pide /confirm.",
                "/paper_alerts on|off\n    prende/apaga las alertas de nivel de paper.",
+               "/set_risk N\n    cambia el tope de riesgo de cartera + pide /confirm.",
                "/confirm\n    ejecuta el pendiente (cierre o resume, ventana 60s).",
                "", "/help - esta lista"]
     return "\n".join(lineas)
@@ -221,6 +222,12 @@ def _cmd_confirmar():
         salida = _correr(os.path.join(_TOOLS, "kill_live.py"), ["on"])
         return ("confirmar", salida, False)
 
+    if tipo == "set_risk":
+        val = _PENDIENTE["dato"]
+        _PENDIENTE["tipo"] = None
+        salida = _correr(os.path.join(_TOOLS, "set_risk_pct.py"), [str(val)])
+        return ("confirmar", salida, False)
+
     _PENDIENTE["tipo"] = None
     return ("confirmar", "Pendiente de tipo desconocido — cancelado.", False)
 
@@ -241,6 +248,46 @@ def _cmd_resume():
             "Esto REACTIVA las aperturas live (el sistema volvera a abrir plata "
             f"real en los proximos slots).\nManda /confirm en los proximos "
             f"{_CONFIRM_VENTANA_S}s para reactivar.\nCualquier otra cosa lo cancela.",
+            False)
+
+
+def _cmd_set_risk(partes):
+    """
+    Cambia el tope de riesgo de cartera (system_state, fuente unica). Como AUMENTA
+    o baja cuanto puede arriesgar el sistema, pide /confirm (2 pasos).
+    Sin argumento: muestra el tope actual.
+    """
+    # Sin argumento -> mostrar el tope actual
+    if len(partes) < 2:
+        salida = _correr(os.path.join(_TOOLS, "set_risk_pct.py"), [])
+        return ("set_risk", salida, False)
+
+    # Validar que sea un numero en rango
+    try:
+        val = float(partes[1])
+    except ValueError:
+        return ("set_risk", f"'{partes[1]}' no es un numero. Uso: /set_risk 60", False)
+    if not (0 < val <= 100):
+        return ("set_risk", f"{val:.0f}% fuera de rango (0-100).", False)
+
+    # Leer el tope actual para mostrar el cambio (de X a Y)
+    actual = None
+    try:
+        sys.path.insert(0, _SCRIPTS)
+        from option_selector import portfolio_risk_pct
+        actual = portfolio_risk_pct()
+    except Exception:
+        pass
+    desde = f"{actual:.0f}%" if actual is not None else "?"
+
+    _PENDIENTE["tipo"] = "set_risk"
+    _PENDIENTE["dato"] = val
+    _PENDIENTE["ts"]   = time.time()
+    return ("set_risk",
+            f"Cambiarias el tope de riesgo de {desde} a {val:.0f}%.\n"
+            f"Esto ajusta cuanto capital puede comprometer el sistema en aperturas.\n"
+            f"Manda /confirm en los proximos {_CONFIRM_VENTANA_S}s para aplicar.\n"
+            f"Cualquier otra cosa lo cancela.",
             False)
 
 
@@ -275,6 +322,8 @@ def _manejar(texto):
         return _cmd_resume()
     if cmd == "/paper_alerts":
         return _cmd_paper_alerts(partes)
+    if cmd == "/set_risk":
+        return _cmd_set_risk(partes)
     # Cualquier comando que NO sea /confirm cancela un pendiente vivo.
     if _PENDIENTE["tipo"] and cmd != "/confirm":
         _PENDIENTE["tipo"] = None
