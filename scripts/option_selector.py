@@ -914,19 +914,44 @@ def position_max_loss(strike_low, strike_high, debit, contracts=1) -> float:
 def portfolio_risk_pct() -> float:
     """
     Tope de riesgo AGREGADO de cartera, en % del capital.
-    Fuente ÚNICA: la usan el gate de auto_run y check_open.py.
+    Fuente ÚNICA: la usan el gate de auto_run, el executor y check_open.py.
 
-    Obligatoria en los DOS libros (paper y live). Sin default: un tope ausente
-    no es "sin tope", es un bug. El default silencioso es exactamente cómo
-    MAX_COST terminó siendo decorativo y dejó pasar el GS de $3,945 (§12.3).
+    FUENTE DE VERDAD: system_state['max_portfolio_risk_pct'] en la DB. Asi TODOS
+    los servicios (worker, bot, dashboard) leen el MISMO valor — antes vivia como
+    env var por servicio y se desincronizaba (el bot quedo en 40 con el worker en
+    60, y el /open mentia). Mismo patron que el kill-flag.
+
+    Cascada:
+      1. system_state['max_portfolio_risk_pct'] (DB)  -> fuente unica.
+      2. env var MAX_PORTFOLIO_RISK_PCT               -> fallback (transicion).
+      3. ninguna de las dos                           -> RuntimeError: un tope
+         ausente no es "sin tope", es un bug (§12.3, el GS de $3,945).
     """
+    # 1. DB (fuente unica)
+    try:
+        import psycopg2
+        conn = psycopg2.connect(os.getenv("DATABASE_URL"))
+        cur = conn.cursor()
+        cur.execute("SELECT value FROM system_state WHERE key = %s",
+                    ("max_portfolio_risk_pct",))
+        row = cur.fetchone()
+        cur.close(); conn.close()
+        if row is not None and row[0] is not None:
+            return float(row[0])
+    except Exception as e:
+        # DB ilegible: no abortamos todavia — probamos la env var. Pero avisamos.
+        print(f"  [tope] no se pudo leer system_state ({e}) — probando env var")
+
+    # 2. env var (fallback de transicion)
     raw = os.getenv("MAX_PORTFOLIO_RISK_PCT")
-    if raw is None:
-        raise RuntimeError(
-            "MAX_PORTFOLIO_RISK_PCT no está definida. Obligatoria en paper y en "
-            "live: sin ella el gate de cartera no rechazaría nada."
-        )
-    return float(raw)
+    if raw is not None:
+        return float(raw)
+
+    # 3. ninguna fuente -> bug
+    raise RuntimeError(
+        "Tope de cartera ausente: ni system_state['max_portfolio_risk_pct'] ni "
+        "MAX_PORTFOLIO_RISK_PCT. Sin el, el gate de cartera no rechazaria nada."
+    )
 
 
 def spread_pnl(strike_low, strike_high, premium_paid, contracts, spread_value,
