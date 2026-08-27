@@ -87,6 +87,8 @@ def twr(days: int = 90, from_date: str = None, to_date: str = None,
     return {
         "twr_pct":    result["twr_pct"],
         "series":     result["twr_series"],
+        "pnl_series": result["pnl_series"],
+        "pnl_real":   result["pnl_real"],
         "net_flows":  result["net_flows"],
         "raw_change": result["raw_change"],
     }

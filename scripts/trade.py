@@ -1650,9 +1650,12 @@ def compute_twr(series, flows):
     primer_dia = _to_date(series[0]["t"])
     flujos_pendientes = {d: v for d, v in flow_by_date.items() if d > primer_dia}
 
+    nlv_inicial = series[0]["nlv"]
     cum_factor = 1.0
     twr_series = [{"t": series[0]["t"], "cum_pct": 0.0}]
+    pnl_series = [{"t": series[0]["t"], "pnl": 0.0}]   # P&L real acumulado ($)
     net_flows = 0.0
+    flujos_acumulados = 0.0
 
     for i in range(1, len(series)):
         prev_nlv = series[i-1]["nlv"]
@@ -1666,20 +1669,26 @@ def compute_twr(series, flows):
             if fecha <= d_curr:
                 flow += flujos_pendientes.pop(fecha)
         net_flows += flow
+        flujos_acumulados += flow
 
-        # NLV de referencia para el tramo: al de este punto le quitamos el flujo
-        # (el deposito/retiro no es rendimiento del tramo).
+        # --- TWR (%) ---
         adj_curr = curr_nlv - flow
-
         if prev_nlv > 0:
             r = (adj_curr - prev_nlv) / prev_nlv
             cum_factor *= (1.0 + r)
-
         twr_series.append({"t": series[i]["t"], "cum_pct": round((cum_factor - 1.0) * 100, 4)})
+
+        # --- P&L real acumulado ($) ---
+        # Cuanto genero el sistema desde el inicio, descontando los flujos que
+        # entraron/salieron hasta aca. NO salta en un deposito (el flujo se resta).
+        pnl_real = (curr_nlv - nlv_inicial) - flujos_acumulados
+        pnl_series.append({"t": series[i]["t"], "pnl": round(pnl_real, 2)})
 
     return {
         "twr_pct":    round((cum_factor - 1.0) * 100, 4),
         "twr_series": twr_series,
+        "pnl_series": pnl_series,
+        "pnl_real":   round((series[-1]["nlv"] - nlv_inicial) - net_flows, 2),
         "net_flows":  round(net_flows, 2),
         "raw_change": round(series[-1]["nlv"] - series[0]["nlv"], 2),
     }
