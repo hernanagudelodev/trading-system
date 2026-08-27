@@ -1661,7 +1661,13 @@ def compute_twr(series, flows):
     flujos.sort(key=lambda x: x["dt"])
 
     t0 = _to_dt(series[0]["t"])
-    flujos_pendientes = [f for f in flujos if f["dt"] > t0]
+    # NO descartamos por executed_at vs la base: el momento en que el broker
+    # REGISTRA el flujo (executed_at) y el momento en que el CASH realmente salta
+    # pueden caer en lados distintos del punto base (ej. registrado ayer 21:00,
+    # pero el cash salta hoy 10:16). La autoridad para descontar es el SALTO DE
+    # CASH dentro de la serie — si el cash salto dentro del rango, el flujo cuenta;
+    # si no aparece (porque ya estaba en la base), no se detecta y no se descuenta.
+    flujos_pendientes = list(flujos)
 
     # ── Ubicar cada flujo por el SALTO EN CASH ───────────────────────────────────
     # El cash_balance es la señal limpia de un flujo: un deposito/retiro cambia el
@@ -1681,26 +1687,32 @@ def compute_twr(series, flows):
         mejor_i, mejor_err = None, None
         for i in range(1, len(series)):
             t_i = _to_dt(series[i]["t"])
-            if t_i < f_dt or t_i > f_dt + timedelta(hours=VENTANA_H):
+            # Ventana SIMETRICA alrededor del executed_at: el salto real del cash
+            # puede ocurrir ANTES o DESPUES del momento que registra el broker
+            # (el registro y el movimiento efectivo del cash no siempre coinciden).
+            if abs((t_i - f_dt).total_seconds()) > VENTANA_H * 3600:
                 continue
             if tiene_cash:
                 salto = series[i]["cash"] - series[i-1]["cash"]
             else:
                 salto = series[i]["nlv"] - series[i-1]["nlv"]
             err = abs(salto - objetivo)
-            # El cash salta casi EXACTO el monto (sin ruido de rendimiento), asi
-            # que el margen puede ser mas ajustado que con NLV.
+            # El cash salta casi EXACTO el monto (sin ruido de rendimiento).
             margen = max(abs(objetivo) * 0.10, 50)
             if err <= margen and (mejor_err is None or err < mejor_err):
                 mejor_err, mejor_i = err, i
         if mejor_i is not None:
             flujo_en_indice[mejor_i] = flujo_en_indice.get(mejor_i, 0.0) + objetivo
-        else:
-            # Fallback: primer snapshot posterior al executed_at.
-            for i in range(1, len(series)):
-                if _to_dt(series[i]["t"]) >= f_dt:
-                    flujo_en_indice[i] = flujo_en_indice.get(i, 0.0) + objetivo
-                    break
+        elif not tiene_cash:
+            # Sin cash confiable: fallback por executed_at, pero solo si el flujo
+            # cae DESPUES de la base (si no, ya estaba en el NLV inicial).
+            if f_dt > t0:
+                for i in range(1, len(series)):
+                    if _to_dt(series[i]["t"]) >= f_dt:
+                        flujo_en_indice[i] = flujo_en_indice.get(i, 0.0) + objetivo
+                        break
+        # Con cash y sin salto detectado: el flujo ya estaba en la base (su cash
+        # no salta dentro del rango) -> NO se descuenta. Correcto.
 
     nlv_inicial = series[0]["nlv"]
     cum_factor = 1.0

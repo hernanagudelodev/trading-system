@@ -57,16 +57,32 @@ def twr(days: int = 90, from_date: str = None, to_date: str = None,
         start = (datetime.now() - timedelta(days=int(days))).date().isoformat()
         end   = datetime.now().date().isoformat()
 
-    # Serie de NLV + cash (el cash detecta los flujos sin ruido de rendimiento)
+    # Serie de NLV + cash (el cash detecta los flujos sin ruido de rendimiento).
+    # Traemos ademas el ULTIMO snapshot ANTERIOR al inicio del rango: es el punto
+    # base (cierre previo). Asi la ganancia del rango se mide desde el cierre
+    # anterior — no desde el primer snapshot dentro del rango (que daria $0 en el
+    # primer punto y perderia la ganancia previa). Aplica a TODOS los rangos.
     conn = trade.get_db_connection()
     cur  = conn.cursor()
     if start and end:
-        cur.execute("""SELECT snapshot_at, net_liquidating_value, cash_balance FROM account_snapshots
-                       WHERE snapshot_at >= %s AND snapshot_at < (%s::date + INTERVAL '1 day')
-                       ORDER BY snapshot_at ASC""", (start, end))
+        cur.execute("""
+            (SELECT snapshot_at, net_liquidating_value, cash_balance FROM account_snapshots
+             WHERE snapshot_at < %s ORDER BY snapshot_at DESC LIMIT 1)
+            UNION ALL
+            (SELECT snapshot_at, net_liquidating_value, cash_balance FROM account_snapshots
+             WHERE snapshot_at >= %s AND snapshot_at < (%s::date + INTERVAL '1 day')
+             ORDER BY snapshot_at ASC)
+            ORDER BY snapshot_at ASC
+        """, (start, start, end))
     elif start:
-        cur.execute("""SELECT snapshot_at, net_liquidating_value, cash_balance FROM account_snapshots
-                       WHERE snapshot_at >= %s ORDER BY snapshot_at ASC""", (start,))
+        cur.execute("""
+            (SELECT snapshot_at, net_liquidating_value, cash_balance FROM account_snapshots
+             WHERE snapshot_at < %s ORDER BY snapshot_at DESC LIMIT 1)
+            UNION ALL
+            (SELECT snapshot_at, net_liquidating_value, cash_balance FROM account_snapshots
+             WHERE snapshot_at >= %s ORDER BY snapshot_at ASC)
+            ORDER BY snapshot_at ASC
+        """, (start, start))
     else:
         cur.execute("""SELECT snapshot_at, net_liquidating_value, cash_balance FROM account_snapshots
                        ORDER BY snapshot_at ASC""")
