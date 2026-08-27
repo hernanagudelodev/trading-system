@@ -57,18 +57,18 @@ def twr(days: int = 90, from_date: str = None, to_date: str = None,
         start = (datetime.now() - timedelta(days=int(days))).date().isoformat()
         end   = datetime.now().date().isoformat()
 
-    # Serie de NLV
+    # Serie de NLV + cash (el cash detecta los flujos sin ruido de rendimiento)
     conn = trade.get_db_connection()
     cur  = conn.cursor()
     if start and end:
-        cur.execute("""SELECT snapshot_at, net_liquidating_value FROM account_snapshots
+        cur.execute("""SELECT snapshot_at, net_liquidating_value, cash_balance FROM account_snapshots
                        WHERE snapshot_at >= %s AND snapshot_at < (%s::date + INTERVAL '1 day')
                        ORDER BY snapshot_at ASC""", (start, end))
     elif start:
-        cur.execute("""SELECT snapshot_at, net_liquidating_value FROM account_snapshots
+        cur.execute("""SELECT snapshot_at, net_liquidating_value, cash_balance FROM account_snapshots
                        WHERE snapshot_at >= %s ORDER BY snapshot_at ASC""", (start,))
     else:
-        cur.execute("""SELECT snapshot_at, net_liquidating_value FROM account_snapshots
+        cur.execute("""SELECT snapshot_at, net_liquidating_value, cash_balance FROM account_snapshots
                        ORDER BY snapshot_at ASC""")
     rows = cur.fetchall()
     cur.close(); conn.close()
@@ -76,7 +76,8 @@ def twr(days: int = 90, from_date: str = None, to_date: str = None,
     if not rows or len(rows) < 2:
         return {"twr_pct": 0.0, "series": [], "net_flows": 0.0, "raw_change": 0.0}
 
-    series = [{"t": r[0].isoformat(), "nlv": float(r[1])} for r in rows]
+    series = [{"t": r[0].isoformat(), "nlv": float(r[1]),
+               "cash": float(r[2]) if r[2] is not None else None} for r in rows]
 
     # Flujos del periodo
     d_start = rows[0][0].date()
@@ -113,4 +114,12 @@ if __name__ == "__main__":
     print(f"  WORKER-API — servicio interno (red privada Railway)")
     print(f"  Puerto: {_PORT}")
     print(f"{'═' * 55}\n")
+    # Asegurar el esquema (crea/actualiza cash_movements con executed_at) antes de
+    # servir — asi el endpoint nunca consulta una tabla incompleta.
+    try:
+        import trade
+        trade.ensure_tables()
+        print("  esquema verificado (cash_movements OK)")
+    except Exception as e:
+        print(f"  ⚠️  no se pudo verificar el esquema ({e}) — sigo igual")
     uvicorn.run(api, host="0.0.0.0", port=_PORT, log_level="info")

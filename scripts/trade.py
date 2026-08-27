@@ -445,12 +445,17 @@ def ensure_tables():
     cur.execute("""
         CREATE TABLE IF NOT EXISTS cash_movements (
             broker_id       VARCHAR(64) PRIMARY KEY,   -- id de la transaccion en Tastytrade
-            movement_date   DATE NOT NULL,
+            movement_date   DATE NOT NULL,             -- dia (para queries por rango)
+            executed_at     TIMESTAMPTZ,               -- momento EXACTO del movimiento (con hora)
             sub_type        VARCHAR(40),               -- Deposit / Withdrawal / etc.
             net_value       DECIMAL(14,2) NOT NULL,    -- + entra (deposito), - sale (retiro)
             description     TEXT,
             synced_at       TIMESTAMP DEFAULT NOW()
         )
+    """)
+    # Si la tabla ya existia sin la columna executed_at, agregarla (migracion suave).
+    cur.execute("""
+        ALTER TABLE cash_movements ADD COLUMN IF NOT EXISTS executed_at TIMESTAMPTZ
     """)
 
     conn.commit()
@@ -533,6 +538,7 @@ async def _fetch_cash_movements(start_date=None):
         movs.append({
             "broker_id":   str(bid),
             "date":        getattr(t, "transaction_date", None),
+            "executed_at": getattr(t, "executed_at", None),
             "sub_type":    sub,
             "net_value":   float(getattr(t, "net_value", 0) or 0),
             "description": getattr(t, "description", "") or "",
@@ -561,15 +567,17 @@ def sync_cash_movements(start_date=None):
     for m in movs:
         cur.execute("""
             INSERT INTO cash_movements
-                (broker_id, movement_date, sub_type, net_value, description, synced_at)
-            VALUES (%s, %s, %s, %s, %s, NOW())
+                (broker_id, movement_date, executed_at, sub_type, net_value, description, synced_at)
+            VALUES (%s, %s, %s, %s, %s, %s, NOW())
             ON CONFLICT (broker_id) DO UPDATE SET
                 movement_date = EXCLUDED.movement_date,
+                executed_at   = EXCLUDED.executed_at,
                 sub_type      = EXCLUDED.sub_type,
                 net_value     = EXCLUDED.net_value,
                 description   = EXCLUDED.description,
                 synced_at     = NOW()
-        """, (m["broker_id"], m["date"], m["sub_type"], m["net_value"], m["description"]))
+        """, (m["broker_id"], m["date"], m["executed_at"], m["sub_type"],
+              m["net_value"], m["description"]))
     conn.commit()
     cur.close()
     conn.close()
@@ -1588,18 +1596,18 @@ def cmd_save_context(position_id, context_json, rationale, ticker=None):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def get_cash_movements_between(start_dt, end_dt):
-    """Movimientos de caja del cache (cash_movements) en [start_dt, end_dt].
-    Devuelve lista de dicts {date, net_value, sub_type} ordenada por fecha."""
+    """Movimientos de caja del cache en [start_dt, end_dt]. Incluye executed_at
+    (timestamp exacto) para ubicar el flujo en el momento correcto del TWR."""
     conn = get_db_connection()
     cur  = conn.cursor()
     cur.execute("""
-        SELECT movement_date, net_value, sub_type
+        SELECT movement_date, net_value, sub_type, executed_at
         FROM cash_movements
         WHERE movement_date >= %s AND movement_date <= %s
         ORDER BY movement_date ASC
     """, (start_dt, end_dt))
-    rows = [{"date": r[0], "net_value": float(r[1]), "sub_type": r[2]}
-            for r in cur.fetchall()]
+    rows = [{"date": r[0], "net_value": float(r[1]), "sub_type": r[2],
+             "executed_at": r[3]} for r in cur.fetchall()]
     cur.close(); conn.close()
     return rows
 
@@ -1622,52 +1630,91 @@ def compute_twr(series, flows):
       net_flows   : suma de flujos en el periodo
       raw_change  : cambio de NLV crudo (sin ajustar), en $
     """
-    from datetime import datetime, date as _date
+    from datetime import datetime, date as _date, timezone
 
-    def _to_date(x):
+    def _to_dt(x):
+        """Normaliza a datetime con tz UTC (para comparar snapshots y flujos)."""
         if isinstance(x, str):
-            return datetime.fromisoformat(x).date()
-        if isinstance(x, datetime):
-            return x.date()
-        return x  # ya es date
+            d = datetime.fromisoformat(x)
+        elif isinstance(x, datetime):
+            d = x
+        elif isinstance(x, _date):
+            d = datetime(x.year, x.month, x.day)
+        else:
+            return None
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=timezone.utc)
+        return d
 
     if not series or len(series) < 2:
         return {"twr_pct": 0.0, "twr_series": [{"t": p["t"], "cum_pct": 0.0} for p in series],
-                "net_flows": 0.0, "raw_change": 0.0}
+                "pnl_series": [{"t": p["t"], "pnl": 0.0} for p in series],
+                "pnl_real": 0.0, "net_flows": 0.0, "raw_change": 0.0}
 
-    # Flujo total por FECHA (varios movimientos el mismo dia se suman)
-    flow_by_date = {}
+    # Cada flujo con su momento de registro (executed_at) y su monto.
+    flujos = []
     for f in flows:
-        d = _to_date(f["date"])
-        flow_by_date[d] = flow_by_date.get(d, 0.0) + f["net_value"]
+        ts = f.get("executed_at")
+        dt = _to_dt(ts) if ts is not None else _to_dt(f["date"])
+        if dt is not None:
+            flujos.append({"dt": dt, "net_value": f["net_value"]})
+    flujos.sort(key=lambda x: x["dt"])
 
-    # Set de fechas de flujo aun NO aplicadas. Cada flujo se aplica UNA sola vez
-    # —en el primer snapshot cuya fecha sea >= la del flujo—, no en cada snapshot
-    # del dia (hay decenas de snapshots intradia; aplicarlo en todos multiplicaba
-    # el flujo por la cantidad de snapshots del dia — bug corregido).
-    # Los flujos ANTERIORES al primer snapshot del rango se descartan: ya estan
-    # incorporados en el NLV inicial, restarlos seria contarlos doble.
-    primer_dia = _to_date(series[0]["t"])
-    flujos_pendientes = {d: v for d, v in flow_by_date.items() if d > primer_dia}
+    t0 = _to_dt(series[0]["t"])
+    flujos_pendientes = [f for f in flujos if f["dt"] > t0]
+
+    # ── Ubicar cada flujo por el SALTO EN CASH ───────────────────────────────────
+    # El cash_balance es la señal limpia de un flujo: un deposito/retiro cambia el
+    # cash exactamente por su monto, mientras que el rendimiento de las opciones NO
+    # toca el cash (mueve el valor de las posiciones). Asi evitamos confundir un
+    # deposito con un buen dia de trading. Para cada flujo, buscamos el snapshot
+    # donde el cash salto ~el monto del flujo y aplicamos el descuento ahi.
+    # Si los snapshots no tienen cash (None), caemos al salto de NLV como respaldo.
+    from datetime import timedelta
+    VENTANA_H = 96
+    tiene_cash = all(s.get("cash") is not None for s in series)
+    flujo_en_indice = {}
+
+    for f in flujos_pendientes:
+        objetivo = f["net_value"]
+        f_dt = f["dt"]
+        mejor_i, mejor_err = None, None
+        for i in range(1, len(series)):
+            t_i = _to_dt(series[i]["t"])
+            if t_i < f_dt or t_i > f_dt + timedelta(hours=VENTANA_H):
+                continue
+            if tiene_cash:
+                salto = series[i]["cash"] - series[i-1]["cash"]
+            else:
+                salto = series[i]["nlv"] - series[i-1]["nlv"]
+            err = abs(salto - objetivo)
+            # El cash salta casi EXACTO el monto (sin ruido de rendimiento), asi
+            # que el margen puede ser mas ajustado que con NLV.
+            margen = max(abs(objetivo) * 0.10, 50)
+            if err <= margen and (mejor_err is None or err < mejor_err):
+                mejor_err, mejor_i = err, i
+        if mejor_i is not None:
+            flujo_en_indice[mejor_i] = flujo_en_indice.get(mejor_i, 0.0) + objetivo
+        else:
+            # Fallback: primer snapshot posterior al executed_at.
+            for i in range(1, len(series)):
+                if _to_dt(series[i]["t"]) >= f_dt:
+                    flujo_en_indice[i] = flujo_en_indice.get(i, 0.0) + objetivo
+                    break
 
     nlv_inicial = series[0]["nlv"]
     cum_factor = 1.0
     twr_series = [{"t": series[0]["t"], "cum_pct": 0.0}]
-    pnl_series = [{"t": series[0]["t"], "pnl": 0.0}]   # P&L real acumulado ($)
+    pnl_series = [{"t": series[0]["t"], "pnl": 0.0}]
     net_flows = 0.0
     flujos_acumulados = 0.0
 
     for i in range(1, len(series)):
         prev_nlv = series[i-1]["nlv"]
         curr_nlv = series[i]["nlv"]
-        d_curr   = _to_date(series[i]["t"])
 
-        # ¿Hay algun flujo pendiente cuya fecha ya ocurrio (<= fecha de este punto)?
-        # Se aplica UNA vez y se saca de pendientes.
-        flow = 0.0
-        for fecha in list(flujos_pendientes.keys()):
-            if fecha <= d_curr:
-                flow += flujos_pendientes.pop(fecha)
+        # Flujo asignado a ESTE indice (donde el NLV realmente salto por el flujo).
+        flow = flujo_en_indice.get(i, 0.0)
         net_flows += flow
         flujos_acumulados += flow
 
@@ -1679,8 +1726,6 @@ def compute_twr(series, flows):
         twr_series.append({"t": series[i]["t"], "cum_pct": round((cum_factor - 1.0) * 100, 4)})
 
         # --- P&L real acumulado ($) ---
-        # Cuanto genero el sistema desde el inicio, descontando los flujos que
-        # entraron/salieron hasta aca. NO salta en un deposito (el flujo se resta).
         pnl_real = (curr_nlv - nlv_inicial) - flujos_acumulados
         pnl_series.append({"t": series[i]["t"], "pnl": round(pnl_real, 2)})
 
