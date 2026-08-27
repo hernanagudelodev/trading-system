@@ -13,3 +13,5 @@ numpy
 psycopg2-binary
 schedule
 pytz
+fastapi
+uvicorn

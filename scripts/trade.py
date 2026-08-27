@@ -437,6 +437,22 @@ def ensure_tables():
         )
     """)
 
+    # Movimientos de caja (depositos/retiros) cacheados del broker. La VERDAD
+    # sigue siendo Tastytrade; esta tabla es un cache reconstruible: el id del
+    # broker es PK, asi el sync es idempotente (UPSERT, correrlo dos veces no
+    # duplica). Sirve para ajustar el rendimiento por flujos de capital (TWR)
+    # sin consultar el broker en cada calculo.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS cash_movements (
+            broker_id       VARCHAR(64) PRIMARY KEY,   -- id de la transaccion en Tastytrade
+            movement_date   DATE NOT NULL,
+            sub_type        VARCHAR(40),               -- Deposit / Withdrawal / etc.
+            net_value       DECIMAL(14,2) NOT NULL,    -- + entra (deposito), - sale (retiro)
+            description     TEXT,
+            synced_at       TIMESTAMP DEFAULT NOW()
+        )
+    """)
+
     conn.commit()
     cur.close()
     conn.close()
@@ -487,44 +503,77 @@ def save_account_snapshot(balances):
     return snapshot_id
 
 
-async def _fetch_balances_only():
+async def _fetch_cash_movements(start_date=None):
     """
-    Solo los balances de la cuenta (sin posiciones). Version liviana de
-    _fetch_tastytrade_data para cuando solo se quiere el NLV — p.ej. el monitor
-    tomando un snapshot periodico de capital, sin necesitar la lista de opciones.
+    Trae los Money Movements (depositos/retiros) del broker desde start_date
+    (default: todo el historico). Mismo filtro que equity_change.py: solo
+    'Money Movement', EXCLUYE 'Balance Adjustment' (ruido de centavos). Devuelve
+    lista de dicts con el id del broker para el UPSERT idempotente.
     """
     from tastytrade import Session
     from tastytrade.account import Account
-    session  = Session(os.getenv("TASTYTRADE_CLIENT_SECRET"),
-                       os.getenv("TASTYTRADE_REFRESH_TOKEN"))
-    account  = (await Account.get(session))[0]
-    bal = await account.get_balances(session)
-    return {
-        "account_number":          account.account_number,
-        "net_liquidating_value":   float(bal.net_liquidating_value or 0),
-        "equity_buying_power":     float(bal.equity_buying_power or 0),
-        "derivative_buying_power": float(bal.derivative_buying_power or 0),
-        "cash_balance":            float(bal.cash_balance or 0),
-        "pending_cash":            float(bal.pending_cash or 0),
-        "long_derivative_value":   float(bal.long_derivative_value or 0),
-        "maintenance_excess":      float(bal.maintenance_excess or 0),
-    }
+    session = Session(os.getenv("TASTYTRADE_CLIENT_SECRET"),
+                      os.getenv("TASTYTRADE_REFRESH_TOKEN"))
+    account = (await Account.get(session))[0]
+    if start_date is not None and hasattr(start_date, "date"):
+        start_date = start_date.date()
+    txns = await account.get_history(session, start_date=start_date) if start_date \
+           else await account.get_history(session)
+
+    movs = []
+    for t in txns:
+        if getattr(t, "transaction_type", "") != "Money Movement":
+            continue
+        sub = getattr(t, "transaction_sub_type", "") or ""
+        if sub == "Balance Adjustment":
+            continue
+        bid = getattr(t, "id", None)
+        if bid is None:
+            continue   # sin id no podemos deduplicar -> lo saltamos
+        movs.append({
+            "broker_id":   str(bid),
+            "date":        getattr(t, "transaction_date", None),
+            "sub_type":    sub,
+            "net_value":   float(getattr(t, "net_value", 0) or 0),
+            "description": getattr(t, "description", "") or "",
+        })
+    return movs
 
 
-def snapshot_now():
+def sync_cash_movements(start_date=None):
     """
-    Toma UN snapshot de capital ya: trae balances de Tastytrade y lo guarda en
-    account_snapshots. Pensado para llamarse desde el monitor (capital fresco
-    entre runs). Devuelve el NLV guardado, o None si algo falla — NUNCA lanza,
-    para no romper al que la llama (el monitor prioriza cerrar posiciones).
+    Sincroniza el cache de movimientos de caja desde el broker (fuente de verdad).
+    Idempotente: UPSERT por broker_id (PK), correrlo dos veces no duplica. NUNCA
+    lanza — si el broker falla, deja el cache como estaba y avisa. Devuelve
+    cuantos movimientos vio (para el log).
     """
     try:
-        balances = asyncio.run(_fetch_balances_only())
-        save_account_snapshot(balances)
-        return balances["net_liquidating_value"]
+        movs = asyncio.run(_fetch_cash_movements(start_date))
     except Exception as e:
-        print(f"  [snapshot] no se pudo guardar snapshot de capital ({e})")
-        return None
+        print(f"  [cash] no se pudo sincronizar movimientos ({e}) — cache intacto")
+        return 0
+
+    if not movs:
+        return 0
+
+    conn = get_db_connection()
+    cur  = conn.cursor()
+    for m in movs:
+        cur.execute("""
+            INSERT INTO cash_movements
+                (broker_id, movement_date, sub_type, net_value, description, synced_at)
+            VALUES (%s, %s, %s, %s, %s, NOW())
+            ON CONFLICT (broker_id) DO UPDATE SET
+                movement_date = EXCLUDED.movement_date,
+                sub_type      = EXCLUDED.sub_type,
+                net_value     = EXCLUDED.net_value,
+                description   = EXCLUDED.description,
+                synced_at     = NOW()
+        """, (m["broker_id"], m["date"], m["sub_type"], m["net_value"], m["description"]))
+    conn.commit()
+    cur.close()
+    conn.close()
+    return len(movs)
 
 
 def insert_spread(spread, account_number):
@@ -1342,6 +1391,11 @@ def run_sync():
     if balances['long_derivative_value']:
         print(f"  Options value:           ${balances['long_derivative_value']:,.2f}")
 
+    # Cache de movimientos de caja (depositos/retiros) desde el broker. Idempotente.
+    n_cash = sync_cash_movements()
+    if n_cash:
+        print(f"  Cash movements synced:   {n_cash} en cache")
+
     spreads, singles = group_spreads(tt_positions)
     print(f"\n  Tastytrade positions: {len(tt_positions)} legs "
           f"→ {len(spreads)} spread(s) + {len(singles)} single(s)")
@@ -1527,6 +1581,108 @@ def cmd_save_context(position_id, context_json, rationale, ticker=None):
         print(f"\n  ✅ Context saved for position #{position_id} (context id: {ctx_id})\n")
     else:
         print(f"\n  ❌ Failed to save context\n")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TIME-WEIGHTED RETURN (rendimiento ajustado por flujos de capital)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_cash_movements_between(start_dt, end_dt):
+    """Movimientos de caja del cache (cash_movements) en [start_dt, end_dt].
+    Devuelve lista de dicts {date, net_value, sub_type} ordenada por fecha."""
+    conn = get_db_connection()
+    cur  = conn.cursor()
+    cur.execute("""
+        SELECT movement_date, net_value, sub_type
+        FROM cash_movements
+        WHERE movement_date >= %s AND movement_date <= %s
+        ORDER BY movement_date ASC
+    """, (start_dt, end_dt))
+    rows = [{"date": r[0], "net_value": float(r[1]), "sub_type": r[2]}
+            for r in cur.fetchall()]
+    cur.close(); conn.close()
+    return rows
+
+
+def compute_twr(series, flows):
+    """
+    Time-Weighted Return sobre una serie de NLV, ajustado por flujos de capital.
+
+    series: lista de puntos {t, nlv} ordenada por tiempo (t = datetime o ISO str).
+    flows:  lista de {date, net_value} (net_value: + deposito, - retiro).
+
+    El TWR parte la serie en cada flujo y encadena los rendimientos de cada
+    sub-periodo, de modo que un deposito/retiro NO cuenta como rendimiento. Un
+    deposito de $3,206 sube el NLV pero no es ganancia: al partir el tramo ahi y
+    restar el flujo del punto siguiente, el rendimiento del tramo queda limpio.
+
+    Devuelve dict con:
+      twr_pct     : rendimiento acumulado ajustado, en % (encadenado)
+      twr_series  : [{t, cum_pct}] rendimiento acumulado en cada punto (para la curva)
+      net_flows   : suma de flujos en el periodo
+      raw_change  : cambio de NLV crudo (sin ajustar), en $
+    """
+    from datetime import datetime, date as _date
+
+    def _to_date(x):
+        if isinstance(x, str):
+            return datetime.fromisoformat(x).date()
+        if isinstance(x, datetime):
+            return x.date()
+        return x  # ya es date
+
+    if not series or len(series) < 2:
+        return {"twr_pct": 0.0, "twr_series": [{"t": p["t"], "cum_pct": 0.0} for p in series],
+                "net_flows": 0.0, "raw_change": 0.0}
+
+    # Flujo total por FECHA (varios movimientos el mismo dia se suman)
+    flow_by_date = {}
+    for f in flows:
+        d = _to_date(f["date"])
+        flow_by_date[d] = flow_by_date.get(d, 0.0) + f["net_value"]
+
+    # Set de fechas de flujo aun NO aplicadas. Cada flujo se aplica UNA sola vez
+    # —en el primer snapshot cuya fecha sea >= la del flujo—, no en cada snapshot
+    # del dia (hay decenas de snapshots intradia; aplicarlo en todos multiplicaba
+    # el flujo por la cantidad de snapshots del dia — bug corregido).
+    # Los flujos ANTERIORES al primer snapshot del rango se descartan: ya estan
+    # incorporados en el NLV inicial, restarlos seria contarlos doble.
+    primer_dia = _to_date(series[0]["t"])
+    flujos_pendientes = {d: v for d, v in flow_by_date.items() if d > primer_dia}
+
+    cum_factor = 1.0
+    twr_series = [{"t": series[0]["t"], "cum_pct": 0.0}]
+    net_flows = 0.0
+
+    for i in range(1, len(series)):
+        prev_nlv = series[i-1]["nlv"]
+        curr_nlv = series[i]["nlv"]
+        d_curr   = _to_date(series[i]["t"])
+
+        # ¿Hay algun flujo pendiente cuya fecha ya ocurrio (<= fecha de este punto)?
+        # Se aplica UNA vez y se saca de pendientes.
+        flow = 0.0
+        for fecha in list(flujos_pendientes.keys()):
+            if fecha <= d_curr:
+                flow += flujos_pendientes.pop(fecha)
+        net_flows += flow
+
+        # NLV de referencia para el tramo: al de este punto le quitamos el flujo
+        # (el deposito/retiro no es rendimiento del tramo).
+        adj_curr = curr_nlv - flow
+
+        if prev_nlv > 0:
+            r = (adj_curr - prev_nlv) / prev_nlv
+            cum_factor *= (1.0 + r)
+
+        twr_series.append({"t": series[i]["t"], "cum_pct": round((cum_factor - 1.0) * 100, 4)})
+
+    return {
+        "twr_pct":    round((cum_factor - 1.0) * 100, 4),
+        "twr_series": twr_series,
+        "net_flows":  round(net_flows, 2),
+        "raw_change": round(series[-1]["nlv"] - series[0]["nlv"], 2),
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
