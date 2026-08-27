@@ -93,6 +93,12 @@ def load_market_context():
         return json.load(f)
 
 
+def _pct_str(v, suffix="%"):
+    """Formatea un porcentaje con signo, tolerando None (Yahoo rate-limit ->
+    valores None que crasheaban con :+.1f). None -> 'N/D'."""
+    return f"{v:+.1f}{suffix}" if v is not None else "N/D"
+
+
 def format_market_context_md(ctx):
     if not ctx:
         return "Market context not available — run market_context.py first.\n"
@@ -104,7 +110,7 @@ def format_market_context_md(ctx):
         f"## Contexto Macro",
         f"**Verdict:** {verdict} — {detail}",
         f"**VIX:** {vix.get('current', 'N/A')} ({vix.get('level', 'N/A')}, {vix.get('trend', 'N/A')})",
-        f"**SPY:** ${spy.get('price', 'N/A')} | {spy.get('trend', 'N/A')} ({spy.get('pct_25d', 0):+.1f}% 25d)",
+        f"**SPY:** ${spy.get('price', 'N/A')} | {spy.get('trend', 'N/A')} ({_pct_str(spy.get('pct_25d'))} 25d)",
     ]
     sectors = ctx.get("sectors", [])
     if sectors:
@@ -149,7 +155,7 @@ def format_criteria_md(ticker, criteria):
 
     lines.append("\n**Technical:**")
     lines.append(f"- Trend 25d: {'BULLISH' if trend.get('is_bullish') else 'BEARISH'} "
-                 f"{trend.get('pct_change', 0):+.1f}%")
+                 f"{_pct_str(trend.get('pct_change'))}")
     above_both = ma.get("above_sma50") and ma.get("above_sma200")
     sma50_dir  = "RISING" if ma.get("sma50_rising") else "FALLING"
     lines.append(f"- MAs: {'Above both' if above_both else 'Below SMA50' if not ma.get('above_sma50') else 'Mixed'} "
@@ -255,7 +261,7 @@ def generate_ai_summary(market_ctx, open_positions, passed_criteria,
             f"VIX: {vix.get('current', 'N/A')} {vix.get('level', '')} "
             f"{vix.get('trend', '')} | "
             f"SPY: ${spy.get('price', 'N/A')} {spy.get('trend', '')} "
-            f"{spy.get('pct_25d', 0):+.1f}% 25d"
+            f"{_pct_str(spy.get('pct_25d'))} 25d"
         )
 
         # Macro events
@@ -323,7 +329,7 @@ def generate_ai_summary(market_ctx, open_positions, passed_criteria,
             from criteria import select_strategy
             strategy = select_strategy(criteria)
 
-            trend_str = f"{trend.get('pct_change', 0):+.1f}%"
+            trend_str = _pct_str(trend.get('pct_change'))
             iv_str    = f"{iv:.1f}% P{ivp:.0f}" if iv and ivp else "N/A"
             rsi_str   = f"{rsi:.1f}" if rsi else "N/A"
             beta_str  = f"{beta:.2f}" if beta else "N/A"
@@ -454,7 +460,7 @@ def generate_html(market_ctx, open_positions, passed_criteria,
             </div>
             <div style="font-size:12px;color:#6b7280;">
                 {'BULLISH' if trend.get('is_bullish') else 'BEARISH'}
-                {trend.get('pct_change', 0):+.1f}% |
+                {_pct_str(trend.get('pct_change'))} |
                 RSI {f"{rsi:.1f}" if rsi else 'N/A'} |
                 IV {f"{iv:.1f}" if iv else 'N/A'}% (P{f"{ivp:.0f}" if ivp else 'N/A'}) |
                 {'Above SMA50' if ma.get('above_sma50') else 'Below SMA50'}
@@ -465,11 +471,9 @@ def generate_html(market_ctx, open_positions, passed_criteria,
     eliminated_cards = "".join(ticker_card(t, all_criteria.get(t, {}), False, r)
                                 for t, r in eliminated.items())
 
-    _vix = (market_ctx.get("vix") or {}) if market_ctx else {}
-    _spy = (market_ctx.get("spy") or {}) if market_ctx else {}
-    vix_val       = _vix.get("current", "N/A")
-    spy_val       = _spy.get("price", "N/A")
-    spy_trend     = _spy.get("trend", "N/A")
+    vix_val       = market_ctx["vix"]["current"]  if market_ctx else "N/A"
+    spy_val       = market_ctx["spy"]["price"]    if market_ctx else "N/A"
+    spy_trend     = market_ctx["spy"]["trend"]    if market_ctx else "N/A"
     verdict       = market_ctx["verdict"]         if market_ctx else "N/A"
     verdict_color = {"FAVORABLE": "#22c55e", "CAUTION": "#eab308",
                      "DO_NOT_TRADE": "#ef4444"}.get(verdict, "#6b7280")
@@ -574,12 +578,9 @@ def run_scan(tickers, expand_to_universe=False):
     print(f"\n{'=' * 65}")
     print(f"  SCANNER — {timestamp}")
     if market_ctx:
-        _vix_c = (market_ctx.get('vix') or {}).get('current')
-        _vix_s = f"{_vix_c:.1f}" if _vix_c is not None else "N/D"
-        _spy_t = (market_ctx.get('spy') or {}).get('trend', 'N/D')
         print(f"  Context: {market_ctx.get('verdict', 'N/A')} | "
-              f"VIX {_vix_s} | "
-              f"SPY {_spy_t}")
+              f"VIX {market_ctx['vix']['current']:.1f} | "
+              f"SPY {market_ctx['spy']['trend']}")
     print(f"{'=' * 65}\n")
 
     tt_session = None
