@@ -48,6 +48,7 @@ Uso:
 import os
 import re
 import subprocess
+import threading
 import sys
 import time
 
@@ -122,15 +123,19 @@ def _ayuda():
                "/resume\n    reactiva aperturas + pide /confirm.",
                "/paper_alerts on|off\n    prende/apaga las alertas de nivel de paper.",
                "/set_risk N\n    cambia el tope de riesgo de cartera + pide /confirm.",
+               "/auto_run\n    corre auto_run (escanea y ABRE posiciones) + pide /confirm.",
                "/confirm\n    ejecuta el pendiente (cierre o resume, ventana 60s).",
                "", "/help - esta lista"]
     return "\n".join(lineas)
 
 
-def _correr(script, args):
+def _correr(script, args, timeout=None):
     """
     Corre el script con el intérprete actual. LISTA, no string: el argumento es
     un argv literal y la shell nunca lo ve.
+
+    timeout: segundos antes de abortar. None usa SCRIPT_TIMEOUT (comandos de
+    lectura). auto_run pasa uno largo (tarda minutos).
 
     PYTHONIOENCODING=utf-8: cuando la salida va a un pipe (que es siempre acá),
     Python en Windows cae al encoding local (cp1252) y revienta con cualquier
@@ -145,14 +150,15 @@ def _correr(script, args):
             [sys.executable, script, *args],
             capture_output=True,
             text=True,
-            timeout=SCRIPT_TIMEOUT,
+            timeout=timeout if timeout is not None else SCRIPT_TIMEOUT,
             cwd=_SCRIPTS,
             env=entorno,
             encoding="utf-8",
             errors="replace",
         )
     except subprocess.TimeoutExpired:
-        return f"El script no terminó en {SCRIPT_TIMEOUT}s — se abortó."
+        lim = timeout if timeout is not None else SCRIPT_TIMEOUT
+        return f"El script no terminó en {lim}s — se abortó."
     except Exception as e:
         return f"No se pudo correr el script: {e}"
 
@@ -178,6 +184,51 @@ def _correr(script, args):
 _PENDIENTE = {"tipo": None, "dato": None, "ts": 0.0}
 _CONFIRM_VENTANA_S = 60
 TICKER_RE = re.compile(r"^[A-Za-z]{1,5}$")
+
+# auto_run corre en un thread (tarda minutos) para no bloquear el loop del bot.
+# Este flag evita lanzar dos a la vez — un segundo /auto_run mientras uno corre
+# se rechaza (dos auto_run simultaneos competirian por el broker y la DB).
+_AUTORUN_CORRIENDO = threading.Event()
+_AUTORUN_TIMEOUT_S = 900   # 15 min: auto_run escanea el universo + LLM + ordenes
+
+
+def _lanzar_auto_run():
+    """
+    Corre auto_run.py en un thread y manda la salida al bot cuando termina. No
+    bloquea el loop: el bot sigue respondiendo mientras auto_run trabaja. auto_run
+    ya respeta el kill switch de live internamente (live_trading_allowed), asi que
+    si live esta en pausa, no abre live — el comando no se salta esa proteccion.
+    """
+    def _worker():
+        try:
+            salida = _correr(os.path.join(_SCRIPTS, "auto_run.py"), [],
+                             timeout=_AUTORUN_TIMEOUT_S)
+            # La salida de auto_run puede ser larga; Telegram corta ~4096 chars.
+            # Mandamos la cola (lo mas reciente: el resumen de aperturas/cierres).
+            if len(salida) > 3500:
+                salida = "…(salida truncada)…\n" + salida[-3500:]
+            send_push("auto_run terminó", salida, mono=True)
+        except Exception as e:
+            send_push("auto_run falló", f"Error inesperado: {e}", mono=False)
+        finally:
+            _AUTORUN_CORRIENDO.clear()
+
+    t = threading.Thread(target=_worker, daemon=True, name="auto_run")
+    t.start()
+
+
+def _cmd_auto_run():
+    """Paso 1: pide confirmacion. auto_run ABRE posiciones reales (si live activo)."""
+    if _AUTORUN_CORRIENDO.is_set():
+        return ("auto_run", "Ya hay un auto_run corriendo. Espera a que termine.", False)
+    _PENDIENTE["tipo"] = "auto_run"
+    _PENDIENTE["dato"] = None
+    _PENDIENTE["ts"]   = time.time()
+    return ("auto_run",
+            f"Esto corre auto_run: escanea y ABRE posiciones segun encuentre "
+            f"(en live si esta activo, y en paper).\n"
+            f"Manda /confirm en los proximos {_CONFIRM_VENTANA_S}s para ejecutar.\n"
+            f"Cualquier otra cosa lo cancela.", False)
 
 
 def _cmd_close(partes):
@@ -227,6 +278,16 @@ def _cmd_confirmar():
         _PENDIENTE["tipo"] = None
         salida = _correr(os.path.join(_TOOLS, "set_risk_pct.py"), [str(val)])
         return ("confirmar", salida, False)
+
+    if tipo == "auto_run":
+        _PENDIENTE["tipo"] = None
+        if _AUTORUN_CORRIENDO.is_set():
+            return ("confirmar", "Ya hay un auto_run corriendo. Espera a que termine.", False)
+        _AUTORUN_CORRIENDO.set()
+        _lanzar_auto_run()
+        return ("confirmar",
+                "auto_run arrancó. Corre en segundo plano (varios minutos) — "
+                "te aviso acá cuando termine. Podes seguir usando el bot.", False)
 
     _PENDIENTE["tipo"] = None
     return ("confirmar", "Pendiente de tipo desconocido — cancelado.", False)
@@ -324,6 +385,8 @@ def _manejar(texto):
         return _cmd_paper_alerts(partes)
     if cmd == "/set_risk":
         return _cmd_set_risk(partes)
+    if cmd == "/auto_run":
+        return _cmd_auto_run()
     # Cualquier comando que NO sea /confirm cancela un pendiente vivo.
     if _PENDIENTE["tipo"] and cmd != "/confirm":
         _PENDIENTE["tipo"] = None
