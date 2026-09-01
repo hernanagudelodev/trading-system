@@ -437,27 +437,6 @@ def ensure_tables():
         )
     """)
 
-    # Movimientos de caja (depositos/retiros) cacheados del broker. La VERDAD
-    # sigue siendo Tastytrade; esta tabla es un cache reconstruible: el id del
-    # broker es PK, asi el sync es idempotente (UPSERT, correrlo dos veces no
-    # duplica). Sirve para ajustar el rendimiento por flujos de capital (TWR)
-    # sin consultar el broker en cada calculo.
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS cash_movements (
-            broker_id       VARCHAR(64) PRIMARY KEY,   -- id de la transaccion en Tastytrade
-            movement_date   DATE NOT NULL,             -- dia (para queries por rango)
-            executed_at     TIMESTAMPTZ,               -- momento EXACTO del movimiento (con hora)
-            sub_type        VARCHAR(40),               -- Deposit / Withdrawal / etc.
-            net_value       DECIMAL(14,2) NOT NULL,    -- + entra (deposito), - sale (retiro)
-            description     TEXT,
-            synced_at       TIMESTAMP DEFAULT NOW()
-        )
-    """)
-    # Si la tabla ya existia sin la columna executed_at, agregarla (migracion suave).
-    cur.execute("""
-        ALTER TABLE cash_movements ADD COLUMN IF NOT EXISTS executed_at TIMESTAMPTZ
-    """)
-
     conn.commit()
     cur.close()
     conn.close()
@@ -506,82 +485,6 @@ def save_account_snapshot(balances):
     cur.close()
     conn.close()
     return snapshot_id
-
-
-async def _fetch_cash_movements(start_date=None):
-    """
-    Trae los Money Movements (depositos/retiros) del broker desde start_date
-    (default: todo el historico). Mismo filtro que equity_change.py: solo
-    'Money Movement', EXCLUYE 'Balance Adjustment' (ruido de centavos). Devuelve
-    lista de dicts con el id del broker para el UPSERT idempotente.
-    """
-    from tastytrade import Session
-    from tastytrade.account import Account
-    session = Session(os.getenv("TASTYTRADE_CLIENT_SECRET"),
-                      os.getenv("TASTYTRADE_REFRESH_TOKEN"))
-    account = (await Account.get(session))[0]
-    if start_date is not None and hasattr(start_date, "date"):
-        start_date = start_date.date()
-    txns = await account.get_history(session, start_date=start_date) if start_date \
-           else await account.get_history(session)
-
-    movs = []
-    for t in txns:
-        if getattr(t, "transaction_type", "") != "Money Movement":
-            continue
-        sub = getattr(t, "transaction_sub_type", "") or ""
-        if sub == "Balance Adjustment":
-            continue
-        bid = getattr(t, "id", None)
-        if bid is None:
-            continue   # sin id no podemos deduplicar -> lo saltamos
-        movs.append({
-            "broker_id":   str(bid),
-            "date":        getattr(t, "transaction_date", None),
-            "executed_at": getattr(t, "executed_at", None),
-            "sub_type":    sub,
-            "net_value":   float(getattr(t, "net_value", 0) or 0),
-            "description": getattr(t, "description", "") or "",
-        })
-    return movs
-
-
-def sync_cash_movements(start_date=None):
-    """
-    Sincroniza el cache de movimientos de caja desde el broker (fuente de verdad).
-    Idempotente: UPSERT por broker_id (PK), correrlo dos veces no duplica. NUNCA
-    lanza — si el broker falla, deja el cache como estaba y avisa. Devuelve
-    cuantos movimientos vio (para el log).
-    """
-    try:
-        movs = asyncio.run(_fetch_cash_movements(start_date))
-    except Exception as e:
-        print(f"  [cash] no se pudo sincronizar movimientos ({e}) — cache intacto")
-        return 0
-
-    if not movs:
-        return 0
-
-    conn = get_db_connection()
-    cur  = conn.cursor()
-    for m in movs:
-        cur.execute("""
-            INSERT INTO cash_movements
-                (broker_id, movement_date, executed_at, sub_type, net_value, description, synced_at)
-            VALUES (%s, %s, %s, %s, %s, %s, NOW())
-            ON CONFLICT (broker_id) DO UPDATE SET
-                movement_date = EXCLUDED.movement_date,
-                executed_at   = EXCLUDED.executed_at,
-                sub_type      = EXCLUDED.sub_type,
-                net_value     = EXCLUDED.net_value,
-                description   = EXCLUDED.description,
-                synced_at     = NOW()
-        """, (m["broker_id"], m["date"], m["executed_at"], m["sub_type"],
-              m["net_value"], m["description"]))
-    conn.commit()
-    cur.close()
-    conn.close()
-    return len(movs)
 
 
 def insert_spread(spread, account_number):
@@ -1304,7 +1207,7 @@ def cmd_paper_close(ticker, close_reason="MANUAL", close_rationale=None):
     cur  = conn.cursor()
     cur.execute("""
         SELECT id, ticker, strategy, strike_low, strike_high, expiration,
-               total_cost, premium_paid, contracts
+               total_cost, premium_paid, contracts, current_spread_value
         FROM paper_positions
         WHERE UPPER(status) = 'OPEN' AND ticker = %s
         ORDER BY opened_at DESC LIMIT 1
@@ -1317,22 +1220,31 @@ def cmd_paper_close(ticker, close_reason="MANUAL", close_rationale=None):
         conn.close()
         return False
 
-    pos_id, ticker, strategy, sl, sh, exp, total_cost, premium, contracts = row
+    pos_id, ticker, strategy, sl, sh, exp, total_cost, premium, contracts, last_value = row
     is_put = strategy == "Bull Put Spread"
     opt_type = "put" if is_put else "call"
 
-    # Opción C: reintenta fuerte; si no consigue precio real, NO cierra.
-    # Nunca inventa $0.00 (eso falseaba el P&L — caso GS del 16-jun).
+    # Se intenta el precio real del mercado. Si NO se consigue (patas iliquidas:
+    # un spread muy perdido queda tan OTM que sus opciones no cotizan, bid 0),
+    # se cae al ULTIMO valor conocido de la DB — la ultima lectura real que hizo
+    # el monitor. Es PAPER: sin plata real, y el ultimo valor conocido es la mejor
+    # estimacion disponible; asi el cierre nunca queda trabado por falta de precio.
+    # (Esto es SOLO paper — cmd_paper_close es exclusivo de paper; live cierra por
+    # el broker real, donde jamas se usaria un precio no confirmado.)
     spread_value = fetch_paper_spread_value(ticker, float(sl), float(sh), exp, opt_type,
                                             retries=4, delay=3)
     if spread_value is None:
-        print(f"\n  ⛔ NO se cerró {ticker}: no se pudo obtener precio real del "
-              f"spread tras varios intentos.")
-        print(f"     La posición sigue ABIERTA. Reintentá con el mercado abierto, "
-              f"o cerrá con un precio conocido.\n")
-        cur.close()
-        conn.close()
-        return False
+        if last_value is not None and float(last_value) > 0:
+            spread_value = float(last_value)
+            print(f"\n  ⚠️  {ticker}: sin precio nuevo del mercado (patas iliquidas). "
+                  f"Se cierra con el ULTIMO valor conocido de la DB: ${spread_value:.2f}")
+        else:
+            print(f"\n  ⛔ NO se cerró {ticker}: no se pudo obtener precio real NI hay "
+                  f"un ultimo valor conocido en la DB.")
+            print(f"     La posición sigue ABIERTA.\n")
+            cur.close()
+            conn.close()
+            return False
 
     # P&L: fuente ÚNICA en option_selector.spread_pnl. Esta matemática vivía
     # copiada acá y en monitor.run_paper_monitor, y ya habían divergido — el
@@ -1398,11 +1310,6 @@ def run_sync():
     print(f"  Pending cash:            ${balances['pending_cash']:,.2f}")
     if balances['long_derivative_value']:
         print(f"  Options value:           ${balances['long_derivative_value']:,.2f}")
-
-    # Cache de movimientos de caja (depositos/retiros) desde el broker. Idempotente.
-    n_cash = sync_cash_movements()
-    if n_cash:
-        print(f"  Cash movements synced:   {n_cash} en cache")
 
     spreads, singles = group_spreads(tt_positions)
     print(f"\n  Tastytrade positions: {len(tt_positions)} legs "
@@ -1589,166 +1496,6 @@ def cmd_save_context(position_id, context_json, rationale, ticker=None):
         print(f"\n  ✅ Context saved for position #{position_id} (context id: {ctx_id})\n")
     else:
         print(f"\n  ❌ Failed to save context\n")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# TIME-WEIGHTED RETURN (rendimiento ajustado por flujos de capital)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def get_cash_movements_between(start_dt, end_dt):
-    """Movimientos de caja del cache en [start_dt, end_dt]. Incluye executed_at
-    (timestamp exacto) para ubicar el flujo en el momento correcto del TWR."""
-    conn = get_db_connection()
-    cur  = conn.cursor()
-    cur.execute("""
-        SELECT movement_date, net_value, sub_type, executed_at
-        FROM cash_movements
-        WHERE movement_date >= %s AND movement_date <= %s
-        ORDER BY movement_date ASC
-    """, (start_dt, end_dt))
-    rows = [{"date": r[0], "net_value": float(r[1]), "sub_type": r[2],
-             "executed_at": r[3]} for r in cur.fetchall()]
-    cur.close(); conn.close()
-    return rows
-
-
-def compute_twr(series, flows):
-    """
-    Time-Weighted Return sobre una serie de NLV, ajustado por flujos de capital.
-
-    series: lista de puntos {t, nlv} ordenada por tiempo (t = datetime o ISO str).
-    flows:  lista de {date, net_value} (net_value: + deposito, - retiro).
-
-    El TWR parte la serie en cada flujo y encadena los rendimientos de cada
-    sub-periodo, de modo que un deposito/retiro NO cuenta como rendimiento. Un
-    deposito de $3,206 sube el NLV pero no es ganancia: al partir el tramo ahi y
-    restar el flujo del punto siguiente, el rendimiento del tramo queda limpio.
-
-    Devuelve dict con:
-      twr_pct     : rendimiento acumulado ajustado, en % (encadenado)
-      twr_series  : [{t, cum_pct}] rendimiento acumulado en cada punto (para la curva)
-      net_flows   : suma de flujos en el periodo
-      raw_change  : cambio de NLV crudo (sin ajustar), en $
-    """
-    from datetime import datetime, date as _date, timezone
-
-    def _to_dt(x):
-        """Normaliza a datetime con tz UTC (para comparar snapshots y flujos)."""
-        if isinstance(x, str):
-            d = datetime.fromisoformat(x)
-        elif isinstance(x, datetime):
-            d = x
-        elif isinstance(x, _date):
-            d = datetime(x.year, x.month, x.day)
-        else:
-            return None
-        if d.tzinfo is None:
-            d = d.replace(tzinfo=timezone.utc)
-        return d
-
-    if not series or len(series) < 2:
-        return {"twr_pct": 0.0, "twr_series": [{"t": p["t"], "cum_pct": 0.0} for p in series],
-                "pnl_series": [{"t": p["t"], "pnl": 0.0} for p in series],
-                "pnl_real": 0.0, "net_flows": 0.0, "raw_change": 0.0}
-
-    # Cada flujo con su momento de registro (executed_at) y su monto.
-    flujos = []
-    for f in flows:
-        ts = f.get("executed_at")
-        dt = _to_dt(ts) if ts is not None else _to_dt(f["date"])
-        if dt is not None:
-            flujos.append({"dt": dt, "net_value": f["net_value"]})
-    flujos.sort(key=lambda x: x["dt"])
-
-    t0 = _to_dt(series[0]["t"])
-    # NO descartamos por executed_at vs la base: el momento en que el broker
-    # REGISTRA el flujo (executed_at) y el momento en que el CASH realmente salta
-    # pueden caer en lados distintos del punto base (ej. registrado ayer 21:00,
-    # pero el cash salta hoy 10:16). La autoridad para descontar es el SALTO DE
-    # CASH dentro de la serie — si el cash salto dentro del rango, el flujo cuenta;
-    # si no aparece (porque ya estaba en la base), no se detecta y no se descuenta.
-    flujos_pendientes = list(flujos)
-
-    # ── Ubicar cada flujo por el SALTO EN CASH ───────────────────────────────────
-    # El cash_balance es la señal limpia de un flujo: un deposito/retiro cambia el
-    # cash exactamente por su monto, mientras que el rendimiento de las opciones NO
-    # toca el cash (mueve el valor de las posiciones). Asi evitamos confundir un
-    # deposito con un buen dia de trading. Para cada flujo, buscamos el snapshot
-    # donde el cash salto ~el monto del flujo y aplicamos el descuento ahi.
-    # Si los snapshots no tienen cash (None), caemos al salto de NLV como respaldo.
-    from datetime import timedelta
-    VENTANA_H = 96
-    tiene_cash = all(s.get("cash") is not None for s in series)
-    flujo_en_indice = {}
-
-    for f in flujos_pendientes:
-        objetivo = f["net_value"]
-        f_dt = f["dt"]
-        mejor_i, mejor_err = None, None
-        for i in range(1, len(series)):
-            t_i = _to_dt(series[i]["t"])
-            # Ventana SIMETRICA alrededor del executed_at: el salto real del cash
-            # puede ocurrir ANTES o DESPUES del momento que registra el broker
-            # (el registro y el movimiento efectivo del cash no siempre coinciden).
-            if abs((t_i - f_dt).total_seconds()) > VENTANA_H * 3600:
-                continue
-            if tiene_cash:
-                salto = series[i]["cash"] - series[i-1]["cash"]
-            else:
-                salto = series[i]["nlv"] - series[i-1]["nlv"]
-            err = abs(salto - objetivo)
-            # El cash salta casi EXACTO el monto (sin ruido de rendimiento).
-            margen = max(abs(objetivo) * 0.10, 50)
-            if err <= margen and (mejor_err is None or err < mejor_err):
-                mejor_err, mejor_i = err, i
-        if mejor_i is not None:
-            flujo_en_indice[mejor_i] = flujo_en_indice.get(mejor_i, 0.0) + objetivo
-        elif not tiene_cash:
-            # Sin cash confiable: fallback por executed_at, pero solo si el flujo
-            # cae DESPUES de la base (si no, ya estaba en el NLV inicial).
-            if f_dt > t0:
-                for i in range(1, len(series)):
-                    if _to_dt(series[i]["t"]) >= f_dt:
-                        flujo_en_indice[i] = flujo_en_indice.get(i, 0.0) + objetivo
-                        break
-        # Con cash y sin salto detectado: el flujo ya estaba en la base (su cash
-        # no salta dentro del rango) -> NO se descuenta. Correcto.
-
-    nlv_inicial = series[0]["nlv"]
-    cum_factor = 1.0
-    twr_series = [{"t": series[0]["t"], "cum_pct": 0.0}]
-    pnl_series = [{"t": series[0]["t"], "pnl": 0.0}]
-    net_flows = 0.0
-    flujos_acumulados = 0.0
-
-    for i in range(1, len(series)):
-        prev_nlv = series[i-1]["nlv"]
-        curr_nlv = series[i]["nlv"]
-
-        # Flujo asignado a ESTE indice (donde el NLV realmente salto por el flujo).
-        flow = flujo_en_indice.get(i, 0.0)
-        net_flows += flow
-        flujos_acumulados += flow
-
-        # --- TWR (%) ---
-        adj_curr = curr_nlv - flow
-        if prev_nlv > 0:
-            r = (adj_curr - prev_nlv) / prev_nlv
-            cum_factor *= (1.0 + r)
-        twr_series.append({"t": series[i]["t"], "cum_pct": round((cum_factor - 1.0) * 100, 4)})
-
-        # --- P&L real acumulado ($) ---
-        pnl_real = (curr_nlv - nlv_inicial) - flujos_acumulados
-        pnl_series.append({"t": series[i]["t"], "pnl": round(pnl_real, 2)})
-
-    return {
-        "twr_pct":    round((cum_factor - 1.0) * 100, 4),
-        "twr_series": twr_series,
-        "pnl_series": pnl_series,
-        "pnl_real":   round((series[-1]["nlv"] - nlv_inicial) - net_flows, 2),
-        "net_flows":  round(net_flows, 2),
-        "raw_change": round(series[-1]["nlv"] - series[0]["nlv"], 2),
-    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
