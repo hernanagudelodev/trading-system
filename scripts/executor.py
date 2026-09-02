@@ -105,32 +105,41 @@ def _cartera_gates(table, ticker, strike_low, strike_high, debit):
     Aplica, en orden:
       1. Lectura de cartera. Si la DB no responde -> FAIL-CLOSED (rechaza).
       2. Concentracion: el ticker ya OPEN en este libro -> rechaza (no apilar nombre).
-      3. Riesgo agregado: riesgo_actual + riesgo_nuevo > tope -> rechaza.
+      3. Riesgo agregado: riesgo_actual + riesgo_nuevo > tope_cartera -> rechaza.
+      4. Riesgo por SECTOR: riesgo_del_sector + riesgo_nuevo > tope_sector -> rechaza.
+         El sector del candidato sale de la fuente unica (get_sector/yfinance).
+         FAIL-CLOSED: si no resuelve a un sector real ('Other'/None), no se abre.
 
     Levanta CarteraRechazo(motivo) si algun gate corta. Devuelve None si todo pasa.
     El CAPITAL sale del broker (get_account_nlv), misma fuente que el gate por-trade.
     """
     import os
     import psycopg2
-    from option_selector import get_account_nlv, position_max_loss, portfolio_risk_pct
+    from option_selector import (get_account_nlv, position_max_loss,
+                                  portfolio_risk_pct, max_sector_risk_pct)
+    from criteria import get_sector
 
     CAPITAL            = get_account_nlv()
-    PCT                = portfolio_risk_pct()
-    MAX_PORTFOLIO_RISK = CAPITAL * PCT / 100.0
+    MAX_PORTFOLIO_RISK = CAPITAL * portfolio_risk_pct() / 100.0
+    MAX_SECTOR_RISK    = CAPITAL * max_sector_risk_pct() / 100.0
 
     open_tickers = set()
     current_risk = 0.0
+    sector_risk  = {}          # sector -> riesgo agregado ($) de las OPEN
     try:
         conn = psycopg2.connect(os.getenv("DATABASE_URL"))
         cur  = conn.cursor()
         cur.execute(f"""
-            SELECT UPPER(ticker), strike_low, strike_high, premium_paid, contracts
+            SELECT UPPER(ticker), strike_low, strike_high, premium_paid,
+                   contracts, COALESCE(sector, 'Other')
             FROM {table}
             WHERE UPPER(status) = 'OPEN'
         """)
-        for _tkr, _sl, _sh, _prem, _n in cur.fetchall():
+        for _tkr, _sl, _sh, _prem, _n, _sec in cur.fetchall():
             open_tickers.add(_tkr)
-            current_risk += position_max_loss(_sl, _sh, _prem, _n)
+            riesgo = position_max_loss(_sl, _sh, _prem, _n)
+            current_risk += riesgo
+            sector_risk[_sec] = sector_risk.get(_sec, 0.0) + riesgo
         cur.close(); conn.close()
     except Exception as e:
         # FAIL-CLOSED: no poder ver la exposicion es exactamente cuando NO se abre.
@@ -141,10 +150,24 @@ def _cartera_gates(table, ticker, strike_low, strike_high, debit):
         raise CarteraRechazo(f"{ticker} ya tiene posicion abierta — no apilar mismo nombre")
 
     new_risk = position_max_loss(strike_low, strike_high, debit)
+
+    # Gate 3: riesgo agregado de cartera.
     if current_risk + new_risk > MAX_PORTFOLIO_RISK:
         raise CarteraRechazo(
             f"{ticker} supera el tope de cartera: "
             f"${current_risk:,.0f} + ${new_risk:,.0f} > ${MAX_PORTFOLIO_RISK:,.0f}")
+
+    # Gate 4: riesgo agregado por SECTOR. Solo se evalua si paso el gate 3 (evita
+    # la llamada a yfinance si ya rechazo por cartera).
+    cand_sector = get_sector(ticker)
+    if cand_sector in (None, "Other"):
+        raise CarteraRechazo(
+            f"{ticker}: sector no resuelto ({cand_sector!r}) — fail-closed, no se abre")
+    sector_actual = sector_risk.get(cand_sector, 0.0)
+    if sector_actual + new_risk > MAX_SECTOR_RISK:
+        raise CarteraRechazo(
+            f"{ticker} supera el tope del sector {cand_sector}: "
+            f"${sector_actual:,.0f} + ${new_risk:,.0f} > ${MAX_SECTOR_RISK:,.0f}")
 
     return None
 

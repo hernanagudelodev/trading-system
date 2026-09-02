@@ -953,6 +953,45 @@ def portfolio_risk_pct() -> float:
         "MAX_PORTFOLIO_RISK_PCT. Sin el, el gate de cartera no rechazaria nada."
     )
 
+def max_sector_risk_pct() -> float:
+    """
+    Tope de riesgo por SECTOR, en % del capital. Lo usa el gate sectorial de
+    _cartera_gates (executor), compartido por paper y live.
+
+    FUENTE DE VERDAD: system_state['max_sector_risk_pct'] en la DB. Mismo patron
+    que max_portfolio_risk_pct: TODOS los servicios (worker, bot, dashboard) leen
+    el MISMO valor, sin desincronizarse como pasaba con las env vars por servicio.
+
+    Cascada:
+      1. system_state['max_sector_risk_pct'] (DB)  -> fuente unica.
+      2. env var MAX_SECTOR_RISK_PCT               -> fallback (transicion).
+      3. ninguna de las dos                        -> RuntimeError: un tope
+         ausente no es "sin tope", es un bug (mismo criterio que el de cartera).
+    """
+    # 1. DB (fuente unica)
+    try:
+        import psycopg2
+        conn = psycopg2.connect(os.getenv("DATABASE_URL"))
+        cur = conn.cursor()
+        cur.execute("SELECT value FROM system_state WHERE key = %s",
+                    ("max_sector_risk_pct",))
+        row = cur.fetchone()
+        cur.close(); conn.close()
+        if row is not None and row[0] is not None:
+            return float(row[0])
+    except Exception as e:
+        print(f"  [tope sector] no se pudo leer system_state ({e}) — probando env var")
+
+    # 2. env var (fallback de transicion)
+    raw = os.getenv("MAX_SECTOR_RISK_PCT")
+    if raw is not None:
+        return float(raw)
+
+    # 3. ninguna fuente -> bug
+    raise RuntimeError(
+        "Tope sectorial ausente: ni system_state['max_sector_risk_pct'] ni "
+        "MAX_SECTOR_RISK_PCT. Sin el, el gate sectorial no rechazaria nada."
+    )
 
 def spread_pnl(strike_low, strike_high, premium_paid, contracts, spread_value,
                strategy=None, long_value=None):
