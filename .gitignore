@@ -18,3 +18,4 @@ _*.py
 
 # Carpeta de scripts temporales — no se versiona
 temp_scripts/
+.env.v2
