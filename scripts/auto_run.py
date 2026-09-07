@@ -789,9 +789,48 @@ def is_friday_afternoon():
 # MARKET HOURS CHECK
 # ══════════════════════════════════════════════════════════════════════════════
 
-def is_market_day():
-    """Only run on weekdays."""
-    return datetime.now().weekday() < 5
+def mercado_abierto():
+    """
+    True SOLO si NYSE esta en sesion regular (Open) segun Tastytrade — la misma
+    fuente que ejecuta las ordenes. Reemplaza a is_market_day (que solo miraba
+    weekday y no sabia de feriados: el 01-sep, Labor Day, el auto_run corrio y
+    trato de abrir con precios del viernes).
+
+    FAIL-CLOSED: si no se puede confirmar 'Open' (red, sesion, API), devuelve
+    False y el run se salta. El daño a evitar es operar sobre datos stale de un
+    mercado cerrado; ante la duda, no operar. Es lo OPUESTO a _ya_corrio_hoy, que
+    fail-opens a proposito — alli el riesgo era un run duplicado, aca un run sobre
+    mercado cerrado.
+
+    Solo 'Open' habilita. 'Pre-market' y 'Extended' NO: los spreads necesitan
+    liquidez de sesion regular, no libros ralos de horario extendido.
+    """
+    from tastytrade.market_sessions import MarketStatus
+
+    async def _consultar():
+        from tastytrade import Session
+        from tastytrade.market_sessions import get_market_sessions, ExchangeType
+        cs = os.getenv("TASTYTRADE_CLIENT_SECRET")
+        rt = os.getenv("TASTYTRADE_REFRESH_TOKEN")
+        if not cs or not rt:
+            return None
+        session = Session(cs, rt)
+        sesiones = await get_market_sessions(session, [ExchangeType.NYSE])
+        return sesiones[0].status if sesiones else None
+
+    try:
+        status = asyncio.run(_consultar())
+    except Exception as e:
+        print(f"  [mercado] no se pudo consultar Tastytrade ({e}) — fail-closed, se salta")
+        return False
+
+    if status is None:
+        print("  [mercado] sin estado de Tastytrade — fail-closed, se salta")
+        return False
+
+    abierto = (status == MarketStatus.OPEN)
+    print(f"  [mercado] NYSE segun Tastytrade: {status} — {'corre' if abierto else 'NO corre'}")
+    return abierto
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -866,8 +905,8 @@ def main():
     print(f"  AUTO RUN [def · live+paper] — {timestamp}")
     print(f"{'=' * 55}")
 
-    if not is_market_day():
-        print("  Weekend — skipping run")
+    if not mercado_abierto():
+        print("  Mercado cerrado (feriado, fin de semana u horario) — se salta el run")
         return
 
     # Wrap entire run in try/except to catch failures and notify
