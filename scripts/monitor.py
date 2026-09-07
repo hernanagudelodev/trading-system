@@ -870,11 +870,13 @@ def scheduled_run():
     _maybe_snapshot_capital()
 
 
-# El monitor corre cada 5min (mercado abierto). Guardar un snapshot en CADA
-# corrida son ~12/hora; con SNAPSHOT_EVERY_N=3 -> uno cada ~15min, capital
-# razonablemente fresco sin inflar la tabla. El contador vive en memoria: un
-# reinicio lo resetea (y toma un snapshot en la primer corrida, que esta bien).
-SNAPSHOT_EVERY_N = 3
+# El monitor corre cada 5min (mercado abierto) / 30min (cerrado). Con
+# SNAPSHOT_EVERY_N=1 se toma un snapshot en CADA corrida — NLV + estado del
+# mercado frescos a ritmo fijo (antes solo se escribia en run_sync, por evento,
+# de forma irregular). Escribe tambien con mercado cerrado, a proposito: asi el
+# estado 'Closed' se refresca. El contador vive en memoria: un reinicio lo
+# resetea (y toma un snapshot en la primer corrida, que esta bien).
+SNAPSHOT_EVERY_N = 1
 _snapshot_counter = 0
 
 

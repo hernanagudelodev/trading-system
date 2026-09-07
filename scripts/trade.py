@@ -460,15 +460,15 @@ def get_open_positions_from_db():
     return rows
 
 
-def save_account_snapshot(balances):
+def save_account_snapshot(balances, market_status=None):
     conn = get_db_connection()
     cur  = conn.cursor()
     cur.execute("""
         INSERT INTO account_snapshots
             (account_number, net_liquidating_value, equity_buying_power,
              derivative_buying_power, cash_balance, pending_cash,
-             long_derivative_value, maintenance_excess)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+             long_derivative_value, maintenance_excess, market_status)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING id
     """, (
         balances["account_number"],
@@ -479,12 +479,51 @@ def save_account_snapshot(balances):
         balances["pending_cash"],
         balances["long_derivative_value"],
         balances["maintenance_excess"],
+        market_status,
     ))
     snapshot_id = cur.fetchone()[0]
     conn.commit()
     cur.close()
     conn.close()
     return snapshot_id
+
+
+def snapshot_now():
+    """
+    Toma un snapshot de la cuenta AHORA y lo guarda: NLV (via fetch_tastytrade_data,
+    el mismo path que run_sync) + estado del mercado (auto_run.market_status,
+    Tastytrade) en la MISMA fila de account_snapshots, con el mismo snapshot_at.
+
+    Lo llama el monitor en CADA ciclo (mercado abierto o no), para que el dashboard
+    tenga NLV y estado frescos a ritmo fijo — antes solo se escribia en run_sync,
+    por evento, de forma irregular.
+
+    Devuelve el NLV (float) o None si algo fallo. NUNCA lanza: el monitor lo llama
+    dentro de su loop de stops; una excepcion aca no debe tumbar ese loop.
+    """
+    try:
+        tt_data  = fetch_tastytrade_data()
+        balances = tt_data["balances"]
+    except Exception as e:
+        print(f"  [snapshot] no se pudo leer la cuenta de Tastytrade ({e})")
+        return None
+
+    # Estado del mercado: import LOCAL para no acoplar trade <-> auto_run a nivel
+    # de modulo. market_status() ya es fail-safe (devuelve None si falla).
+    try:
+        from auto_run import market_status
+        status = market_status()
+    except Exception as e:
+        print(f"  [snapshot] no se pudo leer el estado del mercado ({e})")
+        status = None
+
+    try:
+        save_account_snapshot(balances, status)
+    except Exception as e:
+        print(f"  [snapshot] no se pudo guardar el snapshot ({e})")
+        return None
+
+    return balances.get("net_liquidating_value")
 
 
 def insert_spread(spread, account_number):
