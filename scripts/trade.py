@@ -766,6 +766,53 @@ def close_position_in_db(db_pos_id, close_price, close_reason="Closed in Tastytr
     return gross_pnl
 
 
+async def _reconstruct_close_price_async(sym_long, sym_short, since_date):
+    from tastytrade import Session
+    from tastytrade.account import Account
+    session  = Session(os.getenv("TASTYTRADE_CLIENT_SECRET"),
+                       os.getenv("TASTYTRADE_REFRESH_TOKEN"))
+    accounts = await Account.get(session)
+    account  = accounts[0]
+    txns = await account.get_history(session, start_date=since_date)
+
+    longs, shorts = [], []
+    for t in txns:
+        if "Close" not in str(getattr(t, "action", "") or ""):
+            continue
+        sym = getattr(t, "symbol", None)
+        if sym == sym_long:
+            longs.append(t)
+        elif sym == sym_short:
+            shorts.append(t)
+
+    # GUARDA: solo con EXACTAMENTE un cierre por pata se reconstruye sin ambiguedad.
+    if len(longs) != 1 or len(shorts) != 1:
+        return None
+    return round(float(longs[0].price) - float(shorts[0].price), 2)
+
+
+def _reconstruct_close_price(sym_long, sym_short, since_date):
+    """
+    Reconstruye el close_price de un spread cerrado (a mano o por expiracion),
+    leyendo los fills REALES del historial de transacciones de Tastytrade. El
+    precio de salida no esta en el mark en vivo una vez cerrada la posicion, pero
+    SI en el historial. Devuelve el close_price (prima por accion al cerrar) o None.
+
+    close_price = price(cierre pata long) - price(cierre pata short). Es la MISMA
+    resta con que se define premium_paid al abrir (long - short), asi que el signo
+    sale correcto para BCS (debito) y BPS (credito) sin logica por tipo.
+
+    FAIL-CLOSED: solo reconstruye con un fill de cierre por pata; con 0, con varios,
+    o ante cualquier error de red/API -> None. close_position_in_db(None) marca
+    entonces CLOSED_PRICE_UNKNOWN: un hueco honesto, nunca un P&L inventado (§10).
+    """
+    try:
+        return asyncio.run(_reconstruct_close_price_async(sym_long, sym_short, since_date))
+    except Exception as e:
+        print(f"    [reconstruccion] fallo consultando el historial ({e}) — queda UNKNOWN")
+        return None
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # TRADE CONTEXT — save market snapshot at entry
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1413,16 +1460,21 @@ def run_sync():
             both_gone = (sym_long not in tt_all_symbols and
                          sym_short not in tt_all_symbols)
             if both_gone:
-                # None a propósito: la posición ya no está en Tastytrade, así que
-                # el precio de salida no existe acá. Queda CLOSED_PRICE_UNKNOWN
-                # con P&L NULL. Antes esto registraba la pérdida máxima entera.
-                pnl = close_position_in_db(db_pos["id"], None, "Closed in Tastytrade")
+                # La posición ya no está en Tastytrade: se cerró (a mano o por
+                # expiración). El precio de salida no está en el mark en vivo, pero
+                # SÍ en el historial de fills -> se reconstruye de ahí. Si no se
+                # puede con certeza (0/>1 cierres por pata, o error), close_price
+                # queda None y close_position_in_db marca CLOSED_PRICE_UNKNOWN,
+                # igual que antes: un hueco honesto, nunca un número inventado.
+                since = db_pos["opened_at"].date() if db_pos.get("opened_at") else None
+                close_price = _reconstruct_close_price(sym_long, sym_short, since)
+                pnl = close_position_in_db(db_pos["id"], close_price, "Closed in Tastytrade")
                 print(f"\n  CLOSED spread: {db_pos['ticker']} (DB id={db_pos['id']})")
                 if pnl is None:
-                    print(f"    P&L: SIN DATO — el precio de salida no lo sabe el sync.")
+                    print(f"    P&L: SIN DATO — no se pudo reconstruir del historial.")
                     print(f"         Marcada CLOSED_PRICE_UNKNOWN, no se inventa un número.")
                 else:
-                    print(f"    P&L: ${pnl:.2f}")
+                    print(f"    P&L: ${pnl:.2f} (reconstruido del historial de fills)")
                 closed_count += 1
         else:
             if sym_long and sym_long not in tt_all_symbols:
