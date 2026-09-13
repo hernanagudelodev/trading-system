@@ -279,3 +279,29 @@ if __name__ == "__main__":
     candidates = get_scanner_candidates()
     print(f"\n  Candidates for full scan: {len(candidates)}")
     print(f"  {', '.join(candidates[:30])}{'...' if len(candidates) > 30 else ''}")
+
+def get_sp500_sectors():
+    """
+    {symbol_canonico(punto): 'GICS Sector'} desde el mismo CSV de constituents.
+    Los simbolos vienen con punto (BRK.B) — ya es la forma canonica de v2, no se
+    convierten a guion. Si el CSV falla, devuelve {} (sector faltante -> None honesto).
+    """
+    import io
+    import csv
+    import urllib.request
+    try:
+        req = urllib.request.Request(SP500_GITHUB_CSV, headers={"User-Agent": "Mozilla/5.0"})
+        data = urllib.request.urlopen(req, timeout=20).read().decode("utf-8")
+        reader = csv.DictReader(io.StringIO(data))
+        m = {}
+        for row in reader:
+            sym = (row.get("Symbol") or "").strip()
+            sec = (row.get("GICS Sector") or "").strip()
+            if sym:
+                m[sym] = sec or None
+        if m:
+            print(f"  sectores S&P 500: {len(m)}")
+            return m
+    except Exception as e:
+        print(f"  sector CSV failed: {e}")
+    return {}
