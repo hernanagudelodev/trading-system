@@ -6,30 +6,22 @@ SCANNER de v2 — Capa de Estudio. Mide y expone hechos de mercado; NO decide
 
 FLUJO DE LA CAPA DE ESTUDIO (4 pasos)
     1. Refresco de velas   <- LISTO. Incremental por defecto; backfill si vacia.
-    2. Hechos por accion   <- COMPLETO (modo --facts TICKER)
-       Tecnico desde candle_daily (reutiliza criteria.py) + market_metrics de TT +
-       sector (CSV) + is_etf (Equity) + days_to_earnings + fuerza relativa (vs SPY
-       y vs promedio del sector, 25 sesiones). Simetrico, None honesto.
-       put_call_ratio/open_interest NO van aca (cadena de opciones -> Seleccion).
-    3. Nivel mercado       (TODO) — VIX, SPY, regimen (hecho determinista).
-    4. Persistir dossier   (TODO) — ticker_study + study_fact (computado = persistido).
+    2. Hechos por accion   <- LISTO (modo --facts TICKER).
+    3. Nivel mercado       <- LISTO (modo --market): SPY + regimen + VIX.
+    4. Persistir dossier   <- TODO. ticker_study + study_fact (computado = persistido).
 
-FUERZA RELATIVA
-    ret_25d(accion) - ret_25d(SPY)  y  ret_25d(accion) - ret_25d(promedio sector).
-    Los tres retornos con el MISMO metodo (25 sesiones) para ser comparables. SPY
-    debe estar en candle_daily (backfill puntual por ahora; luego, referencia fija
-    del refresco). El promedio del sector se computa sobre las acciones de ese
-    sector ya presentes en candle_daily — sin fetch nuevo.
-
-REUTILIZACION (criteria.py, traido de def)
-    Funciones tecnicas de criteria.py sobre serie/DataFrame, alimentadas desde
-    candle_daily. DEUDA: importar criteria arrastra yfinance; is_etf se pide por
-    ticker (se batchea al integrar las 500). Podar criteria.py queda pendiente.
+REGIMEN / VIX (hechos derivados deterministas, NO veredicto)
+    regime: BULLISH si SPY>SMA50 y pct_25d>0; BEARISH si SPY<SMA50 y pct_25d<0;
+            NEUTRAL el resto.
+    vix_level: CALM <18, ELEVATED <25, HIGH <35, EXTREME >=35 (umbrales de def).
+    vix_trend: FALLING si current<avg_5d*0.95, RISING si >*1.05, STABLE el resto.
+    Sin score ni verdict — eso es Seleccion. VIX y SPY salen de candle_daily.
 
 USO (PowerShell, venv trading_env)
     python scanner.py --test              # paso 1, lista corta, dry-run
     python scanner.py --commit            # paso 1, refresca candle_daily
     python scanner.py --facts AAPL        # paso 2, hechos de un ticker
+    python scanner.py --market            # paso 3, nivel mercado (SPY + regimen + VIX)
 
 VARIABLES DE ENTORNO (en .env.v2)
     TASTYTRADE_CLIENT_SECRET, TASTYTRADE_REFRESH_TOKEN, DATABASE_URL
@@ -62,8 +54,12 @@ COLCHON_DIAS     = 7
 BATCH_SIZE       = 30
 BATCH_DEADLINE_S = 45.0
 QUIET_S          = 3.0
-RS_WINDOW        = 25       # sesiones para la fuerza relativa (consistente con trend_25d)
+RS_WINDOW        = 25
 SPY_SYMBOL       = "SPY"
+VIX_SYMBOL       = "VIX"
+VIX_CALM         = 18
+VIX_ELEVATED     = 25
+VIX_FEAR         = 35
 
 TICKERS_PRUEBA = [
     "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "JPM",
@@ -308,7 +304,7 @@ def refresh_candles(canon_tickers, commit):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PASO 2 — HECHOS POR ACCION
+# HELPERS DE HECHOS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _try(fn, *args, **kwargs):
@@ -332,7 +328,6 @@ def _days_to(d):
 
 
 def _ret_pct(closes, n=RS_WINDOW):
-    """Retorno % de n sesiones. Acepta pandas Series o lista. None si falta historia."""
     if closes is None:
         return None
     vals = [float(x) for x in (closes.values if hasattr(closes, "values") else closes)]
@@ -344,7 +339,9 @@ def _ret_pct(closes, n=RS_WINDOW):
     return round((c_now / c_then - 1) * 100, 2)
 
 
-# ── fuerza relativa: referencias ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# PASO 2 — HECHOS POR ACCION
+# ══════════════════════════════════════════════════════════════════════════════
 
 def _spy_return(cur, n=RS_WINDOW):
     cur.execute("SELECT close FROM candle_daily WHERE ticker = %s ORDER BY candle_date ASC",
@@ -354,7 +351,6 @@ def _spy_return(cur, n=RS_WINDOW):
 
 
 def _sector_return(cur, sector, sector_map, n=RS_WINDOW):
-    """Promedio del ret_25d de las acciones del sector presentes en candle_daily."""
     if not sector:
         return None
     tickers = [t for t, s in sector_map.items() if s == sector]
@@ -370,8 +366,6 @@ def _sector_return(cur, sector, sector_map, n=RS_WINDOW):
     rets = [r for r in rets if r is not None]
     return round(sum(rets) / len(rets), 2) if rets else None
 
-
-# ── is_etf ────────────────────────────────────────────────────────────────────
 
 async def _is_etf_async(canon_ticker):
     from tastytrade import Session
@@ -390,11 +384,6 @@ def get_is_etf(canon_ticker):
 
 
 def study_stock(ticker, df, sector=None, ret_spy=None, ret_sector=None):
-    """
-    Hechos por accion: tecnico (criteria.py) + market_metrics TT + sector/is_etf/
-    days_to_earnings + fuerza relativa. Simetrico, None honesto. (facts, faltantes).
-    ret_spy / ret_sector se pasan ya computados (referencias del run).
-    """
     from criteria import (
         get_trend_25d, get_moving_averages, get_rsi, get_52_week_position,
         get_support_resistance, get_candlestick_pattern, get_historical_volatility,
@@ -427,7 +416,6 @@ def study_stock(ticker, df, sector=None, ret_spy=None, ret_sector=None):
     facts["days_to_earnings"] = _days_to(tt.get("earnings_date"))
     facts["is_etf"]           = get_is_etf(ticker)
 
-    # ── fuerza relativa ───────────────────────────────────────────────────────
     ret_stock = _ret_pct(closes, RS_WINDOW)
     facts["rs_vs_spy"]    = round(ret_stock - ret_spy, 2)    if (ret_stock is not None and ret_spy is not None) else None
     facts["rs_vs_sector"] = round(ret_stock - ret_sector, 2) if (ret_stock is not None and ret_sector is not None) else None
@@ -466,6 +454,107 @@ def mostrar_facts(ticker):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# PASO 3 — NIVEL MERCADO (SPY + regimen + VIX)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _vix_facts(cur):
+    """Hechos de VIX desde candle_daily. Claves estables (None honesto si falta VIX)."""
+    keys = {"vix_current": None, "vix_avg_5d": None, "vix_avg_10d": None,
+            "vix_trend": None, "vix_level": None}
+    cur.execute("SELECT close FROM candle_daily WHERE ticker = %s ORDER BY candle_date ASC",
+                (VIX_SYMBOL,))
+    closes = [float(r[0]) for r in cur.fetchall()]
+    if len(closes) < 5:
+        return keys
+    current = closes[-1]
+    avg_5d  = sum(closes[-5:]) / 5
+    avg_10d = sum(closes[-10:]) / 10 if len(closes) >= 10 else None
+
+    trend = "FALLING" if current < avg_5d * 0.95 else \
+            "RISING"  if current > avg_5d * 1.05 else "STABLE"
+    level = "CALM"     if current < VIX_CALM     else \
+            "ELEVATED" if current < VIX_ELEVATED else \
+            "HIGH"     if current < VIX_FEAR     else "EXTREME"
+
+    keys.update(
+        vix_current=round(current, 2),
+        vix_avg_5d=round(avg_5d, 2),
+        vix_avg_10d=round(avg_10d, 2) if avg_10d is not None else None,
+        vix_trend=trend, vix_level=level,
+    )
+    return keys
+
+
+def study_market(cur):
+    """
+    Bloque de mercado: SPY + regimen + VIX. Todo hecho determinista desde
+    candle_daily, reutilizando criteria.py. SIN score/verdict (van a Seleccion).
+    """
+    from criteria import get_moving_averages, get_trend_25d
+
+    facts = {}
+
+    df = _load_df(cur, SPY_SYMBOL)
+    if df is None:
+        return None, [f"{SPY_SYMBOL} no esta en candle_daily — backfilleá SPY primero"]
+
+    closes = df["Close"]
+    price  = float(closes.iloc[-1])
+    ma = _try(get_moving_averages, closes) or {}
+    tr = _try(get_trend_25d, closes) or {}
+
+    above_50  = ma.get("above_sma50")
+    above_200 = ma.get("above_sma200")
+    pct_25d   = tr.get("pct_change")
+
+    if above_50 and above_200:
+        sma_status = "ABOVE BOTH"
+    elif above_50:
+        sma_status = "ABOVE SMA50"
+    elif above_200:
+        sma_status = "BELOW SMA50"
+    else:
+        sma_status = "BELOW BOTH"
+
+    if above_50 and pct_25d is not None and pct_25d > 0:
+        regime = "BULLISH"
+    elif (not above_50) and pct_25d is not None and pct_25d < 0:
+        regime = "BEARISH"
+    else:
+        regime = "NEUTRAL"
+
+    facts.update({
+        "spy_price":        round(price, 2),
+        "spy_sma50":        ma.get("sma50"),
+        "spy_sma200":       ma.get("sma200"),
+        "spy_above_sma50":  above_50,
+        "spy_above_sma200": above_200,
+        "spy_sma_status":   sma_status,
+        "spy_sma50_dir":    ma.get("sma50_direction"),
+        "spy_pct_25d":      pct_25d,
+        "regime":           regime,
+    })
+    facts.update(_vix_facts(cur))
+    return facts, []
+
+
+def mostrar_market():
+    conn = _conn(); cur = conn.cursor()
+    facts, notas = study_market(cur)
+    cur.close(); conn.close()
+    if facts is None:
+        for n in notas:
+            print(f"  ⛔ {n}")
+        return 1
+    print(f"\n  NIVEL MERCADO ({len(facts)} campos):")
+    for k in sorted(facts):
+        v = facts[k]
+        marca = "  ·None" if v is None else ""
+        print(f"     {k:<22} {v}{marca}")
+    return 0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -474,6 +563,7 @@ def main():
     p.add_argument("--test", action="store_true", help="lista corta (paso 1)")
     p.add_argument("--commit", action="store_true", help="escribe en candle_daily (paso 1)")
     p.add_argument("--facts", metavar="TICKER", help="paso 2: hechos de un ticker")
+    p.add_argument("--market", action="store_true", help="paso 3: nivel mercado (SPY + regimen + VIX)")
     a = p.parse_args()
 
     print(f"\n{'═'*55}")
@@ -481,6 +571,13 @@ def main():
     print(f"{'═'*55}")
     estado_env = "cargado" if _ENV_LOADED else "NO encontrado — usando variables del sistema"
     print(f"  env: {_ENV_PATH}  ({estado_env})")
+
+    if a.market:
+        if not os.getenv("DATABASE_URL"):
+            print(f"  ⛔ falta DATABASE_URL (revisá {_ENV_PATH})")
+            return 1
+        print("  paso 3 · nivel mercado")
+        return mostrar_market()
 
     if a.facts:
         faltan = faltan_credenciales(commit=True)
@@ -511,7 +608,7 @@ def main():
         muestra = list(incompletos.items())[:15]
         print(f"     {muestra}{' ...' if len(incompletos) > 15 else ''}")
     print(f"{'─'*55}")
-    print("\n  [pasos 3-4 de la Capa de Estudio: pendientes]")
+    print("\n  [paso 4 de la Capa de Estudio: pendiente]")
     return 0
 
 
