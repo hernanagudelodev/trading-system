@@ -4,24 +4,37 @@ scripts/scanner.py  (v2-bidi)
 SCANNER de v2 — Capa de Estudio. Mide y expone hechos de mercado; NO decide
 (no filtra, no rankea, no puntua, no elige direccion). Fuente UNICA: Tastytrade.
 
-FLUJO DE LA CAPA DE ESTUDIO (4 pasos)
-    1. Refresco de velas   <- LISTO. Incremental por defecto; backfill si vacia.
-    2. Hechos por accion   <- LISTO (modo --facts TICKER).
-    3. Nivel mercado       <- LISTO (modo --market): SPY + regimen + VIX.
-    4. Persistir dossier   <- TODO. ticker_study + study_fact (computado = persistido).
+FLUJO (4 pasos) — el barrido (--scan) los encadena sobre el universo:
+    1. Refresco de velas   — incremental por defecto; backfill si vacia.
+    2. Hechos por accion   — tecnico desde candle_daily (reutiliza criteria.py) +
+       market_metrics (batch) + sector + is_etf (batch) + days_to_earnings +
+       fuerza relativa (vs SPY y vs sector). Simetrico, None honesto.
+       put_call_ratio/open_interest NO van aca (cadena de opciones -> Seleccion).
+    3. Nivel mercado       — SPY + regimen (determinista) + VIX.
+    4. Persistir dossier   — ticker_study + study_fact (computado = persistido).
+       Cada accion es una fila; el mercado es la fila sintetica __MARKET__.
 
-REGIMEN / VIX (hechos derivados deterministas, NO veredicto)
-    regime: BULLISH si SPY>SMA50 y pct_25d>0; BEARISH si SPY<SMA50 y pct_25d<0;
-            NEUTRAL el resto.
-    vix_level: CALM <18, ELEVATED <25, HIGH <35, EXTREME >=35 (umbrales de def).
-    vix_trend: FALLING si current<avg_5d*0.95, RISING si >*1.05, STABLE el resto.
-    Sin score ni verdict — eso es Seleccion. VIX y SPY salen de candle_daily.
+BATCH (medido: get_market_metrics y Equity.get son ~25-28x mas rapidos en lista)
+    Las dos llamadas TT del paso 2 se piden para TODO el universo de un saque, no
+    por ticker. study_stock recibe tt_metrics e is_etf ya resueltos y NO toca la
+    red — es puro computo sobre datos que le llegan (como ret_spy/ret_sector).
+
+REUTILIZACION (criteria.py, traido de def)
+    Funciones tecnicas de criteria.py sobre serie/DataFrame, alimentadas desde
+    candle_daily. get_volatility_from_tastytrade de def YA NO se usa (su parseo se
+    migro a _parse_metric_obj, en batch). DEUDA: importar criteria arrastra
+    yfinance; podar criteria.py (sacar yfinance + fetch muertos) queda pendiente.
 
 USO (PowerShell, venv trading_env)
     python scanner.py --test              # paso 1, lista corta, dry-run
     python scanner.py --commit            # paso 1, refresca candle_daily
     python scanner.py --facts AAPL        # paso 2, hechos de un ticker
-    python scanner.py --market            # paso 3, nivel mercado (SPY + regimen + VIX)
+    python scanner.py --market            # paso 3, nivel mercado
+    python scanner.py --persist AAPL --commit        # paso 4a, persiste un ticker
+    python scanner.py --persist-market --commit      # paso 4b, persiste el mercado
+    python scanner.py --scan --test                  # paso 4c, barrido (dry-run)
+    python scanner.py --scan --test --commit         # paso 4c, barrido + persistencia
+    python scanner.py --scan --commit                # barrido de las 500
 
 VARIABLES DE ENTORNO (en .env.v2)
     TASTYTRADE_CLIENT_SECRET, TASTYTRADE_REFRESH_TOKEN, DATABASE_URL
@@ -60,6 +73,8 @@ VIX_SYMBOL       = "VIX"
 VIX_CALM         = 18
 VIX_ELEVATED     = 25
 VIX_FEAR         = 35
+MARKET_TICKER    = "__MARKET__"
+META_BATCH       = 100     # simbolos por llamada batch de metadata (metrics / equity)
 
 TICKERS_PRUEBA = [
     "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "JPM",
@@ -128,6 +143,34 @@ def _ensure_table(cur):
             PRIMARY KEY (ticker, candle_date)
         );
     """)
+
+
+def _ensure_study_tables(cur):
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS ticker_study (
+            id         SERIAL PRIMARY KEY,
+            ticker     VARCHAR(12) NOT NULL,
+            scan_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            slot       VARCHAR(20),
+            price      DECIMAL(14,4),
+            sector     VARCHAR(50),
+            regime     VARCHAR(10),
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS study_fact (
+            id         BIGSERIAL PRIMARY KEY,
+            study_id   INTEGER      NOT NULL REFERENCES ticker_study(id),
+            criterion  VARCHAR(50)  NOT NULL,
+            value_num  DOUBLE PRECISION,
+            value_bool BOOLEAN,
+            value_text VARCHAR(100),
+            is_null    BOOLEAN      NOT NULL DEFAULT FALSE,
+            UNIQUE (study_id, criterion)
+        );
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_study_fact_criterion ON study_fact (criterion);")
 
 
 def _ultima_fecha_global(cur):
@@ -260,7 +303,7 @@ def _chunks(lst, n):
 # PASO 1 — REFRESCO DE VELAS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def refresh_candles(canon_tickers, commit):
+def refresh_candles(canon_tickers, commit, verbose=True):
     conn = _conn(); cur = conn.cursor()
     _ensure_table(cur); conn.commit()
 
@@ -273,7 +316,8 @@ def refresh_candles(canon_tickers, commit):
         start = datetime.datetime(ultima.year, ultima.month, ultima.day) \
                 - datetime.timedelta(days=COLCHON_DIAS)
         modo  = f"INCREMENTAL (desde {start.date()}, ultima en tabla {ultima})"
-    print(f"  modo: {modo}")
+    if verbose:
+        print(f"  modo: {modo}")
 
     all_rows = []
     t0 = time.time()
@@ -284,17 +328,20 @@ def refresh_candles(canon_tickers, commit):
         traidas = sum(len(v) for v in res.values())
         for rows in res.values():
             all_rows.extend(rows)
-        print(f"  batch {i}/{n_batches}: {traidas} velas  ({time.time()-tb:.1f}s)")
+        if verbose:
+            print(f"  batch {i}/{n_batches}: {traidas} velas  ({time.time()-tb:.1f}s)")
 
-    print(f"  fetch: {len(all_rows)} velas en {time.time()-t0:.1f}s")
+    if verbose:
+        print(f"  fetch: {len(all_rows)} velas en {time.time()-t0:.1f}s")
 
     if commit and all_rows:
         tw = time.time()
         _upsert_bulk(cur, all_rows)
         conn.commit()
-        print(f"  ✅ upsert de {len(all_rows)} velas en candle_daily ({time.time()-tw:.1f}s)")
-    elif not commit:
-        print(f"  DRY RUN — no se escribió. Con --commit se hace el upsert.")
+        if verbose:
+            print(f"  ✅ upsert de {len(all_rows)} velas ({time.time()-tw:.1f}s)")
+    elif not commit and verbose:
+        print(f"  DRY RUN — no se escribió (velas).")
 
     counts = _counts_por_ticker(cur, canon_tickers)
     completos   = [t for t in canon_tickers if counts.get(t, 0) >= MIN_VELAS]
@@ -340,6 +387,103 @@ def _ret_pct(closes, n=RS_WINDOW):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# METADATA TT EN BATCH (market_metrics + is_etf)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_METRIC_KEYS = ("iv", "iv_30d", "iv_percentile", "iv_rank", "iv_hv_diff", "beta",
+                "put_call_ratio", "open_interest", "earnings_date", "pe", "eps",
+                "market_cap", "dividend_ex_date", "liquidity_rating")
+
+
+def _parse_metric_obj(m):
+    """MarketMetricInfo -> dict de hechos (mismo parseo que criteria de def)."""
+    if m is None:
+        return {k: None for k in _METRIC_KEYS}
+
+    def pct_to_100(val):
+        if val is None:
+            return None
+        try:
+            f = float(val)
+            return round(f * 100, 1) if f <= 1.0 else round(f, 1)
+        except Exception:
+            return None
+
+    def safe_float(val, mult=1.0, dec=2):
+        if val is None:
+            return None
+        try:
+            return round(float(val) * mult, dec)
+        except (ValueError, TypeError):
+            return None
+
+    earnings_date = None
+    try:
+        if getattr(m, "earnings", None) and getattr(m.earnings, "expected_report_date", None):
+            earnings_date = m.earnings.expected_report_date
+    except Exception:
+        pass
+
+    liq = getattr(m, "liquidity_rating", None)
+    return {
+        "iv":               safe_float(getattr(m, "implied_volatility_index", None), 100.0),
+        "iv_30d":           safe_float(getattr(m, "implied_volatility_30_day", None)),
+        "iv_percentile":    pct_to_100(getattr(m, "implied_volatility_percentile", None)),
+        "iv_rank":          safe_float(getattr(m, "tw_implied_volatility_index_rank", None)),
+        "iv_hv_diff":       safe_float(getattr(m, "iv_hv_30_day_difference", None)),
+        "beta":             safe_float(getattr(m, "beta", None)),
+        "put_call_ratio":   None,
+        "open_interest":    None,
+        "earnings_date":    earnings_date,
+        "pe":               safe_float(getattr(m, "price_earnings_ratio", None)),
+        "eps":              safe_float(getattr(m, "earnings_per_share", None)),
+        "market_cap":       None,
+        "dividend_ex_date": None,
+        "liquidity_rating": int(liq) if liq is not None else None,
+    }
+
+
+async def _fetch_metrics_async(symbols):
+    from tastytrade import Session
+    from tastytrade.metrics import get_market_metrics
+    session = Session(os.getenv("TASTYTRADE_CLIENT_SECRET"), os.getenv("TASTYTRADE_REFRESH_TOKEN"))
+    res = await get_market_metrics(session, symbols)
+    return {getattr(m, "symbol", None): m for m in (res or [])}
+
+
+async def _fetch_etf_async(symbols):
+    from tastytrade import Session
+    from tastytrade.instruments import Equity
+    session = Session(os.getenv("TASTYTRADE_CLIENT_SECRET"), os.getenv("TASTYTRADE_REFRESH_TOKEN"))
+    res = await Equity.get(session, symbols)
+    res = res if isinstance(res, list) else [res]
+    return {getattr(e, "symbol", None): bool(e.is_etf) for e in res}
+
+
+def fetch_metadata(symbols):
+    """
+    {ticker: {"metrics": <dict parseado>, "is_etf": <bool|None>}} para todo el
+    universo, en batches de META_BATCH. Un ticker que no vuelva queda con metrics
+    de None y is_etf None (None honesto).
+    """
+    metrics_obj = {}
+    etf_map     = {}
+    for chunk in _chunks(symbols, META_BATCH):
+        try:
+            metrics_obj.update(asyncio.run(_fetch_metrics_async(chunk)))
+        except Exception as e:
+            print(f"     metrics batch error: {str(e)[:60]}")
+        try:
+            etf_map.update(asyncio.run(_fetch_etf_async(chunk)))
+        except Exception as e:
+            print(f"     equity batch error: {str(e)[:60]}")
+    return {
+        s: {"metrics": _parse_metric_obj(metrics_obj.get(s)), "is_etf": etf_map.get(s)}
+        for s in symbols
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # PASO 2 — HECHOS POR ACCION
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -367,27 +511,25 @@ def _sector_return(cur, sector, sector_map, n=RS_WINDOW):
     return round(sum(rets) / len(rets), 2) if rets else None
 
 
-async def _is_etf_async(canon_ticker):
-    from tastytrade import Session
-    from tastytrade.instruments import Equity
-    session = Session(os.getenv("TASTYTRADE_CLIENT_SECRET"), os.getenv("TASTYTRADE_REFRESH_TOKEN"))
-    res = await Equity.get(session, [canon_ticker])
-    eq  = res[0] if isinstance(res, list) else res
-    return bool(eq.is_etf)
+def _all_sector_returns(cur, sector_map, n=RS_WINDOW):
+    """{sector: ret_25d promedio} computado UNA vez por sector (no por ticker)."""
+    out = {}
+    for sec in set(sector_map.values()):
+        if sec:
+            out[sec] = _sector_return(cur, sec, sector_map, n)
+    return out
 
 
-def get_is_etf(canon_ticker):
-    try:
-        return asyncio.run(_is_etf_async(canon_ticker))
-    except Exception:
-        return None
-
-
-def study_stock(ticker, df, sector=None, ret_spy=None, ret_sector=None):
+def study_stock(ticker, df, sector=None, ret_spy=None, ret_sector=None,
+                tt_metrics=None, is_etf=None):
+    """
+    Hechos por accion. PURO COMPUTO: tt_metrics e is_etf llegan ya resueltos (batch),
+    no se toca la red aca. Simetrico, None honesto. Devuelve (facts, faltantes).
+    """
     from criteria import (
         get_trend_25d, get_moving_averages, get_rsi, get_52_week_position,
         get_support_resistance, get_candlestick_pattern, get_historical_volatility,
-        get_volume, get_volatility_from_tastytrade,
+        get_volume,
     )
 
     closes = df["Close"]
@@ -401,7 +543,6 @@ def study_stock(ticker, df, sector=None, ret_spy=None, ret_sector=None):
         "support_resistance": _try(get_support_resistance, closes, price),
         "candlestick":        _try(get_candlestick_pattern, df),
         "volume":             _try(get_volume, df),
-        "volatility_tt":      _try(get_volatility_from_tastytrade, ticker),
     }
     facts["rsi"]    = _try(get_rsi, closes)
     facts["hv_30d"] = _try(get_historical_volatility, closes)
@@ -412,9 +553,11 @@ def study_stock(ticker, df, sector=None, ret_spy=None, ret_sector=None):
         else:
             facts[g] = None
 
-    tt = grupos["volatility_tt"] if isinstance(grupos["volatility_tt"], dict) else {}
+    # market_metrics ya resueltos (batch)
+    tt = tt_metrics if isinstance(tt_metrics, dict) else _parse_metric_obj(None)
+    facts.update(tt)
     facts["days_to_earnings"] = _days_to(tt.get("earnings_date"))
-    facts["is_etf"]           = get_is_etf(ticker)
+    facts["is_etf"]           = is_etf
 
     ret_stock = _ret_pct(closes, RS_WINDOW)
     facts["rs_vs_spy"]    = round(ret_stock - ret_spy, 2)    if (ret_stock is not None and ret_spy is not None) else None
@@ -429,6 +572,8 @@ def mostrar_facts(ticker):
     sector_map = _try(get_sp500_sectors) or {}
     sector     = sector_map.get(ticker)
 
+    meta = fetch_metadata([ticker]).get(ticker, {})
+
     conn = _conn(); cur = conn.cursor()
     df = _load_df(cur, ticker)
     if df is None:
@@ -439,10 +584,10 @@ def mostrar_facts(ticker):
     ret_sector = _sector_return(cur, sector, sector_map, RS_WINDOW)
     cur.close(); conn.close()
 
-    print(f"  {ticker}: {len(df)} velas  ({df.index[0]} → {df.index[-1]})  "
-          f"sector={sector}  ret_SPY_25d={ret_spy}  ret_sector_25d={ret_sector}")
-
-    facts, faltantes = study_stock(ticker, df, sector, ret_spy, ret_sector)
+    print(f"  {ticker}: {len(df)} velas  sector={sector}  "
+          f"ret_SPY_25d={ret_spy}  ret_sector_25d={ret_sector}")
+    facts, faltantes = study_stock(ticker, df, sector, ret_spy, ret_sector,
+                                   meta.get("metrics"), meta.get("is_etf"))
     print(f"\n  HECHOS ({len(facts)} campos):")
     for k in sorted(facts):
         v = facts[k]
@@ -454,11 +599,10 @@ def mostrar_facts(ticker):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PASO 3 — NIVEL MERCADO (SPY + regimen + VIX)
+# PASO 3 — NIVEL MERCADO
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _vix_facts(cur):
-    """Hechos de VIX desde candle_daily. Claves estables (None honesto si falta VIX)."""
     keys = {"vix_current": None, "vix_avg_5d": None, "vix_avg_10d": None,
             "vix_trend": None, "vix_level": None}
     cur.execute("SELECT close FROM candle_daily WHERE ticker = %s ORDER BY candle_date ASC",
@@ -469,30 +613,19 @@ def _vix_facts(cur):
     current = closes[-1]
     avg_5d  = sum(closes[-5:]) / 5
     avg_10d = sum(closes[-10:]) / 10 if len(closes) >= 10 else None
-
     trend = "FALLING" if current < avg_5d * 0.95 else \
             "RISING"  if current > avg_5d * 1.05 else "STABLE"
     level = "CALM"     if current < VIX_CALM     else \
             "ELEVATED" if current < VIX_ELEVATED else \
             "HIGH"     if current < VIX_FEAR     else "EXTREME"
-
-    keys.update(
-        vix_current=round(current, 2),
-        vix_avg_5d=round(avg_5d, 2),
-        vix_avg_10d=round(avg_10d, 2) if avg_10d is not None else None,
-        vix_trend=trend, vix_level=level,
-    )
+    keys.update(vix_current=round(current, 2), vix_avg_5d=round(avg_5d, 2),
+                vix_avg_10d=round(avg_10d, 2) if avg_10d is not None else None,
+                vix_trend=trend, vix_level=level)
     return keys
 
 
 def study_market(cur):
-    """
-    Bloque de mercado: SPY + regimen + VIX. Todo hecho determinista desde
-    candle_daily, reutilizando criteria.py. SIN score/verdict (van a Seleccion).
-    """
     from criteria import get_moving_averages, get_trend_25d
-
-    facts = {}
 
     df = _load_df(cur, SPY_SYMBOL)
     if df is None:
@@ -502,7 +635,6 @@ def study_market(cur):
     price  = float(closes.iloc[-1])
     ma = _try(get_moving_averages, closes) or {}
     tr = _try(get_trend_25d, closes) or {}
-
     above_50  = ma.get("above_sma50")
     above_200 = ma.get("above_sma200")
     pct_25d   = tr.get("pct_change")
@@ -523,7 +655,7 @@ def study_market(cur):
     else:
         regime = "NEUTRAL"
 
-    facts.update({
+    facts = {
         "spy_price":        round(price, 2),
         "spy_sma50":        ma.get("sma50"),
         "spy_sma200":       ma.get("sma200"),
@@ -533,7 +665,7 @@ def study_market(cur):
         "spy_sma50_dir":    ma.get("sma50_direction"),
         "spy_pct_25d":      pct_25d,
         "regime":           regime,
-    })
+    }
     facts.update(_vix_facts(cur))
     return facts, []
 
@@ -555,15 +687,214 @@ def mostrar_market():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# PASO 4 — PERSISTIR DOSSIER
+# ══════════════════════════════════════════════════════════════════════════════
+
+_HEADER_KEYS = {"ticker", "price", "sector"}
+
+
+def _route(v):
+    if v is None:
+        return (None, None, None, True)
+    if isinstance(v, bool):
+        return (None, v, None, False)
+    if isinstance(v, (int, float)):
+        return (float(v), None, None, False)
+    return (None, None, str(v)[:100], False)
+
+
+def _rows_de_hechos(study_id, facts):
+    rows = []
+    for k, v in facts.items():
+        if k in _HEADER_KEYS:
+            continue
+        num, bl, txt, isnull = _route(v)
+        rows.append((study_id, k, num, bl, txt, isnull))
+    return rows
+
+
+def _print_ruteo(rows):
+    for _sid, crit, num, bl, txt, isnull in sorted(rows, key=lambda r: r[1]):
+        if isnull:
+            col = "is_null=TRUE"
+        elif bl is not None:
+            col = f"value_bool={bl}"
+        elif num is not None:
+            col = f"value_num={num}"
+        else:
+            col = f"value_text={txt!r}"
+        print(f"     {crit:<22} {col}")
+
+
+def persist_study(cur, ticker, facts, regime, slot):
+    from psycopg2.extras import execute_values
+    cur.execute("""
+        INSERT INTO ticker_study (ticker, scan_at, slot, price, sector, regime)
+        VALUES (%s, NOW(), %s, %s, %s, %s) RETURNING id
+    """, (ticker, slot, facts.get("price"), facts.get("sector"), regime))
+    study_id = cur.fetchone()[0]
+    rows = _rows_de_hechos(study_id, facts)
+    execute_values(cur, """
+        INSERT INTO study_fact (study_id, criterion, value_num, value_bool, value_text, is_null)
+        VALUES %s
+    """, rows, page_size=500)
+    return study_id, len(rows)
+
+
+def persistir_estudio(ticker, commit):
+    from universe import get_sp500_sectors
+    sector_map = _try(get_sp500_sectors) or {}
+    sector     = sector_map.get(ticker)
+    meta       = fetch_metadata([ticker]).get(ticker, {})
+
+    conn = _conn(); cur = conn.cursor()
+    _ensure_study_tables(cur); conn.commit()
+    mkt, _ = study_market(cur)
+    regime = mkt.get("regime") if mkt else None
+
+    df = _load_df(cur, ticker)
+    if df is None:
+        cur.close(); conn.close()
+        print(f"  ⛔ {ticker} no esta en candle_daily.")
+        return 1
+    ret_spy    = _spy_return(cur, RS_WINDOW)
+    ret_sector = _sector_return(cur, sector, sector_map, RS_WINDOW)
+    facts, _   = study_stock(ticker, df, sector, ret_spy, ret_sector,
+                             meta.get("metrics"), meta.get("is_etf"))
+
+    rows = _rows_de_hechos(0, facts)
+    print(f"  regime del scan: {regime}   ·   cabecera: ticker={ticker} "
+          f"price={facts.get('price')} sector={sector}")
+    print(f"\n  RUTEO ({len(rows)} hechos -> study_fact):")
+    _print_ruteo(rows)
+
+    if not commit:
+        cur.close(); conn.close()
+        print("\n  DRY RUN — no se escribió.")
+        return 0
+
+    study_id, n = persist_study(cur, ticker, facts, regime, slot="manual")
+    conn.commit()
+    cur.execute("SELECT COUNT(*) FROM study_fact WHERE study_id = %s", (study_id,))
+    n_db = cur.fetchone()[0]
+    cur.close(); conn.close()
+    print(f"\n  ✅ persistido: ticker_study.id={study_id}, {n_db} hechos.")
+    return 0
+
+
+def persistir_mercado(commit):
+    conn = _conn(); cur = conn.cursor()
+    _ensure_study_tables(cur); conn.commit()
+    facts, notas = study_market(cur)
+    if facts is None:
+        cur.close(); conn.close()
+        for n in notas:
+            print(f"  ⛔ {n}")
+        return 1
+    fp = dict(facts)
+    regime = fp.pop("regime", None)
+    fp["price"] = fp.get("spy_price")
+    rows = _rows_de_hechos(0, fp)
+    print(f"  regime del scan: {regime}   ·   cabecera: ticker={MARKET_TICKER} "
+          f"price={fp.get('price')} sector=None")
+    print(f"\n  RUTEO ({len(rows)} hechos -> study_fact):")
+    _print_ruteo(rows)
+    if not commit:
+        cur.close(); conn.close()
+        print("\n  DRY RUN — no se escribió.")
+        return 0
+    study_id, n = persist_study(cur, MARKET_TICKER, fp, regime, slot="manual")
+    conn.commit()
+    cur.execute("SELECT COUNT(*) FROM study_fact WHERE study_id = %s", (study_id,))
+    n_db = cur.fetchone()[0]
+    cur.close(); conn.close()
+    print(f"\n  ✅ persistido mercado: ticker_study.id={study_id}, {n_db} hechos.")
+    return 0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PASO 4c — BARRIDO COMPLETO (1 -> 2 -> 3 -> 4)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def barrer_universo(tickers, commit, slot="scan"):
+    from universe import get_sp500_sectors
+    t_ini = time.time()
+
+    # ── paso 1: refresco ──────────────────────────────────────────────────────
+    print("  [1/4] refresco de velas")
+    completos, incompletos = refresh_candles(tickers, commit, verbose=False)
+    print(f"        completos {len(completos)}/{len(tickers)}, incompletos {len(incompletos)}")
+    if not completos:
+        print("  ⛔ ningun ticker completo — nada que estudiar.")
+        return 1
+
+    # ── metadata TT en batch (para los completos) ─────────────────────────────
+    print(f"  [2/4] metadata TT en batch ({len(completos)} tickers)")
+    tm = time.time()
+    meta = fetch_metadata(completos)
+    print(f"        metrics + is_etf en {time.time()-tm:.1f}s")
+    sector_map = _try(get_sp500_sectors) or {}
+
+    conn = _conn(); cur = conn.cursor()
+    _ensure_study_tables(cur); conn.commit()
+
+    # ── paso 3: nivel mercado (una vez) ───────────────────────────────────────
+    mkt, notas = study_market(cur)
+    if mkt is None:
+        cur.close(); conn.close()
+        for n in notas:
+            print(f"  ⛔ {n}")
+        return 1
+    regime = mkt.get("regime")
+    print(f"  [3/4] mercado: regime={regime}, vix_level={mkt.get('vix_level')}")
+
+    ret_spy        = _spy_return(cur, RS_WINDOW)
+    sector_returns = _all_sector_returns(cur, sector_map, RS_WINDOW)
+
+    # ── paso 2 + 4: por accion ────────────────────────────────────────────────
+    print(f"  [4/4] hechos + persistencia por accion")
+    n_persist = 0
+    tp = time.time()
+    for tk in completos:
+        df = _load_df(cur, tk)
+        if df is None:
+            continue
+        sector = sector_map.get(tk)
+        facts, _ = study_stock(tk, df, sector, ret_spy, sector_returns.get(sector),
+                               meta.get(tk, {}).get("metrics"), meta.get(tk, {}).get("is_etf"))
+        if commit:
+            persist_study(cur, tk, facts, regime, slot)
+            n_persist += 1
+
+    # mercado como fila sintetica
+    if commit:
+        fp = dict(mkt); fp.pop("regime", None); fp["price"] = fp.get("spy_price")
+        persist_study(cur, MARKET_TICKER, fp, regime, slot)
+        conn.commit()
+
+    cur.close(); conn.close()
+    print(f"        {'persistidos '+str(n_persist)+' tickers + mercado' if commit else 'DRY RUN — no se escribió'} "
+          f"({time.time()-tp:.1f}s)")
+    print(f"\n  barrido completo en {time.time()-t_ini:.1f}s")
+    if incompletos:
+        print(f"  (incompletos, sin estudiar: {list(incompletos)[:15]})")
+    return 0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
     p = argparse.ArgumentParser(description="Scanner v2 — Capa de Estudio")
-    p.add_argument("--test", action="store_true", help="lista corta (paso 1)")
-    p.add_argument("--commit", action="store_true", help="escribe en candle_daily (paso 1)")
+    p.add_argument("--test", action="store_true", help="lista corta en vez de las 500")
+    p.add_argument("--commit", action="store_true", help="escribe en la DB")
     p.add_argument("--facts", metavar="TICKER", help="paso 2: hechos de un ticker")
-    p.add_argument("--market", action="store_true", help="paso 3: nivel mercado (SPY + regimen + VIX)")
+    p.add_argument("--market", action="store_true", help="paso 3: nivel mercado")
+    p.add_argument("--persist", metavar="TICKER", help="paso 4a: persiste un ticker")
+    p.add_argument("--persist-market", action="store_true", dest="persist_market",
+                   help="paso 4b: persiste el mercado")
+    p.add_argument("--scan", action="store_true", help="paso 4c: barrido completo (1->2->3->4)")
     a = p.parse_args()
 
     print(f"\n{'═'*55}")
@@ -572,12 +903,40 @@ def main():
     estado_env = "cargado" if _ENV_LOADED else "NO encontrado — usando variables del sistema"
     print(f"  env: {_ENV_PATH}  ({estado_env})")
 
+    if a.scan:
+        faltan = faltan_credenciales(commit=True)
+        if faltan:
+            print(f"  ⛔ faltan variables: {', '.join(faltan)} (revisá {_ENV_PATH})")
+            return 1
+        tickers = get_universe(a.test)
+        if not tickers:
+            print("  ⛔ sin universo — abortando.")
+            return 1
+        print(f"  BARRIDO · {len(tickers)} tickers · {'[COMMIT]' if a.commit else '[dry-run]'}")
+        return barrer_universo(tickers, a.commit)
+
     if a.market:
         if not os.getenv("DATABASE_URL"):
             print(f"  ⛔ falta DATABASE_URL (revisá {_ENV_PATH})")
             return 1
         print("  paso 3 · nivel mercado")
         return mostrar_market()
+
+    if a.persist_market:
+        if not os.getenv("DATABASE_URL"):
+            print(f"  ⛔ falta DATABASE_URL (revisá {_ENV_PATH})")
+            return 1
+        print(f"  paso 4b · persistir mercado  {'[COMMIT]' if a.commit else '[dry-run]'}")
+        return persistir_mercado(a.commit)
+
+    if a.persist:
+        faltan = faltan_credenciales(commit=True)
+        if faltan:
+            print(f"  ⛔ faltan variables: {', '.join(faltan)} (revisá {_ENV_PATH})")
+            return 1
+        canon = yahoo_a_canon(a.persist.upper())
+        print(f"  paso 4a · persistir dossier · {canon}  {'[COMMIT]' if a.commit else '[dry-run]'}")
+        return persistir_estudio(canon, a.commit)
 
     if a.facts:
         faltan = faltan_credenciales(commit=True)
@@ -588,27 +947,24 @@ def main():
         print(f"  paso 2 · hechos por accion · {canon}")
         return mostrar_facts(canon)
 
+    # por defecto: paso 1 (refresco de velas)
     print(f"  paso 1 · refresco de velas  {'[COMMIT]' if a.commit else '[dry-run]'}")
     faltan = faltan_credenciales(a.commit)
     if faltan:
         print(f"  ⛔ faltan variables requeridas: {', '.join(faltan)} (revisá {_ENV_PATH})")
         return 1
-
     tickers = get_universe(a.test)
     if not tickers:
         print("  ⛔ sin universo — abortando.")
         return 1
     print(f"  universo: {len(tickers)} tickers")
-
     completos, incompletos = refresh_candles(tickers, a.commit)
     print(f"\n{'─'*55}")
     print(f"  completos (>= {MIN_VELAS} velas en DB): {len(completos)}/{len(tickers)}")
     print(f"  incompletos: {len(incompletos)}")
     if incompletos:
-        muestra = list(incompletos.items())[:15]
-        print(f"     {muestra}{' ...' if len(incompletos) > 15 else ''}")
+        print(f"     {list(incompletos.items())[:15]}")
     print(f"{'─'*55}")
-    print("\n  [paso 4 de la Capa de Estudio: pendiente]")
     return 0
 
 
