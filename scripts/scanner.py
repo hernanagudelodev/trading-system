@@ -222,6 +222,32 @@ def _load_df(cur, ticker):
     return df
 
 
+def _load_all_dfs(cur, tickers):
+    """
+    UNA sola query -> {ticker: DataFrame OHLCV}. Reemplaza N llamadas a _load_df
+    (una por ticker) en el barrido. Mismo formato de DataFrame que _load_df.
+    """
+    import pandas as pd
+    from collections import defaultdict
+    cur.execute("""
+        SELECT ticker, candle_date, open, high, low, close, volume
+        FROM candle_daily WHERE ticker = ANY(%s)
+        ORDER BY ticker, candle_date ASC
+    """, (tickers,))
+    por_tk = defaultdict(list)
+    for r in cur.fetchall():
+        por_tk[r[0]].append(r[1:])       # (date, o, h, l, c, v)
+
+    out = {}
+    for tk, filas in por_tk.items():
+        df = pd.DataFrame(filas, columns=["date", "Open", "High", "Low", "Close", "Volume"])
+        df = df.set_index("date")
+        for col in ("Open", "High", "Low", "Close", "Volume"):
+            df[col] = df[col].astype(float)
+        out[tk] = df
+    return out
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # FETCH DE CANDLES (DXLink)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -741,6 +767,44 @@ def persist_study(cur, ticker, facts, regime, slot):
     return study_id, len(rows)
 
 
+def persist_studies_batch(cur, items, regime, slot):
+    """
+    Persiste MUCHOS sujetos en 2 statements (para el barrido): todas las cabeceras
+    de un saque, luego todos los hechos de un saque. items: lista de (ticker, facts).
+
+    Emparejamiento por TICKER, no por posicion: RETURNING id,ticker -> {ticker:id}.
+    RETURNING no garantiza el orden de las filas, asi que mapear por posicion
+    cruzaria hechos con el study_id equivocado. El ticker es unico dentro del scan.
+    scan_at/created_at toman DEFAULT NOW(); NOW() es constante en la transaccion,
+    asi que todas las cabeceras del scan comparten el mismo scan_at.
+    """
+    from psycopg2.extras import execute_values
+
+    cabeceras = [
+        (tk, slot, facts.get("price"), facts.get("sector"), regime)
+        for tk, facts in items
+    ]
+    filas = execute_values(cur, """
+        INSERT INTO ticker_study (ticker, slot, price, sector, regime)
+        VALUES %s RETURNING id, ticker
+    """, cabeceras, template="(%s,%s,%s,%s,%s)", page_size=1000, fetch=True)
+
+    id_por_ticker = {tk: sid for sid, tk in filas}
+
+    all_rows = []
+    for tk, facts in items:
+        sid = id_por_ticker.get(tk)
+        if sid is None:
+            continue                      # no deberia pasar (ticker unico en el scan)
+        all_rows.extend(_rows_de_hechos(sid, facts))
+
+    execute_values(cur, """
+        INSERT INTO study_fact (study_id, criterion, value_num, value_bool, value_text, is_null)
+        VALUES %s
+    """, all_rows, page_size=2000)
+    return len(id_por_ticker), len(all_rows)
+
+
 def persistir_estudio(ticker, commit):
     from universe import get_sp500_sectors
     sector_map = _try(get_sp500_sectors) or {}
@@ -853,28 +917,32 @@ def barrer_universo(tickers, commit, slot="scan"):
 
     # ── paso 2 + 4: por accion ────────────────────────────────────────────────
     print(f"  [4/4] hechos + persistencia por accion")
-    n_persist = 0
+    dfs = _load_all_dfs(cur, completos)          # UNA query en vez de N _load_df
     tp = time.time()
+
+    items = []
     for tk in completos:
-        df = _load_df(cur, tk)
+        df = dfs.get(tk)
         if df is None:
             continue
         sector = sector_map.get(tk)
         facts, _ = study_stock(tk, df, sector, ret_spy, sector_returns.get(sector),
                                meta.get(tk, {}).get("metrics"), meta.get(tk, {}).get("is_etf"))
-        if commit:
-            persist_study(cur, tk, facts, regime, slot)
-            n_persist += 1
+        items.append((tk, facts))
 
-    # mercado como fila sintetica
+    # mercado como fila sintetica (un item mas)
+    fp = dict(mkt); fp.pop("regime", None); fp["price"] = fp.get("spy_price")
+    items.append((MARKET_TICKER, fp))
+
     if commit:
-        fp = dict(mkt); fp.pop("regime", None); fp["price"] = fp.get("spy_price")
-        persist_study(cur, MARKET_TICKER, fp, regime, slot)
+        n_suj, n_hechos = persist_studies_batch(cur, items, regime, slot)
         conn.commit()
+        print(f"        persistidos {n_suj} sujetos ({n_suj-1} tickers + mercado), "
+              f"{n_hechos} hechos  ({time.time()-tp:.1f}s)")
+    else:
+        print(f"        DRY RUN — no se escribió ({len(items)} sujetos)  ({time.time()-tp:.1f}s)")
 
     cur.close(); conn.close()
-    print(f"        {'persistidos '+str(n_persist)+' tickers + mercado' if commit else 'DRY RUN — no se escribió'} "
-          f"({time.time()-tp:.1f}s)")
     print(f"\n  barrido completo en {time.time()-t_ini:.1f}s")
     if incompletos:
         print(f"  (incompletos, sin estudiar: {list(incompletos)[:15]})")
