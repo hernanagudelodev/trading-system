@@ -475,6 +475,89 @@ def show_perforation(ticker):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# §5 — SELECCIÓN DE ESTRATEGIA (volatilidad × dirección · espejo bidireccional)
+# ══════════════════════════════════════════════════════════════════════════════
+# estructura = f(volatilidad, dirección). El eje de volatilidad es el de def
+# (agnóstico, mismos umbrales); lo nuevo es cruzarlo con la dirección para el
+# espejo bajista. Fail-closed: sin IV o sin dirección operable -> None (NO el
+# default alcista de def).
+
+def select_strategy(f, stock_dir):
+    """
+    §5: elige la estructura. Espejo:
+        IV >= 60 (vender prima)         : Bull Put Spread  / Bear Call Spread
+        IV < 30 + momentum fuerte       : Long Call        / Long Put
+        IV < 30 sin momentum, o 30-60   : Bull Call Spread / Bear Put Spread
+    Momentum fuerte = beta>1.2 y |trend|>10 y rsi ok. RSI espeja: <65 (alcista,
+    evita sobrecompra) / >35 (bajista, evita sobreventa).
+    Devuelve el nombre de la estructura, o None (fail-closed).
+    """
+    if stock_dir not in ("UPTREND", "DOWNTREND"):
+        return None
+    ivp = f.get("iv_percentile")
+    if ivp is None:
+        return None                                # sin IV no hay estructura (no default de def)
+
+    bull      = (stock_dir == "UPTREND")
+    beta      = f.get("beta") or 0
+    rsi       = f.get("rsi")
+    trend_pct = abs(f.get("pct_change") or 0)
+
+    if ivp >= 60:                                  # IV alta -> vender prima (crédito)
+        return "Bull Put Spread" if bull else "Bear Call Spread"
+
+    if ivp < 30:                                   # IV baja -> long direccional si hay momentum
+        rsi_ok = (rsi is not None and rsi < 65) if bull else (rsi is not None and rsi > 35)
+        if beta > 1.2 and trend_pct > 10 and rsi_ok:
+            return "Long Call" if bull else "Long Put"
+        return "Bull Call Spread" if bull else "Bear Put Spread"
+
+    return "Bull Call Spread" if bull else "Bear Put Spread"   # IV media -> débito vertical
+
+
+def show_strategy():
+    from collections import Counter
+    neutral_factor = get_param_float("neutral_size_factor", 0.5)
+    mode           = get_param_str("dial_mode", "GATE")
+
+    conn = _conn(); cur = conn.cursor()
+    dossier = load_dossier(cur, "scan")
+    regime  = load_regime(cur, "scan")
+    cur.close(); conn.close()
+    if not dossier:
+        print("  no scan dossier. Run the scanner (--scan --commit) first.")
+        return 1
+
+    counts = Counter()
+    examples = {}
+    for tk, f in dossier.items():
+        stock_dir = direction(f)
+        passes, _ = dial(stock_dir, regime, neutral_factor, mode)
+        if not passes:
+            continue                               # solo las que pasan el dial tienen estrategia
+        strat = select_strategy(f, stock_dir)
+        counts[strat] += 1
+        examples.setdefault(strat, []).append(tk)
+
+    total = sum(counts.values())
+    print(f"\n  STRATEGY (§5) — regime={regime} · {total} candidates that pass the dial")
+    bearish = {"Bear Call Spread", "Bear Put Spread", "Long Put"}
+    order = ["Bull Put Spread", "Bear Call Spread", "Long Call", "Long Put",
+             "Bull Call Spread", "Bear Put Spread", None]
+    for strat in order:
+        if strat not in counts:
+            continue
+        tag = "bearish" if strat in bearish else ("fail-closed" if strat is None else "bullish")
+        name = strat if strat else "None"
+        ex = ", ".join(examples[strat][:5])
+        print(f"     {name:<18} {counts[strat]:>3}  [{tag:<11}] {ex}")
+    n_bear = sum(counts.get(s, 0) for s in bearish)
+    n_bull = total - n_bear - counts.get(None, 0)
+    print(f"\n  bidirectional balance: {n_bull} bullish · {n_bear} bearish · {counts.get(None,0)} fail-closed")
+    return 0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -488,6 +571,8 @@ def main():
                    help="§4.3: LLM validates a ticker's direction against external evidence")
     p.add_argument("--perforate", metavar="TICKER",
                    help="§4.4: check whether a blocked counter-trend ticker perforates the Gate")
+    p.add_argument("--strategy", action="store_true",
+                   help="§5: strategy split (bidirectional mirror) over the dial-passing candidates")
     a = p.parse_args()
 
     print(f"\n{'═'*55}")
@@ -508,6 +593,8 @@ def main():
         return show_validation(a.validate.upper())
     if a.perforate:
         return show_perforation(a.perforate.upper())
+    if a.strategy:
+        return show_strategy()
 
     print("  nothing to do — try --direction")
     return 0
