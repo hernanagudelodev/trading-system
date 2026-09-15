@@ -407,6 +407,74 @@ def show_validation(ticker):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# §4.4 — PERFORACIÓN DEL GATE (regla determinista alimentada por el LLM)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def gate_perforation(llm_result, perforation_factor):
+    """
+    §4.4: regla DETERMINISTA que consume el veredicto del LLM (§4.3). Una
+    contra-tendencia bloqueada por el dial (§4.2) perfora el Gate SOLO si se
+    cumplen LAS DOS: conviction == HIGH y un catalizador externo citado
+    (catalyst != NONE). La regla dura de §4.3 ya garantiza EN CÓDIGO que un HIGH
+    sin catalizador es imposible, así que la perforación no se puede falsificar.
+
+    Devuelve (perforates: bool, size_factor: float). Si perfora, entra reducido.
+    """
+    high     = llm_result.get("conviction") == "HIGH"
+    catalyst = llm_result.get("catalyst") not in (None, "NONE", "")
+    if high and catalyst:
+        return (True, perforation_factor)
+    return (False, 0.0)
+
+
+def show_perforation(ticker):
+    perf_factor    = get_param_float("perforation_size_factor", 0.5)
+    neutral_factor = get_param_float("neutral_size_factor", 0.5)
+    mode           = get_param_str("dial_mode", "GATE")
+
+    conn = _conn(); cur = conn.cursor()
+    dossier = load_dossier(cur, "scan")
+    regime  = load_regime(cur, "scan")
+    cur.close(); conn.close()
+    f = dossier.get(ticker)
+    if f is None:
+        print(f"  {ticker} is not in the latest scan.")
+        return 1
+
+    stock_dir = direction(f)
+    print(f"  {ticker}: direction={stock_dir} · regime={regime} · perforation_size_factor={perf_factor}")
+    if stock_dir not in ("UPTREND", "DOWNTREND"):
+        print("  (LATERAL/None — nothing to perforate)")
+        return 0
+
+    # Estado del dial, como contexto (la perforación solo importa cuando bloquea).
+    passes, _ = dial(stock_dir, regime, neutral_factor, mode)
+    print(f"  dial: {'PASSES (with-regime or NEUTRAL)' if passes else 'BLOCKED (counter-trend)'}")
+
+    if not os.getenv("ANTHROPIC_API_KEY"):
+        print(f"  missing ANTHROPIC_API_KEY in {_ENV_PATH}")
+        return 1
+
+    print("  querying LLM validator (with web search)...")
+    r = validate_direction(ticker, stock_dir)
+    print(f"\n  assessment : {r['assessment']}")
+    print(f"  conviction : {r['conviction']}")
+    print(f"  catalyst   : {r['catalyst']}")
+    print(f"  evidence   : {r['evidence']}")
+    if r.get("error"):
+        print(f"  error      : {r['error']}")
+
+    perforates, size = gate_perforation(r, perf_factor)
+    if perforates:
+        print(f"\n  -> gate_perforation: PERFORATES — enters at size {size} (HIGH + external catalyst)")
+    else:
+        print(f"\n  -> gate_perforation: does NOT perforate (needs HIGH + external catalyst)")
+    if passes and perforates:
+        print("     (note: the dial already passes this one; perforation only matters when BLOCKED)")
+    return 0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -418,6 +486,8 @@ def main():
                    help="§4.2: apply the regime dial (GATE mode) over the latest scan")
     p.add_argument("--validate", metavar="TICKER",
                    help="§4.3: LLM validates a ticker's direction against external evidence")
+    p.add_argument("--perforate", metavar="TICKER",
+                   help="§4.4: check whether a blocked counter-trend ticker perforates the Gate")
     a = p.parse_args()
 
     print(f"\n{'═'*55}")
@@ -436,6 +506,8 @@ def main():
         return show_dial()
     if a.validate:
         return show_validation(a.validate.upper())
+    if a.perforate:
+        return show_perforation(a.perforate.upper())
 
     print("  nothing to do — try --direction")
     return 0
