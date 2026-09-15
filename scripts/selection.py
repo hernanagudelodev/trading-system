@@ -48,6 +48,8 @@ _ENV_LOADED = load_dotenv(_ENV_PATH)
 
 MARKET_TICKER = "__MARKET__"
 
+from system_state import get_param_float, get_param_str  # noqa: E402  (path ya seteado arriba)
+
 
 def _conn():
     import psycopg2
@@ -88,6 +90,17 @@ def cargar_dossier(cur, slot="scan"):
     for ticker, crit, num, bl, txt, isnull in cur.fetchall():
         dossier.setdefault(ticker, {})[crit] = _valor(num, bl, txt, isnull)
     return dossier
+
+
+def cargar_regimen(cur, slot="scan"):
+    """Régimen del último scan (está en la cabecera ticker_study, igual en todas las filas)."""
+    cur.execute("""
+        SELECT regime FROM ticker_study
+        WHERE slot = %s AND scan_at = (SELECT MAX(scan_at) FROM ticker_study WHERE slot = %s)
+        LIMIT 1
+    """, (slot, slot))
+    row = cur.fetchone()
+    return row[0] if row else None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -139,6 +152,79 @@ def mostrar_direccion():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# §4.2 — DIAL DE RÉGIMEN (modo GATE · determinista)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def dial(direc, regime, neutral_factor, mode="GATE"):
+    """
+    Cruza la dirección propia (§4.1) con el régimen del scan. Devuelve
+    (pasa: bool, size_factor: float).
+
+    GATE:
+      - régimen a favor de la dirección  -> (True, 1.0)
+      - NEUTRAL con UPTREND o DOWNTREND  -> (True, neutral_factor)  [sizing reducido]
+      - contra-tendencia                 -> (False, 0.0)  [bloqueado; perfora el LLM §4.4]
+      - LATERAL / None (ya filtrados §4.1)-> (False, 0.0)
+
+    Solo GATE está implementado. Otro modo -> falla explícito (no comportamiento raro).
+    """
+    if mode != "GATE":
+        raise NotImplementedError(
+            f"dial_mode={mode!r} no implementado — solo GATE por ahora "
+            f"(MODULA/INFORMACIONAL se activan con evidencia futura)")
+
+    if direc not in ("UPTREND", "DOWNTREND"):
+        return (False, 0.0)                      # LATERAL / None
+    if regime == "BULLISH":
+        return (True, 1.0) if direc == "UPTREND" else (False, 0.0)
+    if regime == "BEARISH":
+        return (True, 1.0) if direc == "DOWNTREND" else (False, 0.0)
+    if regime == "NEUTRAL":
+        return (True, neutral_factor)            # ambas, sizing reducido
+    return (False, 0.0)                           # régimen desconocido -> fail-closed
+
+
+def mostrar_dial():
+    mode           = get_param_str("dial_mode", "GATE")
+    neutral_factor = get_param_float("neutral_size_factor", 0.5)
+
+    conn = _conn(); cur = conn.cursor()
+    dossier = cargar_dossier(cur, "scan")
+    regime  = cargar_regimen(cur, "scan")
+    cur.close(); conn.close()
+    if not dossier:
+        print("  ⛔ no hay dossier de scan. Corré el scanner (--scan --commit) primero.")
+        return 1
+
+    print(f"\n  DIAL (§4.2) — régimen={regime} · modo={mode} · neutral_size_factor={neutral_factor}")
+
+    pleno, reducido, bloqueada, fuera = [], [], [], []
+    try:
+        for tk, f in dossier.items():
+            direc = direccion(f)
+            pasa, factor = dial(direc, regime, neutral_factor, mode)
+            if not pasa:
+                (bloqueada if direc in ("UPTREND", "DOWNTREND") else fuera).append(tk)
+            elif factor >= 1.0:
+                pleno.append(tk)
+            else:
+                reducido.append(tk)
+    except NotImplementedError as e:
+        print(f"  ⛔ {e}")
+        return 1
+
+    total = len(dossier)
+    print(f"\n  de {total} acciones:")
+    print(f"     pasan a favor del régimen (size 1.0)   {len(pleno):>3}")
+    print(f"     pasan en NEUTRAL (size {neutral_factor})           {len(reducido):>3}")
+    print(f"     bloqueadas contra-tendencia (GATE)     {len(bloqueada):>3}")
+    print(f"     fuera por dirección (LATERAL/None)     {len(fuera):>3}")
+    if bloqueada:
+        print(f"\n  ejemplos bloqueadas contra-tendencia: {', '.join(bloqueada[:12])}")
+    return 0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -146,6 +232,8 @@ def main():
     p = argparse.ArgumentParser(description="Capa de Selección v2")
     p.add_argument("--direccion", action="store_true",
                    help="§4.1: reparto de dirección determinista del último scan")
+    p.add_argument("--dial", action="store_true",
+                   help="§4.2: aplica el dial de régimen (modo GATE) sobre el último scan")
     a = p.parse_args()
 
     print(f"\n{'═'*55}")
@@ -160,6 +248,9 @@ def main():
 
     if a.direccion:
         return mostrar_direccion()
+
+    if a.dial:
+        return mostrar_dial()
 
     print("  nada que hacer — probá --direccion")
     return 0
