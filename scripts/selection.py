@@ -52,7 +52,7 @@ _ENV_LOADED = load_dotenv(_ENV_PATH)
 MARKET_TICKER = "__MARKET__"
 AI_MODEL      = "claude-sonnet-4-6"   # mismo modelo que usa def para el LLM
 
-from system_state import get_param_float, get_param_str  # noqa: E402  (path ya seteado arriba)
+from system_state import get_param_float, get_param_str, get_param_int  # noqa: E402  (path ya seteado arriba)
 
 
 def _conn():
@@ -105,6 +105,82 @@ def load_regime(cur, slot="scan"):
     """, (slot, slot))
     row = cur.fetchone()
     return row[0] if row else None
+
+
+def load_market(cur, slot="scan"):
+    """
+    Hechos del bloque de mercado (fila __MARKET__) del último scan: spy_*, vix_*,
+    macro_*. El regime NO está acá (vive en la cabecera; usar load_regime).
+    """
+    cur.execute("""
+        WITH latest AS (SELECT MAX(scan_at) AS m FROM ticker_study WHERE slot = %s)
+        SELECT f.criterion, f.value_num, f.value_bool, f.value_text, f.is_null
+        FROM ticker_study s
+        JOIN study_fact f ON f.study_id = s.id
+        WHERE s.slot = %s AND s.scan_at = (SELECT m FROM latest) AND s.ticker = %s
+    """, (slot, slot, MARKET_TICKER))
+    market = {}
+    for crit, num, bl, txt, is_null in cur.fetchall():
+        market[crit] = _value(num, bl, txt, is_null)
+    return market
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# §3 — GATE MACRO × BETA (determinista · aguas arriba del LLM)
+# ══════════════════════════════════════════════════════════════════════════════
+# Descarta beta alta con un evento macro de alto impacto inminente. Va en CÓDIGO,
+# antes del LLM, a propósito: es un riesgo que no se quiere que el LLM racionalice
+# (el caso "beta 2,25 en día de CPI/FOMC" que el diseño cita). Umbrales del owner
+# en system_state.
+
+def macro_beta_gate(f, macro_next_high_days, beta_threshold, days_threshold):
+    """
+    Devuelve (blocked: bool, reason: str|None).
+    - Sin evento inminente (macro_days None o > days_threshold) -> el gate NO aplica.
+    - Con evento inminente: beta alta -> bloquea; beta desconocida -> bloquea
+      (fail-closed, §3); beta baja -> pasa.
+    """
+    if macro_next_high_days is None or macro_next_high_days > days_threshold:
+        return (False, None)                       # sin evento inminente
+
+    beta = f.get("beta")
+    if beta is None:
+        return (True, f"macro event in {macro_next_high_days}d, beta unknown (fail-closed)")
+    if beta > beta_threshold:
+        return (True, f"beta {beta} > {beta_threshold} with macro event in {macro_next_high_days}d")
+    return (False, None)                           # beta baja -> segura pese al evento
+
+
+def show_macro_gate():
+    beta_th = get_param_float("macro_gate_beta_threshold", 2.0)
+    days_th = get_param_int("macro_gate_days_threshold", 2)
+
+    conn = _conn(); cur = conn.cursor()
+    dossier = load_dossier(cur, "scan")
+    market  = load_market(cur, "scan")
+    cur.close(); conn.close()
+    if not dossier:
+        print("  no scan dossier. Run the scanner (--scan --commit) first.")
+        return 1
+
+    macro_days  = market.get("macro_next_high_days")
+    macro_event = market.get("macro_next_high_event")
+    print(f"\n  MACRO×BETA GATE (§3) — next high-impact event: {macro_event} in {macro_days}d")
+    print(f"  thresholds: beta > {beta_th} · within {days_th}d")
+
+    blocked = []
+    for tk, f in dossier.items():
+        is_blocked, reason = macro_beta_gate(f, macro_days, beta_th, days_th)
+        if is_blocked:
+            blocked.append((tk, f.get("beta"), reason))
+
+    total = len(dossier)
+    print(f"\n  blocked: {len(blocked)}/{total}")
+    for tk, beta, reason in sorted(blocked, key=lambda x: -(x[1] or 0))[:15]:
+        print(f"     {tk:<6} beta={beta}  — {reason}")
+    if not blocked:
+        print("     (none — no high-beta names with an imminent macro event)")
+    return 0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -573,6 +649,8 @@ def main():
                    help="§4.4: check whether a blocked counter-trend ticker perforates the Gate")
     p.add_argument("--strategy", action="store_true",
                    help="§5: strategy split (bidirectional mirror) over the dial-passing candidates")
+    p.add_argument("--macro-gate", action="store_true", dest="macro_gate",
+                   help="§3: macro×beta gate — blocks high-beta names with an imminent macro event")
     a = p.parse_args()
 
     print(f"\n{'═'*55}")
@@ -595,6 +673,8 @@ def main():
         return show_perforation(a.perforate.upper())
     if a.strategy:
         return show_strategy()
+    if a.macro_gate:
+        return show_macro_gate()
 
     print("  nothing to do — try --direction")
     return 0
