@@ -61,9 +61,9 @@ if not _ENV_PATH.is_absolute():
 _ENV_LOADED = load_dotenv(_ENV_PATH)
 
 # ── Parametros ────────────────────────────────────────────────────────────────
-MIN_VELAS        = 250
+MIN_CANDLES        = 250
 DAYS_BACKFILL    = 400
-COLCHON_DIAS     = 7
+CUSHION_DAYS     = 7
 BATCH_SIZE       = 30
 BATCH_DEADLINE_S = 45.0
 QUIET_S          = 3.0
@@ -76,7 +76,7 @@ VIX_FEAR         = 35
 MARKET_TICKER    = "__MARKET__"
 META_BATCH       = 100     # simbolos por llamada batch de metadata (metrics / equity)
 
-TICKERS_PRUEBA = [
+TEST_TICKERS = [
     "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "JPM",
     "V", "JNJ", "WMT", "PG", "XOM", "HD", "CVX", "KO", "PEP", "BAC",
     "DIS", "CSCO", "BRK-B", "BF-B",
@@ -87,32 +87,32 @@ TICKERS_PRUEBA = [
 # NORMALIZACION
 # ══════════════════════════════════════════════════════════════════════════════
 
-def yahoo_a_canon(t):
+def yahoo_to_canon(t):
     return t.replace("-", ".")
 
 
-def canon_a_streamer(t):
+def canon_to_streamer(t):
     return t.replace(".", "/")
 
 
-def get_universe(usar_test):
-    if usar_test:
-        print(f"  fuente: lista de prueba ({len(TICKERS_PRUEBA)} tickers)")
-        raw = list(TICKERS_PRUEBA)
+def get_universe(use_test):
+    if use_test:
+        print(f"  source: test list ({len(TEST_TICKERS)} tickers)")
+        raw = list(TEST_TICKERS)
     else:
         try:
             from universe import get_sp500_tickers
         except Exception as e:
-            print(f"  ⛔ no se pudo importar universe.get_sp500_tickers: {e}")
+            print(f"  ⛔ could not import universe.get_sp500_tickers: {e}")
             return []
         raw = get_sp500_tickers()
         if not raw:
-            print("  ⛔ get_sp500_tickers() devolvió vacio.")
+            print("  ⛔ get_sp500_tickers() returned empty.")
             return []
-    return [yahoo_a_canon(t) for t in raw]
+    return [yahoo_to_canon(t) for t in raw]
 
 
-def faltan_credenciales(commit):
+def missing_credentials(commit):
     req = ["TASTYTRADE_CLIENT_SECRET", "TASTYTRADE_REFRESH_TOKEN"]
     if commit:
         req.append("DATABASE_URL")
@@ -173,12 +173,12 @@ def _ensure_study_tables(cur):
     cur.execute("CREATE INDEX IF NOT EXISTS idx_study_fact_criterion ON study_fact (criterion);")
 
 
-def _ultima_fecha_global(cur):
+def _max_candle_date(cur):
     cur.execute("SELECT MAX(candle_date) FROM candle_daily")
     return cur.fetchone()[0]
 
 
-def _counts_por_ticker(cur, canon_tickers):
+def _counts_by_ticker(cur, canon_tickers):
     cur.execute(
         "SELECT ticker, COUNT(*) FROM candle_daily WHERE ticker = ANY(%s) GROUP BY ticker",
         (canon_tickers,),
@@ -259,12 +259,12 @@ async def _fetch_batch_async(canon_symbols, start_dt):
     cs = os.getenv("TASTYTRADE_CLIENT_SECRET")
     rt = os.getenv("TASTYTRADE_REFRESH_TOKEN")
     if not cs or not rt:
-        print("  ⛔ faltan credenciales de Tastytrade")
+        print("  ⛔ missing Tastytrade credentials")
         return {}
 
     session   = Session(cs, rt)
-    streamers = [canon_a_streamer(s) for s in canon_symbols]
-    canon_de  = {canon_a_streamer(s): s for s in canon_symbols}
+    streamers = [canon_to_streamer(s) for s in canon_symbols]
+    canon_de  = {canon_to_streamer(s): s for s in canon_symbols}
     by_ticker = {s: {} for s in canon_symbols}
 
     async with DXLinkStreamer(session) as streamer:
@@ -314,7 +314,7 @@ def fetch_batch(canon_symbols, start_dt, retries=2, delay=3):
             if res:
                 return res
         except Exception as e:
-            print(f"     batch error intento {attempt+1}/{retries}: {e}")
+            print(f"     batch error attempt {attempt+1}/{retries}: {e}")
         if attempt < retries - 1:
             time.sleep(delay)
     return {t: [] for t in canon_symbols}
@@ -333,17 +333,17 @@ def refresh_candles(canon_tickers, commit, verbose=True):
     conn = _conn(); cur = conn.cursor()
     _ensure_table(cur); conn.commit()
 
-    ultima = _ultima_fecha_global(cur)
+    ultima = _max_candle_date(cur)
     hoy    = datetime.datetime.now()
     if ultima is None:
         start = hoy - datetime.timedelta(days=DAYS_BACKFILL)
-        modo  = f"BACKFILL (tabla vacia, {DAYS_BACKFILL}d)"
+        mode_desc  = f"BACKFILL (tabla vacia, {DAYS_BACKFILL}d)"
     else:
-        start = datetime.datetime(ultima.year, ultima.month, ultima.day) \
-                - datetime.timedelta(days=COLCHON_DIAS)
-        modo  = f"INCREMENTAL (desde {start.date()}, ultima en tabla {ultima})"
+        start = datetime.datetime(ultima.year, ultima.month, ultima.day)\
+                - datetime.timedelta(days=CUSHION_DAYS)
+        mode_desc  = f"INCREMENTAL (desde {start.date()}, ultima en tabla {ultima})"
     if verbose:
-        print(f"  modo: {modo}")
+        print(f"  mode: {mode_desc}")
 
     all_rows = []
     t0 = time.time()
@@ -351,29 +351,29 @@ def refresh_candles(canon_tickers, commit, verbose=True):
     for i, batch in enumerate(_chunks(canon_tickers, BATCH_SIZE), 1):
         tb  = time.time()
         res = fetch_batch(batch, start)
-        traidas = sum(len(v) for v in res.values())
+        fetched = sum(len(v) for v in res.values())
         for rows in res.values():
             all_rows.extend(rows)
         if verbose:
-            print(f"  batch {i}/{n_batches}: {traidas} velas  ({time.time()-tb:.1f}s)")
+            print(f"  batch {i}/{n_batches}: {fetched} candles  ({time.time()-tb:.1f}s)")
 
     if verbose:
-        print(f"  fetch: {len(all_rows)} velas en {time.time()-t0:.1f}s")
+        print(f"  fetch: {len(all_rows)} candles in {time.time()-t0:.1f}s")
 
     if commit and all_rows:
         tw = time.time()
         _upsert_bulk(cur, all_rows)
         conn.commit()
         if verbose:
-            print(f"  ✅ upsert de {len(all_rows)} velas ({time.time()-tw:.1f}s)")
+            print(f"  ✅ upsert of {len(all_rows)} candles ({time.time()-tw:.1f}s)")
     elif not commit and verbose:
-        print(f"  DRY RUN — no se escribió (velas).")
+        print(f"  DRY RUN — nothing written (candles).")
 
-    counts = _counts_por_ticker(cur, canon_tickers)
-    completos   = [t for t in canon_tickers if counts.get(t, 0) >= MIN_VELAS]
-    incompletos = {t: counts.get(t, 0) for t in canon_tickers if counts.get(t, 0) < MIN_VELAS}
+    counts = _counts_by_ticker(cur, canon_tickers)
+    complete   = [t for t in canon_tickers if counts.get(t, 0) >= MIN_CANDLES]
+    incomplete = {t: counts.get(t, 0) for t in canon_tickers if counts.get(t, 0) < MIN_CANDLES}
     cur.close(); conn.close()
-    return completos, incompletos
+    return complete, incomplete
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -562,7 +562,7 @@ def study_stock(ticker, df, sector=None, ret_spy=None, ret_sector=None,
     price  = float(closes.iloc[-1])
     facts  = {"ticker": ticker, "price": round(price, 2), "sector": sector}
 
-    grupos = {
+    groups = {
         "trend_25d":          _try(get_trend_25d, closes),
         "moving_averages":    _try(get_moving_averages, closes),
         "week_52":            _try(get_52_week_position, closes, price),
@@ -573,7 +573,7 @@ def study_stock(ticker, df, sector=None, ret_spy=None, ret_sector=None,
     facts["rsi"]    = _try(get_rsi, closes)
     facts["hv_30d"] = _try(get_historical_volatility, closes)
 
-    for g, v in grupos.items():
+    for g, v in groups.items():
         if isinstance(v, dict):
             facts.update(v)
         else:
@@ -589,11 +589,11 @@ def study_stock(ticker, df, sector=None, ret_spy=None, ret_sector=None,
     facts["rs_vs_spy"]    = round(ret_stock - ret_spy, 2)    if (ret_stock is not None and ret_spy is not None) else None
     facts["rs_vs_sector"] = round(ret_stock - ret_sector, 2) if (ret_stock is not None and ret_sector is not None) else None
 
-    faltantes = [g for g, v in grupos.items() if v is None]
-    return facts, faltantes
+    missing = [g for g, v in groups.items() if v is None]
+    return facts, missing
 
 
-def mostrar_facts(ticker):
+def show_facts(ticker):
     from universe import get_sp500_sectors
     sector_map = _try(get_sp500_sectors) or {}
     sector     = sector_map.get(ticker)
@@ -604,23 +604,23 @@ def mostrar_facts(ticker):
     df = _load_df(cur, ticker)
     if df is None:
         cur.close(); conn.close()
-        print(f"  ⛔ {ticker} no esta en candle_daily. Refrescá primero (paso 1).")
+        print(f"  ⛔ {ticker} not in candle_daily. Refresh first (step 1).")
         return 1
     ret_spy    = _spy_return(cur, RS_WINDOW)
     ret_sector = _sector_return(cur, sector, sector_map, RS_WINDOW)
     cur.close(); conn.close()
 
-    print(f"  {ticker}: {len(df)} velas  sector={sector}  "
+    print(f"  {ticker}: {len(df)} candles  sector={sector}  "
           f"ret_SPY_25d={ret_spy}  ret_sector_25d={ret_sector}")
-    facts, faltantes = study_stock(ticker, df, sector, ret_spy, ret_sector,
+    facts, missing = study_stock(ticker, df, sector, ret_spy, ret_sector,
                                    meta.get("metrics"), meta.get("is_etf"))
-    print(f"\n  HECHOS ({len(facts)} campos):")
+    print(f"\n  FACTS ({len(facts)} fields):")
     for k in sorted(facts):
         v = facts[k]
-        marca = "  ·None" if v is None else ""
-        print(f"     {k:<22} {v}{marca}")
-    if faltantes:
-        print(f"\n  grupos que salieron None: {faltantes}")
+        marker = "  ·None" if v is None else ""
+        print(f"     {k:<22} {v}{marker}")
+    if missing:
+        print(f"\n  groups that came out None: {missing}")
     return 0
 
 
@@ -691,10 +691,10 @@ def _vix_facts(cur):
     current = closes[-1]
     avg_5d  = sum(closes[-5:]) / 5
     avg_10d = sum(closes[-10:]) / 10 if len(closes) >= 10 else None
-    trend = "FALLING" if current < avg_5d * 0.95 else \
+    trend = "FALLING" if current < avg_5d * 0.95 else\
             "RISING"  if current > avg_5d * 1.05 else "STABLE"
-    level = "CALM"     if current < VIX_CALM     else \
-            "ELEVATED" if current < VIX_ELEVATED else \
+    level = "CALM"     if current < VIX_CALM     else\
+            "ELEVATED" if current < VIX_ELEVATED else\
             "HIGH"     if current < VIX_FEAR     else "EXTREME"
     keys.update(vix_current=round(current, 2), vix_avg_5d=round(avg_5d, 2),
                 vix_avg_10d=round(avg_10d, 2) if avg_10d is not None else None,
@@ -726,9 +726,15 @@ def study_market(cur):
     else:
         sma_status = "BELOW BOTH"
 
-    if above_50 and pct_25d is not None and pct_25d > 0:
+    # Regimen por ESTRUCTURA (no por el signo de un solo momentum). Asimetrico a
+    # proposito: BEARISH pide solo estructura bajista (bajo ambas medias, aunque el
+    # movimiento sea gradual); BULLISH pide estructura + momentum. Asi un bajista
+    # lento no se cuela como NEUTRAL y habilita alcistas (beta adversa).
+    if above_50 is None or above_200 is None or pct_25d is None:
+        regime = "NEUTRAL"                                   # fail-safe: sin dato, no asumir tendencia
+    elif above_50 and above_200 and pct_25d > 0:
         regime = "BULLISH"
-    elif (not above_50) and pct_25d is not None and pct_25d < 0:
+    elif (not above_50) and (not above_200):
         regime = "BEARISH"
     else:
         regime = "NEUTRAL"
@@ -751,7 +757,7 @@ def study_market(cur):
     return facts, []
 
 
-def mostrar_market():
+def show_market():
     conn = _conn(); cur = conn.cursor()
     facts, notas = study_market(cur)
     cur.close(); conn.close()
@@ -759,11 +765,11 @@ def mostrar_market():
         for n in notas:
             print(f"  ⛔ {n}")
         return 1
-    print(f"\n  NIVEL MERCADO ({len(facts)} campos):")
+    print(f"\n  MARKET LEVEL ({len(facts)} fields):")
     for k in sorted(facts):
         v = facts[k]
-        marca = "  ·None" if v is None else ""
-        print(f"     {k:<22} {v}{marca}")
+        marker = "  ·None" if v is None else ""
+        print(f"     {k:<22} {v}{marker}")
     return 0
 
 
@@ -784,7 +790,7 @@ def _route(v):
     return (None, None, str(v)[:100], False)
 
 
-def _rows_de_hechos(study_id, facts):
+def _fact_rows(study_id, facts):
     rows = []
     for k, v in facts.items():
         if k in _HEADER_KEYS:
@@ -794,7 +800,7 @@ def _rows_de_hechos(study_id, facts):
     return rows
 
 
-def _print_ruteo(rows):
+def _print_routing(rows):
     for _sid, crit, num, bl, txt, isnull in sorted(rows, key=lambda r: r[1]):
         if isnull:
             col = "is_null=TRUE"
@@ -807,14 +813,14 @@ def _print_ruteo(rows):
         print(f"     {crit:<22} {col}")
 
 
-def persist_study(cur, ticker, facts, regime, slot):
+def write_study(cur, ticker, facts, regime, slot):
     from psycopg2.extras import execute_values
     cur.execute("""
         INSERT INTO ticker_study (ticker, scan_at, slot, price, sector, regime)
         VALUES (%s, NOW(), %s, %s, %s, %s) RETURNING id
     """, (ticker, slot, facts.get("price"), facts.get("sector"), regime))
     study_id = cur.fetchone()[0]
-    rows = _rows_de_hechos(study_id, facts)
+    rows = _fact_rows(study_id, facts)
     execute_values(cur, """
         INSERT INTO study_fact (study_id, criterion, value_num, value_bool, value_text, is_null)
         VALUES %s
@@ -822,7 +828,7 @@ def persist_study(cur, ticker, facts, regime, slot):
     return study_id, len(rows)
 
 
-def persist_studies_batch(cur, items, regime, slot):
+def write_studies_batch(cur, items, regime, slot):
     """
     Persiste MUCHOS sujetos en 2 statements (para el barrido): todas las cabeceras
     de un saque, luego todos los hechos de un saque. items: lista de (ticker, facts).
@@ -835,14 +841,14 @@ def persist_studies_batch(cur, items, regime, slot):
     """
     from psycopg2.extras import execute_values
 
-    cabeceras = [
+    headers = [
         (tk, slot, facts.get("price"), facts.get("sector"), regime)
         for tk, facts in items
     ]
     filas = execute_values(cur, """
         INSERT INTO ticker_study (ticker, slot, price, sector, regime)
         VALUES %s RETURNING id, ticker
-    """, cabeceras, template="(%s,%s,%s,%s,%s)", page_size=1000, fetch=True)
+    """, headers, template="(%s,%s,%s,%s,%s)", page_size=1000, fetch=True)
 
     id_por_ticker = {tk: sid for sid, tk in filas}
 
@@ -851,7 +857,7 @@ def persist_studies_batch(cur, items, regime, slot):
         sid = id_por_ticker.get(tk)
         if sid is None:
             continue                      # no deberia pasar (ticker unico en el scan)
-        all_rows.extend(_rows_de_hechos(sid, facts))
+        all_rows.extend(_fact_rows(sid, facts))
 
     execute_values(cur, """
         INSERT INTO study_fact (study_id, criterion, value_num, value_bool, value_text, is_null)
@@ -860,7 +866,7 @@ def persist_studies_batch(cur, items, regime, slot):
     return len(id_por_ticker), len(all_rows)
 
 
-def persistir_estudio(ticker, commit):
+def persist_stock(ticker, commit):
     from universe import get_sp500_sectors
     sector_map = _try(get_sp500_sectors) or {}
     sector     = sector_map.get(ticker)
@@ -881,27 +887,27 @@ def persistir_estudio(ticker, commit):
     facts, _   = study_stock(ticker, df, sector, ret_spy, ret_sector,
                              meta.get("metrics"), meta.get("is_etf"))
 
-    rows = _rows_de_hechos(0, facts)
-    print(f"  regime del scan: {regime}   ·   cabecera: ticker={ticker} "
+    rows = _fact_rows(0, facts)
+    print(f"  scan regime: {regime}   ·   header: ticker={ticker} "
           f"price={facts.get('price')} sector={sector}")
-    print(f"\n  RUTEO ({len(rows)} hechos -> study_fact):")
-    _print_ruteo(rows)
+    print(f"\n  ROUTING ({len(rows)} facts -> study_fact):")
+    _print_routing(rows)
 
     if not commit:
         cur.close(); conn.close()
-        print("\n  DRY RUN — no se escribió.")
+        print("\n  DRY RUN — nothing written.")
         return 0
 
-    study_id, n = persist_study(cur, ticker, facts, regime, slot="manual")
+    study_id, n = write_study(cur, ticker, facts, regime, slot="manual")
     conn.commit()
     cur.execute("SELECT COUNT(*) FROM study_fact WHERE study_id = %s", (study_id,))
     n_db = cur.fetchone()[0]
     cur.close(); conn.close()
-    print(f"\n  ✅ persistido: ticker_study.id={study_id}, {n_db} hechos.")
+    print(f"\n  ✅ persisted: ticker_study.id={study_id}, {n_db} facts.")
     return 0
 
 
-def persistir_mercado(commit):
+def persist_market(commit):
     conn = _conn(); cur = conn.cursor()
     _ensure_study_tables(cur); conn.commit()
     facts, notas = study_market(cur)
@@ -913,21 +919,21 @@ def persistir_mercado(commit):
     fp = dict(facts)
     regime = fp.pop("regime", None)
     fp["price"] = fp.get("spy_price")
-    rows = _rows_de_hechos(0, fp)
-    print(f"  regime del scan: {regime}   ·   cabecera: ticker={MARKET_TICKER} "
+    rows = _fact_rows(0, fp)
+    print(f"  scan regime: {regime}   ·   header: ticker={MARKET_TICKER} "
           f"price={fp.get('price')} sector=None")
-    print(f"\n  RUTEO ({len(rows)} hechos -> study_fact):")
-    _print_ruteo(rows)
+    print(f"\n  ROUTING ({len(rows)} facts -> study_fact):")
+    _print_routing(rows)
     if not commit:
         cur.close(); conn.close()
-        print("\n  DRY RUN — no se escribió.")
+        print("\n  DRY RUN — nothing written.")
         return 0
-    study_id, n = persist_study(cur, MARKET_TICKER, fp, regime, slot="manual")
+    study_id, n = write_study(cur, MARKET_TICKER, fp, regime, slot="manual")
     conn.commit()
     cur.execute("SELECT COUNT(*) FROM study_fact WHERE study_id = %s", (study_id,))
     n_db = cur.fetchone()[0]
     cur.close(); conn.close()
-    print(f"\n  ✅ persistido mercado: ticker_study.id={study_id}, {n_db} hechos.")
+    print(f"\n  ✅ persisted market: ticker_study.id={study_id}, {n_db} facts.")
     return 0
 
 
@@ -935,23 +941,23 @@ def persistir_mercado(commit):
 # PASO 4c — BARRIDO COMPLETO (1 -> 2 -> 3 -> 4)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def barrer_universo(tickers, commit, slot="scan"):
+def scan_universe(tickers, commit, slot="scan"):
     from universe import get_sp500_sectors
     t_ini = time.time()
 
     # ── paso 1: refresco ──────────────────────────────────────────────────────
-    print("  [1/4] refresco de velas")
-    completos, incompletos = refresh_candles(tickers, commit, verbose=False)
-    print(f"        completos {len(completos)}/{len(tickers)}, incompletos {len(incompletos)}")
-    if not completos:
-        print("  ⛔ ningun ticker completo — nada que estudiar.")
+    print("  [1/4] candle refresh")
+    complete, incomplete = refresh_candles(tickers, commit, verbose=False)
+    print(f"        complete {len(complete)}/{len(tickers)}, incomplete {len(incomplete)}")
+    if not complete:
+        print("  ⛔ no complete ticker — nothing to study.")
         return 1
 
     # ── metadata TT en batch (para los completos) ─────────────────────────────
-    print(f"  [2/4] metadata TT en batch ({len(completos)} tickers)")
+    print(f"  [2/4] TT metadata in batch ({len(complete)} tickers)")
     tm = time.time()
-    meta = fetch_metadata(completos)
-    print(f"        metrics + is_etf en {time.time()-tm:.1f}s")
+    meta = fetch_metadata(complete)
+    print(f"        metrics + is_etf in {time.time()-tm:.1f}s")
     sector_map = _try(get_sp500_sectors) or {}
 
     conn = _conn(); cur = conn.cursor()
@@ -965,18 +971,18 @@ def barrer_universo(tickers, commit, slot="scan"):
             print(f"  ⛔ {n}")
         return 1
     regime = mkt.get("regime")
-    print(f"  [3/4] mercado: regime={regime}, vix_level={mkt.get('vix_level')}")
+    print(f"  [3/4] market: regime={regime}, vix_level={mkt.get('vix_level')}")
 
     ret_spy        = _spy_return(cur, RS_WINDOW)
     sector_returns = _all_sector_returns(cur, sector_map, RS_WINDOW)
 
     # ── paso 2 + 4: por accion ────────────────────────────────────────────────
-    print(f"  [4/4] hechos + persistencia por accion")
-    dfs = _load_all_dfs(cur, completos)          # UNA query en vez de N _load_df
+    print(f"  [4/4] facts + persistence per stock")
+    dfs = _load_all_dfs(cur, complete)          # UNA query en vez de N _load_df
     tp = time.time()
 
     items = []
-    for tk in completos:
+    for tk in complete:
         df = dfs.get(tk)
         if df is None:
             continue
@@ -990,17 +996,17 @@ def barrer_universo(tickers, commit, slot="scan"):
     items.append((MARKET_TICKER, fp))
 
     if commit:
-        n_suj, n_hechos = persist_studies_batch(cur, items, regime, slot)
+        n_subj, n_facts = write_studies_batch(cur, items, regime, slot)
         conn.commit()
-        print(f"        persistidos {n_suj} sujetos ({n_suj-1} tickers + mercado), "
-              f"{n_hechos} hechos  ({time.time()-tp:.1f}s)")
+        print(f"        persisted {n_subj} subjects ({n_subj-1} tickers + market), "
+              f"{n_facts} facts  ({time.time()-tp:.1f}s)")
     else:
-        print(f"        DRY RUN — no se escribió ({len(items)} sujetos)  ({time.time()-tp:.1f}s)")
+        print(f"        DRY RUN — nothing written ({len(items)} subjects)  ({time.time()-tp:.1f}s)")
 
     cur.close(); conn.close()
-    print(f"\n  barrido completo en {time.time()-t_ini:.1f}s")
-    if incompletos:
-        print(f"  (incompletos, sin estudiar: {list(incompletos)[:15]})")
+    print(f"\n  full scan in {time.time()-t_ini:.1f}s")
+    if incomplete:
+        print(f"  (incomplete, not studied: {list(incomplete)[:15]})")
     return 0
 
 
@@ -1009,84 +1015,84 @@ def barrer_universo(tickers, commit, slot="scan"):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    p = argparse.ArgumentParser(description="Scanner v2 — Capa de Estudio")
-    p.add_argument("--test", action="store_true", help="lista corta en vez de las 500")
-    p.add_argument("--commit", action="store_true", help="escribe en la DB")
-    p.add_argument("--facts", metavar="TICKER", help="paso 2: hechos de un ticker")
-    p.add_argument("--market", action="store_true", help="paso 3: nivel mercado")
-    p.add_argument("--persist", metavar="TICKER", help="paso 4a: persiste un ticker")
+    p = argparse.ArgumentParser(description="Scanner v2 — Study layer")
+    p.add_argument("--test", action="store_true", help="short list instead of the 500")
+    p.add_argument("--commit", action="store_true", help="writes to the DB")
+    p.add_argument("--facts", metavar="TICKER", help="step 2: facts of a ticker")
+    p.add_argument("--market", action="store_true", help="step 3: market level")
+    p.add_argument("--persist", metavar="TICKER", help="step 4a: persist a ticker")
     p.add_argument("--persist-market", action="store_true", dest="persist_market",
-                   help="paso 4b: persiste el mercado")
-    p.add_argument("--scan", action="store_true", help="paso 4c: barrido completo (1->2->3->4)")
+                   help="step 4b: persist the market")
+    p.add_argument("--scan", action="store_true", help="step 4c: full scan (1->2->3->4)")
     a = p.parse_args()
 
     print(f"\n{'═'*55}")
-    print(f"  SCANNER v2 · CAPA DE ESTUDIO")
+    print(f"  SCANNER v2 · STUDY LAYER")
     print(f"{'═'*55}")
-    estado_env = "cargado" if _ENV_LOADED else "NO encontrado — usando variables del sistema"
-    print(f"  env: {_ENV_PATH}  ({estado_env})")
+    env_state = "loaded" if _ENV_LOADED else "NOT found — using system env vars"
+    print(f"  env: {_ENV_PATH}  ({env_state})")
 
     if a.scan:
-        faltan = faltan_credenciales(commit=True)
-        if faltan:
-            print(f"  ⛔ faltan variables: {', '.join(faltan)} (revisá {_ENV_PATH})")
+        missing_vars = missing_credentials(commit=True)
+        if missing_vars:
+            print(f"  ⛔ missing variables: {', '.join(missing_vars)} (check {_ENV_PATH})")
             return 1
         tickers = get_universe(a.test)
         if not tickers:
-            print("  ⛔ sin universo — abortando.")
+            print("  ⛔ no universe — aborting.")
             return 1
-        print(f"  BARRIDO · {len(tickers)} tickers · {'[COMMIT]' if a.commit else '[dry-run]'}")
-        return barrer_universo(tickers, a.commit)
+        print(f"  SCAN · {len(tickers)} tickers · {'[COMMIT]' if a.commit else '[dry-run]'}")
+        return scan_universe(tickers, a.commit)
 
     if a.market:
         if not os.getenv("DATABASE_URL"):
-            print(f"  ⛔ falta DATABASE_URL (revisá {_ENV_PATH})")
+            print(f"  ⛔ missing DATABASE_URL (check {_ENV_PATH})")
             return 1
-        print("  paso 3 · nivel mercado")
-        return mostrar_market()
+        print("  step 3 · market level")
+        return show_market()
 
     if a.persist_market:
         if not os.getenv("DATABASE_URL"):
-            print(f"  ⛔ falta DATABASE_URL (revisá {_ENV_PATH})")
+            print(f"  ⛔ missing DATABASE_URL (check {_ENV_PATH})")
             return 1
-        print(f"  paso 4b · persistir mercado  {'[COMMIT]' if a.commit else '[dry-run]'}")
-        return persistir_mercado(a.commit)
+        print(f"  step 4b · persist market  {'[COMMIT]' if a.commit else '[dry-run]'}")
+        return persist_market(a.commit)
 
     if a.persist:
-        faltan = faltan_credenciales(commit=True)
-        if faltan:
-            print(f"  ⛔ faltan variables: {', '.join(faltan)} (revisá {_ENV_PATH})")
+        missing_vars = missing_credentials(commit=True)
+        if missing_vars:
+            print(f"  ⛔ missing variables: {', '.join(missing_vars)} (check {_ENV_PATH})")
             return 1
-        canon = yahoo_a_canon(a.persist.upper())
-        print(f"  paso 4a · persistir dossier · {canon}  {'[COMMIT]' if a.commit else '[dry-run]'}")
-        return persistir_estudio(canon, a.commit)
+        canon = yahoo_to_canon(a.persist.upper())
+        print(f"  step 4a · persist dossier · {canon}  {'[COMMIT]' if a.commit else '[dry-run]'}")
+        return persist_stock(canon, a.commit)
 
     if a.facts:
-        faltan = faltan_credenciales(commit=True)
-        if faltan:
-            print(f"  ⛔ faltan variables: {', '.join(faltan)} (revisá {_ENV_PATH})")
+        missing_vars = missing_credentials(commit=True)
+        if missing_vars:
+            print(f"  ⛔ missing variables: {', '.join(missing_vars)} (check {_ENV_PATH})")
             return 1
-        canon = yahoo_a_canon(a.facts.upper())
-        print(f"  paso 2 · hechos por accion · {canon}")
-        return mostrar_facts(canon)
+        canon = yahoo_to_canon(a.facts.upper())
+        print(f"  step 2 · facts per stock · {canon}")
+        return show_facts(canon)
 
     # por defecto: paso 1 (refresco de velas)
-    print(f"  paso 1 · refresco de velas  {'[COMMIT]' if a.commit else '[dry-run]'}")
-    faltan = faltan_credenciales(a.commit)
-    if faltan:
-        print(f"  ⛔ faltan variables requeridas: {', '.join(faltan)} (revisá {_ENV_PATH})")
+    print(f"  step 1 · candle refresh  {'[COMMIT]' if a.commit else '[dry-run]'}")
+    missing_vars = missing_credentials(a.commit)
+    if missing_vars:
+        print(f"  ⛔ missing required variables: {', '.join(missing_vars)} (check {_ENV_PATH})")
         return 1
     tickers = get_universe(a.test)
     if not tickers:
-        print("  ⛔ sin universo — abortando.")
+        print("  ⛔ no universe — aborting.")
         return 1
-    print(f"  universo: {len(tickers)} tickers")
-    completos, incompletos = refresh_candles(tickers, a.commit)
+    print(f"  universe: {len(tickers)} tickers")
+    complete, incomplete = refresh_candles(tickers, a.commit)
     print(f"\n{'─'*55}")
-    print(f"  completos (>= {MIN_VELAS} velas en DB): {len(completos)}/{len(tickers)}")
-    print(f"  incompletos: {len(incompletos)}")
-    if incompletos:
-        print(f"     {list(incompletos.items())[:15]}")
+    print(f"  complete (>= {MIN_CANDLES} candles in DB): {len(complete)}/{len(tickers)}")
+    print(f"  incomplete: {len(incomplete)}")
+    if incomplete:
+        print(f"     {list(incomplete.items())[:15]}")
     print(f"{'─'*55}")
     return 0
 

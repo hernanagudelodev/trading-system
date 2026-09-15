@@ -92,7 +92,7 @@ def get_sp500_tickers():
         print(f"  Wikipedia failed: {e}")
 
     # Ambas fuentes cayeron: sin universo. Devuelve [] -> el scan falla ruidoso.
-    print("  ⛔ no se pudo obtener el universo (GitHub y Wikipedia fallaron).")
+    print("  ⛔ could not fetch the universe (GitHub and Wikipedia both failed).")
     return []
 
 
@@ -274,12 +274,6 @@ def get_scanner_candidates():
     return candidates
 
 
-if __name__ == "__main__":
-    # Test the pipeline
-    candidates = get_scanner_candidates()
-    print(f"\n  Candidates for full scan: {len(candidates)}")
-    print(f"  {', '.join(candidates[:30])}{'...' if len(candidates) > 30 else ''}")
-
 def get_sp500_sectors():
     """
     {symbol_canonico(punto): 'GICS Sector'} desde el mismo CSV de constituents.
@@ -300,8 +294,15 @@ def get_sp500_sectors():
             if sym:
                 m[sym] = sec or None
         if m:
-            print(f"  sectores S&P 500: {len(m)}")
+            print(f"  S&P 500 sectors: {len(m)}")
             return m
     except Exception as e:
         print(f"  sector CSV failed: {e}")
     return {}
+
+
+if __name__ == "__main__":
+    # Test the pipeline
+    candidates = get_scanner_candidates()
+    print(f"\n  Candidates for full scan: {len(candidates)}")
+    print(f"  {', '.join(candidates[:30])}{'...' if len(candidates) > 30 else ''}")

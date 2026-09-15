@@ -62,7 +62,7 @@ def init_table():
     conn = _conn(); cur = conn.cursor()
     ensure_table(cur)
     conn.commit(); cur.close(); conn.close()
-    print("  system_state lista (creada o ya existía).")
+    print("  system_state ready (created or already existed).")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -147,17 +147,17 @@ def list_params():
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    p = argparse.ArgumentParser(description="Administra system_state (parámetros de política)")
+    p = argparse.ArgumentParser(description="Manage system_state (policy parameters)")
     g = p.add_mutually_exclusive_group(required=True)
-    g.add_argument("--init", action="store_true", help="crea la tabla si no existe")
-    g.add_argument("--list", action="store_true", help="muestra todos los parámetros")
-    g.add_argument("--get", metavar="KEY", help="muestra un parámetro")
-    g.add_argument("--set", nargs=2, metavar=("KEY", "VALUE"), help="fija un parámetro")
-    g.add_argument("--del", dest="delete", metavar="KEY", help="borra un parámetro")
+    g.add_argument("--init", action="store_true", help="create the table if it does not exist")
+    g.add_argument("--list", action="store_true", help="show all parameters")
+    g.add_argument("--get", metavar="KEY", help="show one parameter")
+    g.add_argument("--set", nargs=2, metavar=("KEY", "VALUE"), help="set one parameter")
+    g.add_argument("--del", dest="delete", metavar="KEY", help="delete one parameter")
     a = p.parse_args()
 
     if not os.getenv("DATABASE_URL"):
-        print(f"  ⛔ falta DATABASE_URL (revisá {_ENV_PATH})")
+        print(f"  missing DATABASE_URL (check {_ENV_PATH})")
         return 1
 
     if a.init:
@@ -165,20 +165,20 @@ def main():
     elif a.list:
         rows = list_params()
         if not rows:
-            print("  (sin parámetros — la tabla está vacía; el código usa defaults)")
+            print("  (no parameters — table is empty; code uses defaults)")
         else:
             print(f"\n  {'key':<28} {'value':<12} updated_at")
             for k, v, ts in rows:
                 print(f"  {k:<28} {v:<12} {ts}")
     elif a.get:
         v = get_param(a.get)
-        print(f"  {a.get} = {v!r}" if v is not None else f"  {a.get}: (no está — el código usa su default)")
+        print(f"  {a.get} = {v!r}" if v is not None else f"  {a.get}: (not set — code uses its default)")
     elif a.set:
         set_param(a.set[0], a.set[1])
         print(f"  ✅ {a.set[0]} = {a.set[1]}")
     elif a.delete:
         n = delete_param(a.delete)
-        print(f"  borrado: {a.delete} (filas: {n})")
+        print(f"  deleted: {a.delete} (rows: {n})")
     return 0
 
 
