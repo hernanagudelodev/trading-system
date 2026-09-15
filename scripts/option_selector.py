@@ -353,9 +353,12 @@ async def _fetch_option_data(session, ticker, price, strategy):
         strike_table.sort(key=lambda x: x["strike"])
 
         # Build strategy-specific candidates
-        long_calls  = []
-        spreads     = []
-        put_spreads = []
+        long_calls        = []
+        spreads           = []
+        put_spreads       = []
+        long_puts         = []
+        bear_call_spreads = []
+        bear_put_spreads  = []
 
         if strategy == "Long Call":
             long_calls = _build_long_calls(strike_table, price)
@@ -364,11 +367,20 @@ async def _fetch_option_data(session, ticker, price, strategy):
             spreads    = _build_call_spreads(strike_table, price, ticker)
         elif strategy == "Bull Put Spread":
             put_spreads = _build_put_spreads(strike_table, price, ticker)
+        elif strategy == "Long Put":
+            long_puts = _build_long_puts(strike_table, price)
+        elif strategy == "Bear Put Spread":
+            bear_put_spreads = _build_bear_put_spreads(strike_table, price, ticker)
+        elif strategy == "Bear Call Spread":
+            bear_call_spreads = _build_bear_call_spreads(strike_table, price, ticker)
 
         return {
-            "long_calls":  long_calls,
-            "spreads":     spreads,
-            "put_spreads": put_spreads,
+            "long_calls":        long_calls,
+            "spreads":           spreads,
+            "put_spreads":       put_spreads,
+            "long_puts":         long_puts,
+            "bear_call_spreads": bear_call_spreads,
+            "bear_put_spreads":  bear_put_spreads,
             "exp_date":    exp_date,
             "dte":         dte_selected,
             "strategy":    strategy,
@@ -695,6 +707,179 @@ def _build_put_spreads(strike_table, price, ticker=""):
     # Sort: best R/R first
     put_spreads.sort(key=lambda x: -x["risk_reward"])
     return put_spreads[:MAX_SPREADS]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BUILDERS BAJISTAS (espejo · misma valuacion/gates/liquidez que los alcistas)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _build_bear_put_spreads(strike_table, price, ticker=""):
+    """
+    Bear Put Spread (debito, puts) — espejo de _build_call_spreads (familia debito).
+        Compra put ALTO (long, mas ATM, |delta| 0.50-0.70) — gana si baja
+        Vende put BAJO (short, mas OTM, |delta| 0.20-0.40) — limita el costo
+        long_strike > short_strike. Breakeven = long_strike - debito (put: abajo).
+    Puts: delta negativo -> se compara abs(delta). Gate R/R >= MIN_RR_DEBIT, liquidez debito.
+    """
+    max_risk    = max_risk_dollars()
+    long_cands  = [s for s in strike_table
+                   if SPREAD_LONG_DELTA_RANGE[0] <= abs(s["delta"]) <= SPREAD_LONG_DELTA_RANGE[1]]
+    short_cands = [s for s in strike_table
+                   if SPREAD_SHORT_DELTA_RANGE[0] <= abs(s["delta"]) <= SPREAD_SHORT_DELTA_RANGE[1]]
+
+    spreads   = []
+    descartes = []
+    for long_leg in long_cands:          # put comprado (strike ALTO)
+        for short_leg in short_cands:    # put vendido (strike BAJO)
+            if short_leg["strike"] >= long_leg["strike"]:
+                continue                 # el long put debe tener el strike MAS ALTO
+            spread_width = long_leg["strike"] - short_leg["strike"]
+            if spread_width < MIN_SPREAD_WIDTH or spread_width > price * 0.15:
+                continue
+            net_debit = round(long_leg["mid"] - short_leg["mid"], 2)
+            if net_debit <= 0:
+                continue
+            max_profit    = round((spread_width - net_debit) * 100, 0)
+            max_loss      = round(net_debit * 100, 0)
+            breakeven     = round(long_leg["strike"] - net_debit, 2)     # put: breakeven ABAJO
+            breakeven_pct = round((breakeven - price) / price * 100, 2)
+            rr            = round(max_profit / max_loss, 2) if max_loss > 0 else 0
+            if max_loss > max_risk:
+                continue
+            if rr < MIN_RR_DEBIT:
+                continue
+            liq_ok, liq = spread_liquidity(long_leg, short_leg, spread_width, is_credit=False)
+            if not liq_ok:
+                descartes.append(f"${long_leg['strike']:.1f}/${short_leg['strike']:.1f}: {liq['motivo']}")
+                continue
+            spreads.append({
+                "bid_ask":     liq["bid_ask"],
+                "bid_ask_pct": round(liq["bid_ask_pct"] * 100, 1),
+                "mark":        liq["mark"],
+                "long_strike":   long_leg["strike"],
+                "short_strike":  short_leg["strike"],
+                "long_delta":    round(long_leg["delta"], 3),
+                "short_delta":   round(short_leg["delta"], 3),
+                "net_debit":     net_debit,
+                "cost_total":    max_loss,
+                "max_profit":    max_profit,
+                "max_loss":      max_loss,
+                "breakeven":     breakeven,
+                "breakeven_pct": breakeven_pct,
+                "risk_reward":   rr,
+                "profit_50":     round(max_profit * 0.50, 0),
+                "profit_70":     round(max_profit * 0.70, 0),
+                "within_budget": True,
+            })
+    _report_descartes(ticker, "Bear Put Spread", descartes, len(spreads))
+    spreads.sort(key=lambda x: (not x["within_budget"], -x["risk_reward"]))
+    return spreads[:MAX_SPREADS]
+
+
+def _build_bear_call_spreads(strike_table, price, ticker=""):
+    """
+    Bear Call Spread (credito, calls) — espejo de _build_put_spreads (familia credito).
+        Vende call BAJO (short, OTM arriba, delta 0.25-0.45) — cobra prima
+        Compra call ALTO (long, mas OTM, delta 0.10-0.25) — limita el riesgo
+        Ambos > price (OTM). short_strike < long_strike. Breakeven = short + credito.
+        POP ~ 1 - abs(short_delta). Gate POP >= MIN_POP_CREDIT, liquidez credito.
+    """
+    max_risk    = max_risk_dollars()
+    short_cands = [s for s in strike_table
+                   if PUT_SHORT_DELTA_RANGE[0] <= abs(s["delta"]) <= PUT_SHORT_DELTA_RANGE[1]
+                   and s["strike"] > price]     # call OTM (arriba del precio)
+    long_cands  = [s for s in strike_table
+                   if PUT_LONG_DELTA_RANGE[0] <= abs(s["delta"]) <= PUT_LONG_DELTA_RANGE[1]
+                   and s["strike"] > price]      # mas OTM
+
+    call_spreads = []
+    descartes    = []
+    for short_leg in short_cands:        # call vendido (strike BAJO)
+        for long_leg in long_cands:      # call comprado (strike ALTO, proteccion)
+            if long_leg["strike"] <= short_leg["strike"]:
+                continue                 # el long call debe tener el strike MAS ALTO
+            spread_width = long_leg["strike"] - short_leg["strike"]
+            if spread_width < MIN_SPREAD_WIDTH or spread_width > price * 0.12:
+                continue
+            net_credit = round(short_leg["mid"] - long_leg["mid"], 2)
+            if net_credit <= 0:
+                continue
+            max_profit  = round(net_credit * 100, 0)
+            max_loss    = round((spread_width - net_credit) * 100, 0)
+            breakeven   = round(short_leg["strike"] + net_credit, 2)     # call: breakeven ARRIBA
+            be_pct      = round((breakeven - price) / price * 100, 2)
+            rr          = round(max_profit / max_loss, 2) if max_loss > 0 else 0
+            pop_approx  = round((1 - abs(short_leg["delta"])) * 100, 0)
+            if max_loss > max_risk:
+                continue
+            if pop_approx < MIN_POP_CREDIT:
+                continue
+            liq_ok, liq = spread_liquidity(long_leg, short_leg, spread_width, is_credit=True)
+            if not liq_ok:
+                descartes.append(f"${short_leg['strike']:.1f}/${long_leg['strike']:.1f}: {liq['motivo']}")
+                continue
+            call_spreads.append({
+                "bid_ask":     liq["bid_ask"],
+                "bid_ask_pct": round(liq["bid_ask_pct"] * 100, 1),
+                "mark":        liq["mark"],
+                "short_strike":   short_leg["strike"],
+                "long_strike":    long_leg["strike"],
+                "short_delta":    round(short_leg["delta"], 3),
+                "long_delta":     round(long_leg["delta"], 3),
+                "short_mid":      short_leg["mid"],
+                "long_mid":       long_leg["mid"],
+                "net_credit":     net_credit,
+                "max_profit":     max_profit,
+                "max_loss":       max_loss,
+                "breakeven":      breakeven,
+                "breakeven_pct":  be_pct,
+                "risk_reward":    rr,
+                "pop_approx":     pop_approx,
+                "stop_loss_2x":   round(net_credit * 2 * 100, 0),
+            })
+    _report_descartes(ticker, "Bear Call Spread", descartes, len(call_spreads))
+    call_spreads.sort(key=lambda x: -x["risk_reward"])
+    return call_spreads[:MAX_SPREADS]
+
+
+def _build_long_puts(strike_table, price):
+    """Long Put — espejo de _build_long_calls. Compra put; breakeven = strike - prima."""
+    results = []
+    max_risk = max_risk_dollars()
+    for s in strike_table:
+        delta = s["delta"]
+        if not (DELTA_MIN <= abs(delta) <= DELTA_MAX):
+            continue
+        mid           = s["mid"]
+        breakeven     = round(s["strike"] - mid, 2)          # put: breakeven ABAJO
+        breakeven_pct = round((breakeven - price) / price * 100, 2)
+        premium_total = round(mid * 100, 0)
+        if premium_total > max_risk:
+            continue
+        profit_50     = round(mid * 0.50 * 100, 0)
+        profit_70     = round(mid * 0.70 * 100, 0)
+        ideal         = DELTA_IDEAL_LOW <= abs(delta) <= DELTA_IDEAL_HIGH
+        theta_day     = round(abs(s["theta"]) * 100, 2) if s["theta"] else 0
+        results.append({
+            "strike":        s["strike"],
+            "delta":         round(delta, 3),
+            "bid":           s["bid"],
+            "ask":           s["ask"],
+            "mid":           mid,
+            "iv":            round(s["iv"], 1) if s["iv"] else None,
+            "theta_day":     theta_day,
+            "premium_total": premium_total,
+            "breakeven":     breakeven,
+            "breakeven_pct": breakeven_pct,
+            "profit_50":     profit_50,
+            "profit_70":     profit_70,
+            "ideal_delta":   ideal,
+            "itm":           s["strike"] > price,             # put ITM cuando strike > price
+            "within_budget": True,
+        })
+    results.sort(key=lambda x: (not x["ideal_delta"], abs(x["breakeven_pct"])))
+    return results[:MAX_LONG_CALLS]
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
