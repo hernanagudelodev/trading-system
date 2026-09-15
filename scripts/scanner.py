@@ -628,6 +628,58 @@ def mostrar_facts(ticker):
 # PASO 3 — NIVEL MERCADO
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Fechas FOMC 2026 (calendario fijo). ACTUALIZAR anualmente (mismo dato que def).
+FOMC_DATES_2026 = [
+    datetime.date(2026, 1, 27), datetime.date(2026, 1, 28),
+    datetime.date(2026, 3, 17), datetime.date(2026, 3, 18),
+    datetime.date(2026, 4, 28), datetime.date(2026, 4, 29),
+    datetime.date(2026, 6, 16), datetime.date(2026, 6, 17),
+    datetime.date(2026, 7, 28), datetime.date(2026, 7, 29),
+    datetime.date(2026, 9, 15), datetime.date(2026, 9, 16),
+    datetime.date(2026, 11, 3), datetime.date(2026, 11, 4),
+    datetime.date(2026, 12, 15), datetime.date(2026, 12, 16),
+]
+
+
+def get_macro_events(look_days=7):
+    """
+    Eventos macro programados en la ventana (calendario fijo, sin red). Portado de
+    def market_context.get_macro_events. Lista de dicts: event, date, days_away, impact.
+    """
+    today  = datetime.date.today()
+    events = []
+    for d in range(look_days + 1):
+        check   = today + datetime.timedelta(days=d)
+        day     = check.day
+        weekday = check.weekday()
+        if weekday == 4 and day <= 7:                       # NFP: 1er viernes
+            events.append({"event": "NFP — Non-Farm Payrolls", "date": str(check),
+                           "days_away": d, "impact": "HIGH"})
+        if day in (10, 11, 12) and weekday not in (5, 6):   # CPI: ~10-12
+            events.append({"event": "CPI — Consumer Price Index", "date": str(check),
+                           "days_away": d, "impact": "HIGH"})
+        if day in (14, 15) and weekday not in (5, 6):       # PPI: ~14-15
+            events.append({"event": "PPI — Producer Price Index", "date": str(check),
+                           "days_away": d, "impact": "MEDIUM"})
+        if check in FOMC_DATES_2026:                        # FOMC: lista fija
+            events.append({"event": "FOMC — Fed Meeting", "date": str(check),
+                           "days_away": d, "impact": "VERY_HIGH"})
+    seen, unique = set(), []
+    for e in events:
+        if e["event"] not in seen:
+            seen.add(e["event"]); unique.append(e)
+    return sorted(unique, key=lambda x: x["days_away"])
+
+
+def _macro_next_high(events):
+    """(days_away, nombre) del proximo evento de alto impacto (HIGH/VERY_HIGH), o (None, None)."""
+    altos = [e for e in events if e["impact"] in ("HIGH", "VERY_HIGH")]
+    if not altos:
+        return None, None
+    nxt = min(altos, key=lambda e: e["days_away"])
+    return nxt["days_away"], nxt["event"]
+
+
 def _vix_facts(cur):
     keys = {"vix_current": None, "vix_avg_5d": None, "vix_avg_10d": None,
             "vix_trend": None, "vix_level": None}
@@ -693,6 +745,9 @@ def study_market(cur):
         "regime":           regime,
     }
     facts.update(_vix_facts(cur))
+    d_high, ev_high = _macro_next_high(get_macro_events())
+    facts["macro_next_high_days"]  = d_high      # dias al proximo HIGH/VERY_HIGH, o None
+    facts["macro_next_high_event"] = ev_high     # nombre del evento, o None
     return facts, []
 
 
