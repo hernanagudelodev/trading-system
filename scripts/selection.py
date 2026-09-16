@@ -79,10 +79,11 @@ def load_dossier(cur, slot="scan"):
     """
     {ticker: {criterion: value}} del ÚLTIMO scan (max scan_at para ese slot),
     excluyendo la fila de mercado. Pivotea el formato largo a un dict por acción.
+    Agrega price y sector, que viven en la CABECERA (ticker_study), no en study_fact.
     """
     cur.execute("""
         WITH latest AS (SELECT MAX(scan_at) AS m FROM ticker_study WHERE slot = %s)
-        SELECT s.ticker, f.criterion, f.value_num, f.value_bool, f.value_text, f.is_null
+        SELECT s.id, s.ticker, s.price, s.sector, f.criterion, f.value_num, f.value_bool, f.value_text, f.is_null
         FROM ticker_study s
         JOIN study_fact f ON f.study_id = s.id
         WHERE s.slot = %s
@@ -91,8 +92,13 @@ def load_dossier(cur, slot="scan"):
     """, (slot, slot, MARKET_TICKER))
 
     dossier = {}
-    for ticker, crit, num, bl, txt, is_null in cur.fetchall():
-        dossier.setdefault(ticker, {})[crit] = _value(num, bl, txt, is_null)
+    for study_id, ticker, price, sector, crit, num, bl, txt, is_null in cur.fetchall():
+        d = dossier.setdefault(ticker, {})
+        if "price" not in d:                       # campos de cabecera, una vez por ticker
+            d["price"]      = float(price) if price is not None else None
+            d["sector"]     = sector
+            d["_study_id"]  = study_id             # FK a ticker_study (metadata, no un hecho)
+        d[crit] = _value(num, bl, txt, is_null)
     return dossier
 
 
@@ -123,6 +129,64 @@ def load_market(cur, slot="scan"):
     for crit, num, bl, txt, is_null in cur.fetchall():
         market[crit] = _value(num, bl, txt, is_null)
     return market
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# §2 — OPERABILIDAD (filtro NEUTRAL · nunca por dirección)
+# ══════════════════════════════════════════════════════════════════════════════
+# Descarta lo inoperable: banda de precio, volumen mínimo, liquidez mínima (proxy
+# barato: liquidity_rating de TT). Historial suficiente e higiene (no halted/
+# delisting) YA están garantizados: una acción está en el dossier solo si el
+# scanner la midió con datos frescos. Es el filtro barato que recorta el universo
+# antes de las decisiones caras (cadena de opciones + LLM). Umbrales del owner.
+
+def operability(f, min_price, max_price, min_avg_volume, min_liquidity):
+    """Devuelve (operable: bool, reason: str|None). Fail-closed: dato faltante -> no operable."""
+    price = f.get("price")
+    if price is None or not (min_price <= price <= max_price):
+        return (False, f"price {price} out of band [{min_price}, {max_price}]")
+    vol = f.get("volume_avg_20d")
+    if vol is None or vol < min_avg_volume:
+        return (False, f"avg volume {vol} < {min_avg_volume}")
+    liq = f.get("liquidity_rating")
+    if liq is None or liq < min_liquidity:
+        return (False, f"liquidity_rating {liq} < {min_liquidity}")
+    return (True, None)
+
+
+def show_operability():
+    min_price     = get_param_float("op_min_price", 5.0)
+    max_price     = get_param_float("op_max_price", 2000.0)
+    min_avg_vol   = get_param_float("op_min_avg_volume", 300000.0)
+    min_liquidity = get_param_int("op_min_liquidity_rating", 2)
+
+    conn = _conn(); cur = conn.cursor()
+    dossier = load_dossier(cur, "scan")
+    cur.close(); conn.close()
+    if not dossier:
+        print("  no scan dossier. Run the scanner (--scan --commit) first.")
+        return 1
+
+    print(f"\n  OPERABILITY (§2) — price [{min_price}, {max_price}] · "
+          f"avg_vol >= {min_avg_vol:,.0f} · liquidity_rating >= {min_liquidity}")
+
+    operable = []
+    from collections import Counter
+    reasons = Counter()
+    for tk, f in dossier.items():
+        ok, reason = operability(f, min_price, max_price, min_avg_vol, min_liquidity)
+        if ok:
+            operable.append(tk)
+        else:
+            # agrupa por el tipo de motivo (primera palabra clave)
+            key = reason.split()[0] if reason else "other"
+            reasons[key] += 1
+
+    total = len(dossier)
+    print(f"\n  operable: {len(operable)}/{total}  ·  discarded: {total - len(operable)}")
+    for key, n in reasons.most_common():
+        print(f"     discarded by {key:<12} {n}")
+    return 0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -634,6 +698,167 @@ def show_strategy():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# PIPELINE DE SELECCIÓN (ensamblado: §2 -> §3 -> §4.1 -> §4.2 -> §5)
+# ══════════════════════════════════════════════════════════════════════════════
+# Recorre las 500 del dossier y marca el status de cada una según el PRIMER gate
+# que la frena, en el orden del diseño. Persiste TODAS (extensión del scan) en
+# selection_result: las 'candidate' son la entrega, el resto documenta por qué no.
+# El LLM (§4.3) y los builders (§6) son caros y NO corren acá — actúan después,
+# selectivamente, sobre las candidatas persistidas.
+
+def _ensure_selection_table(cur):
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS selection_result (
+            id             SERIAL PRIMARY KEY,
+            study_id       INTEGER NOT NULL REFERENCES ticker_study(id),
+            ticker         VARCHAR(12) NOT NULL,
+            scan_at        TIMESTAMPTZ NOT NULL,
+            direction      VARCHAR(10),
+            operable       BOOLEAN,
+            macro_blocked  BOOLEAN,
+            dial_passes    BOOLEAN,
+            size_factor    DOUBLE PRECISION,
+            strategy       VARCHAR(30),
+            status         VARCHAR(30) NOT NULL,
+            llm_assessment VARCHAR(10),
+            llm_conviction VARCHAR(10),
+            llm_catalyst   TEXT,
+            created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (study_id)
+        );
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_selection_status ON selection_result (status);")
+
+
+def _scan_at(cur, slot="scan"):
+    cur.execute("SELECT MAX(scan_at) FROM ticker_study WHERE slot = %s", (slot,))
+    return cur.fetchone()[0]
+
+
+def run_selection(dossier, market, regime):
+    """
+    Orquesta las piezas ya validadas. Devuelve la lista de resultados (un dict por
+    acción con study_id, direction, strategy, size_factor, status). No toca la DB.
+    """
+    min_price     = get_param_float("op_min_price", 5.0)
+    max_price     = get_param_float("op_max_price", 2000.0)
+    min_avg_vol   = get_param_float("op_min_avg_volume", 300000.0)
+    min_liquidity = get_param_int("op_min_liquidity_rating", 2)
+    beta_th       = get_param_float("macro_gate_beta_threshold", 2.0)
+    days_th       = get_param_int("macro_gate_days_threshold", 2)
+    neutral_f     = get_param_float("neutral_size_factor", 0.5)
+    mode          = get_param_str("dial_mode", "GATE")
+    macro_days    = market.get("macro_next_high_days")
+
+    results = []
+    for tk, f in dossier.items():
+        r = {"study_id": f.get("_study_id"), "ticker": tk,
+             "direction": None, "operable": None, "macro_blocked": None,
+             "dial_passes": None, "size_factor": None, "strategy": None, "status": None}
+
+        # §2 operabilidad
+        op_ok, _ = operability(f, min_price, max_price, min_avg_vol, min_liquidity)
+        r["operable"] = op_ok
+        if not op_ok:
+            r["status"] = "not_operable"; results.append(r); continue
+
+        # §3 gate macro × beta
+        blocked, _ = macro_beta_gate(f, macro_days, beta_th, days_th)
+        r["macro_blocked"] = blocked
+        if blocked:
+            r["status"] = "macro_blocked"; results.append(r); continue
+
+        # §4.1 dirección
+        d = direction(f)
+        r["direction"] = d if d else "NONE"
+        if d not in ("UPTREND", "DOWNTREND"):
+            r["status"] = "no_direction"; results.append(r); continue
+
+        # §4.2 dial de régimen
+        passes, size = dial(d, regime, neutral_f, mode)
+        r["dial_passes"] = passes
+        r["size_factor"] = size if passes else 0.0
+        if not passes:
+            r["status"] = "blocked_counter_trend"; results.append(r); continue
+
+        # §5 estrategia
+        r["strategy"] = select_strategy(f, d)
+        r["status"]   = "candidate"
+        results.append(r)
+
+    return results
+
+
+def _persist_selection(cur, results, scan_at):
+    """
+    Upsert por study_id (una selección por dossier de acción). Actualiza los campos
+    deterministas; NO toca los llm_* -> el enriquecimiento del LLM sobrevive a un re-run.
+    """
+    from psycopg2.extras import execute_values
+    data = [
+        (r["study_id"], r["ticker"], scan_at, r["direction"], r["operable"],
+         r["macro_blocked"], r["dial_passes"], r["size_factor"], r["strategy"], r["status"])
+        for r in results
+    ]
+    execute_values(cur, """
+        INSERT INTO selection_result
+            (study_id, ticker, scan_at, direction, operable, macro_blocked,
+             dial_passes, size_factor, strategy, status)
+        VALUES %s
+        ON CONFLICT (study_id) DO UPDATE SET
+            scan_at = EXCLUDED.scan_at, direction = EXCLUDED.direction,
+            operable = EXCLUDED.operable, macro_blocked = EXCLUDED.macro_blocked,
+            dial_passes = EXCLUDED.dial_passes, size_factor = EXCLUDED.size_factor,
+            strategy = EXCLUDED.strategy, status = EXCLUDED.status
+    """, data, page_size=1000)
+
+
+def show_selection(commit):
+    from collections import Counter
+    conn = _conn(); cur = conn.cursor()
+    _ensure_selection_table(cur); conn.commit()
+    dossier = load_dossier(cur, "scan")
+    if not dossier:
+        cur.close(); conn.close()
+        print("  no scan dossier. Run the scanner (--scan --commit) first.")
+        return 1
+    market  = load_market(cur, "scan")
+    regime  = load_regime(cur, "scan")
+    scan_at = _scan_at(cur, "scan")
+
+    results = run_selection(dossier, market, regime)
+
+    status_order = ["candidate", "blocked_counter_trend", "no_direction",
+                    "macro_blocked", "not_operable"]
+    counts = Counter(r["status"] for r in results)
+    total  = len(results)
+    print(f"\n  SELECTION PIPELINE — regime={regime} · {total} stocks")
+    for st in status_order:
+        if st in counts:
+            print(f"     {st:<22} {counts[st]:>3}")
+
+    # balance bidireccional de las candidatas (la entrega)
+    cands = [r for r in results if r["status"] == "candidate"]
+    strat = Counter(r["strategy"] for r in cands)
+    bearish = {"Bear Call Spread", "Bear Put Spread", "Long Put"}
+    n_bear = sum(v for s, v in strat.items() if s in bearish)
+    n_bull = len(cands) - n_bear
+    print(f"\n  candidates: {len(cands)}  ·  {n_bull} bullish · {n_bear} bearish")
+    for s, v in strat.most_common():
+        tag = "bearish" if s in bearish else "bullish"
+        print(f"     {s:<18} {v:>3}  [{tag}]")
+
+    if commit:
+        _persist_selection(cur, results, scan_at)
+        conn.commit()
+        print(f"\n  ✅ persisted {total} rows in selection_result (scan_at {scan_at})")
+    else:
+        print(f"\n  DRY RUN — nothing written. With --commit it persists to selection_result.")
+    cur.close(); conn.close()
+    return 0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -651,6 +876,11 @@ def main():
                    help="§5: strategy split (bidirectional mirror) over the dial-passing candidates")
     p.add_argument("--macro-gate", action="store_true", dest="macro_gate",
                    help="§3: macro×beta gate — blocks high-beta names with an imminent macro event")
+    p.add_argument("--operability", action="store_true",
+                   help="§2: operability filter (neutral) — price band, min volume, min liquidity")
+    p.add_argument("--select", action="store_true",
+                   help="run the full deterministic pipeline (§2->§5) over the dossier")
+    p.add_argument("--commit", action="store_true", help="with --select: persist to selection_result")
     a = p.parse_args()
 
     print(f"\n{'═'*55}")
@@ -675,6 +905,10 @@ def main():
         return show_strategy()
     if a.macro_gate:
         return show_macro_gate()
+    if a.operability:
+        return show_operability()
+    if a.select:
+        return show_selection(a.commit)
 
     print("  nothing to do — try --direction")
     return 0
