@@ -251,6 +251,77 @@ def get_single_value(ticker, strike, expiration, option_type="call", retries=3, 
     q = get_single_quote(ticker, strike, expiration, option_type, retries, delay)
     return q["mid"] if q else None
 
+
+async def _fetch_single_delta_async(ticker, strike, expiration, option_type):
+    from tastytrade import Session, DXLinkStreamer
+    from tastytrade.instruments import NestedOptionChain
+    from tastytrade.dxfeed import Greeks
+
+    client_secret = os.getenv("TASTYTRADE_CLIENT_SECRET")
+    refresh_token = os.getenv("TASTYTRADE_REFRESH_TOKEN")
+    if not client_secret or not refresh_token:
+        return None
+
+    session = Session(client_secret, refresh_token)
+    chains  = await NestedOptionChain.get(session, ticker)
+    if not chains:
+        return None
+    chain = chains[0]
+
+    target     = datetime.date.fromisoformat(str(expiration))
+    target_exp = None
+    for exp in chain.expirations:
+        if exp.expiration_date == target:
+            target_exp = exp
+            break
+    if target_exp is None:
+        return None
+
+    leg_obj = None
+    for s in target_exp.strikes:
+        if abs(float(s.strike_price) - strike) < 0.01:
+            leg_obj = s
+            break
+    if not leg_obj:
+        return None
+
+    sym = leg_obj.put_streamer_symbol if option_type == "put" else leg_obj.call_streamer_symbol
+
+    greeks_map = {}
+    async with DXLinkStreamer(session) as streamer:
+        await streamer.subscribe(Greeks, [sym])
+        loop     = asyncio.get_running_loop()
+        deadline = loop.time() + 12
+        while sym not in greeks_map:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            try:
+                g = await asyncio.wait_for(streamer.get_event(Greeks), timeout=remaining)
+                greeks_map[g.event_symbol] = g
+            except asyncio.TimeoutError:
+                break
+
+    g = greeks_map.get(sym)
+    if g is None or g.delta is None:
+        return None
+    return float(g.delta)          # con su signo: call +, put -
+
+
+def get_single_delta(ticker, strike, expiration, option_type="call", retries=3, delay=2):
+    """Delta de UNA opción (call +, put -), o None si no hay dato confiable."""
+    import time as _time
+    for attempt in range(retries):
+        try:
+            res = asyncio.run(_fetch_single_delta_async(ticker, strike, expiration, option_type))
+        except Exception:
+            res = None
+        if res is not None:
+            return res
+        if attempt < retries - 1:
+            _time.sleep(delay)
+    return None
+
 # ══════════════════════════════════════════════════════════════════════════════
 # REST PRICING BY OCC SYMBOL — single source for the monitor
 # ══════════════════════════════════════════════════════════════════════════════
