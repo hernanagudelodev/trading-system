@@ -405,6 +405,10 @@ def ensure_tables():
             tastytrade_symbol_short VARCHAR(50),
             option_type             VARCHAR(10),
             broker                  VARCHAR(20)     DEFAULT 'tastytrade',
+            -- rate-limiting de alertas (Telegram) del monitor
+            last_alert_level        VARCHAR(10),
+            last_alert_at           TIMESTAMP,
+            last_alert_pnl_pct      DECIMAL(10,4),
             -- v2: vinculo de auditoria a la candidata de Seleccion
             selection_id            INTEGER         REFERENCES selection_result(id),
             created_at              TIMESTAMP       DEFAULT NOW()
