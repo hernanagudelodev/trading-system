@@ -95,9 +95,98 @@ def book_net_delta(positions):
     return round(total, 2), incomplete
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# LIBRO REAL — lee las posiciones OPEN de un libro y trae sus deltas frescos
+# ══════════════════════════════════════════════════════════════════════════════
+# Cada gate mide SU libro: paper mide paper_positions, live mide positions. Nunca
+# se mezclan — un delta neto que sume ambos no corresponde a ningún libro real.
+
+_BOOK_TABLE = {"paper": "paper_positions", "live": "positions"}
+
+# familia put (lado) y geometría long/short por estructura.
+_PUT_STRATEGIES = ("Bull Put Spread", "Bear Put Spread", "Long Put")
+_BULL_SPREADS   = ("Bull Call Spread", "Bull Put Spread")   # long = strike bajo
+_LONGS          = ("Long Call", "Long Put")
+
+
+def _legs_of(strategy, strike_low, strike_high):
+    """
+    Deriva (long_strike, short_strike, option_type) de la estructura.
+    - familia put/call por _PUT_STRATEGIES.
+    - alcista: long = strike bajo; bajista: long = strike alto.
+    - long de 1 pata: short_strike = None.
+    """
+    option_type = "put" if strategy in _PUT_STRATEGIES else "call"
+    if strategy in _LONGS:
+        return strike_low, None, option_type          # 1 pata (strike_high viene NULL)
+    if strategy in _BULL_SPREADS:
+        return strike_low, strike_high, option_type    # alcista: long = bajo
+    return strike_high, strike_low, option_type        # bajista: long = alto
+
+
+def build_book(book="paper"):
+    """
+    Lee las posiciones OPEN del libro pedido, trae los deltas frescos de sus patas
+    y devuelve (net_delta, positions, incomplete). Cada posición del resultado
+    lleva su delta calculado. book: 'paper' | 'live'.
+    """
+    import pricing
+    table = _BOOK_TABLE.get(book)
+    if table is None:
+        raise ValueError(f"libro desconocido: {book!r} (usar 'paper' o 'live')")
+
+    conn = _conn(); cur = conn.cursor()
+    cur.execute(f"""
+        SELECT id, ticker, strategy, strike_low, strike_high, expiration, contracts
+        FROM {table}
+        WHERE UPPER(status) = 'OPEN'
+        ORDER BY opened_at
+    """)
+    rows = cur.fetchall()
+    cur.close(); conn.close()
+
+    positions = []
+    for pos_id, ticker, strategy, sl, sh, exp, contracts in rows:
+        sl = float(sl) if sl is not None else None
+        sh = float(sh) if sh is not None else None
+        long_strike, short_strike, opt_type = _legs_of(strategy, sl, sh)
+
+        delta_long  = pricing.get_single_delta(ticker, long_strike, exp, opt_type)
+        delta_short = 0.0 if short_strike is None else \
+                      pricing.get_single_delta(ticker, short_strike, exp, opt_type)
+
+        d = position_delta(delta_long, delta_short, int(contracts))
+        positions.append({
+            "id": pos_id, "ticker": ticker, "strategy": strategy,
+            "contracts": int(contracts), "delta_long": delta_long,
+            "delta_short": delta_short, "position_delta": d,
+        })
+
+    net, incomplete = book_net_delta(positions)
+    return net, positions, incomplete
+
+
+def show_book(book="paper"):
+    net, positions, incomplete = build_book(book)
+    print(f"\n  {book.upper()} BOOK — {len(positions)} open position(s)")
+    for p in positions:
+        d = p["position_delta"]
+        d_str = f"{d:+.2f}" if d is not None else "None (missing delta)"
+        print(f"     {p['ticker']:<6} {p['strategy']:<18} x{p['contracts']}  "
+              f"Δlong={p['delta_long']} Δshort={p['delta_short']}  ->  {d_str}")
+    side = "NET LONG (gana si sube)" if net > 0 else \
+           "NET SHORT (gana si baja)" if net < 0 else "NEUTRAL"
+    print(f"\n  book net delta: {net:+.2f}  ->  {side}")
+    if incomplete:
+        print(f"  ⚠️  {len(incomplete)} position(s) with missing delta — fail-closed for new opens")
+    return 0
+
+
 def main():
     p = argparse.ArgumentParser(description="Portfolio layer v2 (delta, sector, risk gates)")
     p.add_argument("--selftest", action="store_true", help="prueba la matemática del delta neto")
+    p.add_argument("--book", choices=["paper", "live"],
+                   help="delta neto real del libro (paper o live), con deltas frescos de TT")
     a = p.parse_args()
 
     if a.selftest:
@@ -116,6 +205,12 @@ def main():
         if incomplete:
             print(f"  incomplete (missing delta): {len(incomplete)}")
         return 0
+
+    if a.book:
+        if not os.getenv("DATABASE_URL"):
+            print(f"  missing DATABASE_URL (check {_ENV_PATH})")
+            return 1
+        return show_book(a.book)
 
     print("  nothing to do — try --selftest")
     return 0
