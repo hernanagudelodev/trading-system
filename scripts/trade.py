@@ -398,6 +398,7 @@ def ensure_tables():
             price_at_close          DECIMAL(10,2),
             status                  VARCHAR(20)     DEFAULT 'OPEN',
             close_reason            VARCHAR(50),
+            close_rationale         TEXT,
             notes                   TEXT,
             -- columnas que el codigo usa (en def venian por ALTER dispersos)
             tastytrade_symbol       VARCHAR(50),
@@ -1075,7 +1076,7 @@ def cmd_paper_sync():
         contracts   = int(pos["contracts"])
         expiration  = pos["expiration"]
         strategy    = pos.get("strategy", "Bull Call Spread")
-        is_put      = strategy == "Bull Put Spread"
+        is_put      = strategy in ("Bull Put Spread", "Bear Put Spread")   # familia put
         dte         = (expiration - date.today()).days
 
         print(f"  {ticker} ${strike_low}/{strike_high} (DTE: {dte})...", end=" ", flush=True)
@@ -1242,7 +1243,7 @@ def cmd_paper_close(ticker, close_reason="MANUAL", close_rationale=None):
         return False
 
     pos_id, ticker, strategy, sl, sh, exp, total_cost, premium, contracts, last_value = row
-    is_put = strategy == "Bull Put Spread"
+    is_put = strategy in ("Bull Put Spread", "Bear Put Spread")   # familia put
     opt_type = "put" if is_put else "call"
 
     # Se intenta el precio real del mercado. Si NO se consigue (patas iliquidas:
