@@ -224,6 +224,132 @@ def delta_gate(current_net, candidate_delta, regime):
     return (True, None, resulting)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# GATE DE CARTERA (sector + riesgo total + no-apilar · determinista, fail-closed)
+# ══════════════════════════════════════════════════════════════════════════════
+# Reutiliza la lógica de _cartera_gates de def. Mide SU libro. El sector sale del
+# CSV por ticker (get_sp500_sectors), no de una columna. Topes en system_state:
+# max_portfolio_risk_pct, max_sector_risk_pct (deben estar seteados, o revienta).
+
+_SECTORS_CACHE = None
+
+
+def _sectors_map():
+    """{ticker: sector} del CSV de constituents, cacheado por corrida."""
+    global _SECTORS_CACHE
+    if _SECTORS_CACHE is None:
+        from universe import get_sp500_sectors
+        _SECTORS_CACHE = get_sp500_sectors() or {}
+    return _SECTORS_CACHE
+
+
+def read_book_risk(book="paper"):
+    """
+    Lee las posiciones OPEN del libro y agrega el riesgo (position_max_loss) total y
+    por sector. Devuelve (current_risk, sector_risk, open_tickers) o levanta.
+    Un long (strike_high NULL) se valúa con width 0 -> riesgo = prima.
+    """
+    from option_selector import position_max_loss
+    table = _BOOK_TABLE.get(book)
+    if table is None:
+        raise ValueError(f"libro desconocido: {book!r}")
+    sectors = _sectors_map()
+
+    conn = _conn(); cur = conn.cursor()
+    cur.execute(f"""
+        SELECT UPPER(ticker), strike_low, strike_high, premium_paid, contracts
+        FROM {table} WHERE UPPER(status) = 'OPEN'
+    """)
+    rows = cur.fetchall()
+    cur.close(); conn.close()
+
+    current_risk = 0.0
+    sector_risk  = {}
+    open_tickers = set()
+    for tk, sl, sh, prem, contracts in rows:
+        open_tickers.add(tk)
+        sh_val = float(sh) if sh is not None else float(sl)      # long: width 0
+        risk = position_max_loss(float(sl), sh_val, float(prem), int(contracts))
+        current_risk += risk
+        sec = sectors.get(tk, "Other")
+        sector_risk[sec] = sector_risk.get(sec, 0.0) + risk
+    return round(current_risk, 2), sector_risk, open_tickers
+
+
+def cartera_gates(book, ticker, strike_low, strike_high, debit):
+    """
+    Gate determinista de cartera para abrir `ticker` en `book`. Devuelve
+    (allowed: bool, reason: str|None). Fail-closed ante error o dato faltante.
+    Chequea, en orden: DB legible, no apilar ticker, riesgo total, riesgo por sector.
+    """
+    from option_selector import (get_account_nlv, position_max_loss,
+                                  portfolio_risk_pct, max_sector_risk_pct)
+    ticker  = ticker.upper()
+    sectors = _sectors_map()
+
+    # 1. Lectura de cartera (fail-closed si la DB no responde)
+    try:
+        current_risk, sector_risk, open_tickers = read_book_risk(book)
+    except Exception as e:
+        return (False, f"no se pudo leer la cartera ({book}): {e} — no se abre")
+
+    # 2. No apilar el mismo ticker
+    if ticker in open_tickers:
+        return (False, f"{ticker} ya tiene posición abierta — no apilar mismo nombre")
+
+    # Topes desde system_state (revientan si faltan -> fail-closed)
+    try:
+        capital  = get_account_nlv()
+        max_port = capital * portfolio_risk_pct() / 100.0
+        max_sect = capital * max_sector_risk_pct() / 100.0
+    except Exception as e:
+        return (False, f"no se pudieron leer los topes de riesgo: {e} — no se abre")
+
+    new_risk = position_max_loss(strike_low, strike_high, debit)
+
+    # 3. Riesgo total vs NLV
+    if current_risk + new_risk > max_port:
+        return (False, f"riesgo total ${current_risk:,.0f} + ${new_risk:,.0f} > "
+                       f"${max_port:,.0f} (tope cartera)")
+
+    # 4. Riesgo por sector (sector de la candidata desde el CSV; fail-closed si no resuelve)
+    cand_sector = sectors.get(ticker)
+    if cand_sector in (None, "Other", ""):
+        return (False, f"{ticker}: sector no resuelto ({cand_sector!r}) — fail-closed, no se abre")
+    sec_now = sector_risk.get(cand_sector, 0.0)
+    if sec_now + new_risk > max_sect:
+        return (False, f"sector {cand_sector} ${sec_now:,.0f} + ${new_risk:,.0f} > "
+                       f"${max_sect:,.0f} (tope sector)")
+
+    return (True, None)
+
+
+def show_risk(book="paper"):
+    from option_selector import get_account_nlv, portfolio_risk_pct, max_sector_risk_pct
+    try:
+        current_risk, sector_risk, open_tickers = read_book_risk(book)
+    except Exception as e:
+        print(f"  ⛔ {e}")
+        return 1
+    try:
+        capital  = get_account_nlv()
+        max_port = capital * portfolio_risk_pct() / 100.0
+        max_sect = capital * max_sector_risk_pct() / 100.0
+    except Exception as e:
+        print(f"  ⛔ topes no configurados en system_state: {e}")
+        print(f"     setear max_portfolio_risk_pct y max_sector_risk_pct.")
+        return 1
+
+    print(f"\n  {book.upper()} BOOK RISK — NLV ${capital:,.0f}")
+    print(f"  total risk ${current_risk:,.0f} / ${max_port:,.0f} (portfolio cap)")
+    print(f"  open tickers: {', '.join(sorted(open_tickers)) if open_tickers else '(none)'}")
+    if sector_risk:
+        print(f"\n  by sector (cap ${max_sect:,.0f}):")
+        for sec, risk in sorted(sector_risk.items(), key=lambda x: -x[1]):
+            print(f"     {sec:<24} ${risk:,.0f}")
+    return 0
+
+
 def main():
     p = argparse.ArgumentParser(description="Portfolio layer v2 (delta, sector, risk gates)")
     p.add_argument("--selftest", action="store_true", help="prueba la matemática del delta neto")
@@ -231,6 +357,8 @@ def main():
                    help="delta neto real del libro (paper o live), con deltas frescos de TT")
     p.add_argument("--delta-gate", dest="delta_gate", action="store_true",
                    help="prueba el gate de delta neto con casos sintéticos")
+    p.add_argument("--risk", choices=["paper", "live"],
+                   help="estado de riesgo del libro (total + por sector) vs topes")
     a = p.parse_args()
 
     if a.selftest:
@@ -272,6 +400,12 @@ def main():
             extra = "" if allowed else f"  ({reason})"
             print(f"     {desc:<28} net {cur_net:+.0f} + {cand:+.0f} = {resulting:+.0f}  -> {tag}{extra}")
         return 0
+
+    if a.risk:
+        if not os.getenv("DATABASE_URL"):
+            print(f"  missing DATABASE_URL (check {_ENV_PATH})")
+            return 1
+        return show_risk(a.risk)
 
     print("  nothing to do — try --selftest")
     return 0
