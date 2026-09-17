@@ -1040,6 +1040,83 @@ def cmd_paper_buy(ticker, strike_low, strike_high, expiration_str, debit,
     print()
 
 
+def cmd_paper_buy_single(ticker, strike, expiration_str, premium,
+                         strategy, notes=None, context_json=None, rationale=None,
+                         price_at_open=0.0, selection_id=None):
+    """
+    Registra un LONG de 1 pata en paper (Long Call / Long Put). strike_high queda
+    NULL: esa es la señal de "1 pata" que el sync/close usan para pricear con
+    get_single_value (una opción) en vez de get_spread_value (dos patas).
+
+    premium: prima pagada por la opción (débito positivo). max_loss = la prima.
+    Long Call: ganancia teóricamente ilimitada. Long Put: hasta strike - prima.
+    """
+    ensure_tables()
+
+    try:
+        expiration = datetime.strptime(expiration_str, "%Y-%m-%d").date()
+    except ValueError:
+        print(f"  ERROR: invalid expiration format '{expiration_str}' — use YYYY-MM-DD")
+        return
+    if strategy not in ("Long Call", "Long Put"):
+        print(f"  ERROR: cmd_paper_buy_single solo maneja longs, no '{strategy}'")
+        return
+
+    is_put      = strategy == "Long Put"
+    option_type = "put" if is_put else "call"
+    total_cost  = round(premium * 100, 2)
+    max_loss    = total_cost                                    # el long pierde la prima
+    if is_put:
+        breakeven  = round(strike - premium, 2)
+        max_profit = round((strike - premium) * 100, 2)
+        econ = f"Prima: ${premium:.2f}. Max loss: -${max_loss:.2f}. Max profit: ${max_profit:.2f} (BE ${breakeven})."
+    else:
+        breakeven  = round(strike + premium, 2)
+        econ = f"Prima: ${premium:.2f}. Max loss: -${max_loss:.2f}. Max profit: ilimitado (BE ${breakeven})."
+
+    auto_notes = f"Paper trade — {strategy} ${strike} exp {expiration}. {econ}"
+    if notes:
+        auto_notes += f" | {notes}"
+
+    sym = build_occ_symbol(ticker, expiration, option_type, strike)
+
+    conn = get_db_connection(); cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO paper_positions
+            (ticker, strategy, strike_low, strike_high, contracts,
+             expiration, premium_paid, total_cost, price_at_open,
+             status, opened_at, notes,
+             tastytrade_symbol, tastytrade_symbol_short, option_type, selection_id)
+        VALUES (%s, %s, %s, NULL, 1, %s, %s, %s, %s, 'OPEN', NOW(), %s,
+                %s, NULL, %s, %s)
+        RETURNING id
+    """, (
+        ticker, strategy, strike,
+        expiration, premium, total_cost,
+        float(price_at_open or 0.0),
+        auto_notes, sym, option_type, selection_id,
+    ))
+    pos_id = cur.fetchone()[0]
+    conn.commit(); cur.close(); conn.close()
+
+    print(f"\n  ✅ Paper position opened ({strategy}):")
+    print(f"     {ticker} {strategy} ${strike}")
+    print(f"     Exp: {expiration} | {econ}")
+    print(f"     DB id: {pos_id}")
+
+    if context_json is None:
+        context_json = _read_context_from_reports(ticker)
+        if context_json:
+            print(f"     Context auto-loaded from reports ✅")
+    if isinstance(context_json, dict):
+        context_json["strategy"] = strategy
+    if context_json or rationale:
+        ctx_id = save_trade_context(paper_position_id=pos_id, context_json=context_json, rationale=rationale)
+        if ctx_id:
+            print(f"     Context saved (id: {ctx_id}) ✅")
+    print()
+
+
 def cmd_paper_sync():
     """Update P&L of all open paper positions using real Tastytrade prices."""
     ensure_tables()
@@ -1070,41 +1147,52 @@ def cmd_paper_sync():
     for pos in positions:
         ticker      = pos["ticker"]
         strike_low  = float(pos["strike_low"])
-        strike_high = float(pos["strike_high"])
+        raw_high    = pos["strike_high"]
+        is_single   = raw_high is None                          # long de 1 pata
+        strike_high = float(raw_high) if raw_high is not None else None
         total_cost  = float(pos["total_cost"])
         premium     = float(pos["premium_paid"])
         contracts   = int(pos["contracts"])
         expiration  = pos["expiration"]
         strategy    = pos.get("strategy", "Bull Call Spread")
-        is_put      = strategy in ("Bull Put Spread", "Bear Put Spread")   # familia put
+        # lado put/call por familia (incluye el long put)
+        is_put      = strategy in ("Bull Put Spread", "Bear Put Spread", "Long Put")
+        opt_type    = "put" if is_put else "call"
         dte         = (expiration - date.today()).days
 
-        print(f"  {ticker} ${strike_low}/{strike_high} (DTE: {dte})...", end=" ", flush=True)
+        label = f"${strike_low}" if is_single else f"${strike_low}/{strike_high}"
+        print(f"  {ticker} {label} (DTE: {dte})...", end=" ", flush=True)
 
-        opt_type = "put" if is_put else "call"
-        spread_value = fetch_paper_spread_value(ticker, strike_low, strike_high,
+        if is_single:
+            # Long de 1 pata: mark de la opción; P&L = valor actual - prima pagada.
+            import pricing
+            mark = pricing.get_single_value(ticker, strike_low, expiration, opt_type)
+            if mark is None:
+                print("no data")
+                continue
+            leg_value      = mark
+            current_value  = round(mark * 100 * contracts, 2)
+            gross_pnl      = round(current_value - total_cost, 2)
+            pnl_pct        = round(gross_pnl / total_cost * 100, 1) if total_cost else 0
+            profit_pct_max = 0                                  # long: max profit no acotado
+        else:
+            leg_value = fetch_paper_spread_value(ticker, strike_low, strike_high,
                                                  expiration, opt_type)
+            if leg_value is None:
+                print("no data")
+                continue
+            # P&L: fuente ÚNICA en option_selector.spread_pnl.
+            from option_selector import spread_pnl
+            r = spread_pnl(strike_low, strike_high, premium, contracts, leg_value)
+            current_value  = r["current_value"]
+            gross_pnl      = r["gross_pnl"]
+            pnl_pct        = r["pnl_pct"] if r["pnl_pct"] is not None else 0
+            profit_pct_max = r["profit_pct_of_max"] if r["profit_pct_of_max"] is not None else 0
 
-        if spread_value is None:
-            print("no data")
-            continue
+        print(f"value=${leg_value:.2f} | P&L ${gross_pnl:+.2f} ({pnl_pct:+.1f}%)")
 
-        # P&L: fuente ÚNICA en option_selector.spread_pnl. Era la TERCERA copia
-        # de esta matemática (con cmd_paper_close y run_paper_monitor).
-        from option_selector import spread_pnl
-        r = spread_pnl(strike_low, strike_high, premium, contracts, spread_value)
-
-        max_profit     = r["max_profit"]
-        current_value  = r["current_value"]
-        gross_pnl      = r["gross_pnl"]
-        pnl_pct        = r["pnl_pct"] if r["pnl_pct"] is not None else 0
-        profit_pct_max = r["profit_pct_of_max"] if r["profit_pct_of_max"] is not None else 0
-
-        print(f"spread=${spread_value:.2f} | P&L ${gross_pnl:+.2f} ({pnl_pct:+.1f}%)")
-
-        # NOTA: el cierre por stop/target/DTE lo hace AHORA el worker
-        # (run_paper_monitor, intradía). Aquí solo se actualiza P&L para el
-        # reporte del auto_run — para no tener dos procesos cerrando la misma fila.
+        # NOTA: el cierre por stop/target/DTE lo hace el worker (run_paper_monitor,
+        # intradía). Aquí solo se actualiza P&L para el reporte del auto_run.
         conn = get_db_connection()
         cur  = conn.cursor()
         cur.execute("""
@@ -1113,7 +1201,7 @@ def cmd_paper_sync():
                 gross_pnl = %s, pnl_pct = %s, profit_pct_of_max = %s,
                 last_synced_at = NOW()
             WHERE id = %s
-        """, (spread_value, current_value, gross_pnl, pnl_pct,
+        """, (leg_value, current_value, gross_pnl, pnl_pct,
               profit_pct_max, pos["id"]))
 
         conn.commit()
@@ -1243,23 +1331,24 @@ def cmd_paper_close(ticker, close_reason="MANUAL", close_rationale=None):
         return False
 
     pos_id, ticker, strategy, sl, sh, exp, total_cost, premium, contracts, last_value = row
-    is_put = strategy in ("Bull Put Spread", "Bear Put Spread")   # familia put
-    opt_type = "put" if is_put else "call"
+    is_single = sh is None                                        # long de 1 pata
+    is_put    = strategy in ("Bull Put Spread", "Bear Put Spread", "Long Put")   # familia put
+    opt_type  = "put" if is_put else "call"
 
-    # Se intenta el precio real del mercado. Si NO se consigue (patas iliquidas:
-    # un spread muy perdido queda tan OTM que sus opciones no cotizan, bid 0),
-    # se cae al ULTIMO valor conocido de la DB — la ultima lectura real que hizo
-    # el monitor. Es PAPER: sin plata real, y el ultimo valor conocido es la mejor
-    # estimacion disponible; asi el cierre nunca queda trabado por falta de precio.
-    # (Esto es SOLO paper — cmd_paper_close es exclusivo de paper; live cierra por
-    # el broker real, donde jamas se usaria un precio no confirmado.)
-    spread_value = fetch_paper_spread_value(ticker, float(sl), float(sh), exp, opt_type,
-                                            retries=4, delay=3)
-    if spread_value is None:
+    # Se intenta el precio real del mercado. Si NO se consigue (patas iliquidas),
+    # se cae al ULTIMO valor conocido de la DB. Es PAPER: sin plata real, el ultimo
+    # valor conocido es la mejor estimacion; asi el cierre nunca queda trabado.
+    if is_single:
+        import pricing
+        value = pricing.get_single_value(ticker, float(sl), exp, opt_type, retries=4, delay=3)
+    else:
+        value = fetch_paper_spread_value(ticker, float(sl), float(sh), exp, opt_type,
+                                         retries=4, delay=3)
+    if value is None:
         if last_value is not None and float(last_value) > 0:
-            spread_value = float(last_value)
+            value = float(last_value)
             print(f"\n  ⚠️  {ticker}: sin precio nuevo del mercado (patas iliquidas). "
-                  f"Se cierra con el ULTIMO valor conocido de la DB: ${spread_value:.2f}")
+                  f"Se cierra con el ULTIMO valor conocido de la DB: ${value:.2f}")
         else:
             print(f"\n  ⛔ NO se cerró {ticker}: no se pudo obtener precio real NI hay "
                   f"un ultimo valor conocido en la DB.")
@@ -1268,17 +1357,20 @@ def cmd_paper_close(ticker, close_reason="MANUAL", close_rationale=None):
             conn.close()
             return False
 
-    # P&L: fuente ÚNICA en option_selector.spread_pnl. Esta matemática vivía
-    # copiada acá y en monitor.run_paper_monitor, y ya habían divergido — el
-    # monitor no multiplicaba por `contracts`. Idénticas con 1 contrato (que es
-    # todo lo que paper abre hoy), distintas apenas haya más.
-    from option_selector import spread_pnl
-    r = spread_pnl(float(sl), float(sh), float(premium), int(contracts), spread_value)
-
-    current_value  = r["current_value"]
-    gross_pnl      = r["gross_pnl"]
-    pnl_pct        = r["pnl_pct"] if r["pnl_pct"] is not None else 0
-    profit_pct_max = r["profit_pct_of_max"] if r["profit_pct_of_max"] is not None else 0
+    if is_single:
+        # Long de 1 pata: P&L = valor actual de la opción - prima pagada.
+        current_value  = round(value * 100 * int(contracts), 2)
+        gross_pnl      = round(current_value - float(total_cost), 2)
+        pnl_pct        = round(gross_pnl / float(total_cost) * 100, 1) if float(total_cost) else 0
+        profit_pct_max = 0                                        # long: max profit no acotado
+    else:
+        # P&L: fuente ÚNICA en option_selector.spread_pnl.
+        from option_selector import spread_pnl
+        r = spread_pnl(float(sl), float(sh), float(premium), int(contracts), value)
+        current_value  = r["current_value"]
+        gross_pnl      = r["gross_pnl"]
+        pnl_pct        = r["pnl_pct"] if r["pnl_pct"] is not None else 0
+        profit_pct_max = r["profit_pct_of_max"] if r["profit_pct_of_max"] is not None else 0
 
     cur.execute("""
         UPDATE paper_positions SET
@@ -1288,17 +1380,18 @@ def cmd_paper_close(ticker, close_reason="MANUAL", close_rationale=None):
             gross_pnl = %s, pnl_pct = %s, profit_pct_of_max = %s,
             close_reason = %s, close_rationale = %s, last_synced_at = NOW()
         WHERE id = %s
-    """, (spread_value, current_value, spread_value, current_value,
+    """, (value, current_value, value, current_value,
           gross_pnl, pnl_pct, profit_pct_max, reason, rationale, pos_id))
 
     conn.commit()
     cur.close()
     conn.close()
 
-    sign = "✅" if gross_pnl >= 0 else "❌"
+    label = f"${sl}" if is_single else f"${sl}/{sh}"
+    sign  = "✅" if gross_pnl >= 0 else "❌"
     print(f"\n  {sign} Paper position closed:")
-    print(f"     {ticker} ({strategy}) ${sl}/{sh} | "
-          f"spread=${spread_value:.2f} | P&L ${gross_pnl:+.2f} ({pnl_pct:+.1f}%)\n")
+    print(f"     {ticker} ({strategy}) {label} | "
+          f"value=${value:.2f} | P&L ${gross_pnl:+.2f} ({pnl_pct:+.1f}%)\n")
     return True
 
 
