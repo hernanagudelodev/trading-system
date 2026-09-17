@@ -285,7 +285,11 @@ async def _fetch_batch_async(canon_symbols, start_dt):
             except asyncio.TimeoutError:
                 break
 
-            if None in (c.open, c.high, c.low, c.close):
+            # Descarta velas incompletas o basura: OHLC en None, o <= 0. La vela
+            # VIVA del día en curso puede llegar con 0.0 en algún estado del stream;
+            # sin este filtro entra como último close y arruina precio/régimen.
+            ohlc = (c.open, c.high, c.low, c.close)
+            if any(x is None for x in ohlc) or any(float(x) <= 0 for x in ohlc):
                 continue
             base  = c.event_symbol.split("{")[0]
             canon = canon_de.get(base)
@@ -333,6 +337,13 @@ def refresh_candles(canon_tickers, commit, verbose=True):
     conn = _conn(); cur = conn.cursor()
     _ensure_table(cur); conn.commit()
 
+    # SPY y VIX son referencias de mercado (régimen, VIX, fuerza relativa): se
+    # refrescan SIEMPRE junto al universo, aunque no sean del S&P 500 ni candidatas.
+    # Sin esto quedan congelados en su backfill inicial y el régimen/VIX salen viejos
+    # con cara de frescos (silent failure). NO entran al estudio de acciones.
+    refs     = [s for s in (SPY_SYMBOL, VIX_SYMBOL) if s not in canon_tickers]
+    to_fetch = list(canon_tickers) + refs
+
     ultima = _max_candle_date(cur)
     hoy    = datetime.datetime.now()
     if ultima is None:
@@ -343,12 +354,12 @@ def refresh_candles(canon_tickers, commit, verbose=True):
                 - datetime.timedelta(days=CUSHION_DAYS)
         mode_desc  = f"INCREMENTAL (desde {start.date()}, ultima en tabla {ultima})"
     if verbose:
-        print(f"  mode: {mode_desc}")
+        print(f"  mode: {mode_desc}  (+ refs: {', '.join(refs) if refs else 'ninguna'})")
 
     all_rows = []
     t0 = time.time()
-    n_batches = (len(canon_tickers) + BATCH_SIZE - 1) // BATCH_SIZE
-    for i, batch in enumerate(_chunks(canon_tickers, BATCH_SIZE), 1):
+    n_batches = (len(to_fetch) + BATCH_SIZE - 1) // BATCH_SIZE
+    for i, batch in enumerate(_chunks(to_fetch, BATCH_SIZE), 1):
         tb  = time.time()
         res = fetch_batch(batch, start)
         fetched = sum(len(v) for v in res.values())
@@ -369,6 +380,8 @@ def refresh_candles(canon_tickers, commit, verbose=True):
     elif not commit and verbose:
         print(f"  DRY RUN — nothing written (candles).")
 
+    # complete/incomplete SOLO sobre el universo: SPY/VIX se refrescan pero no son
+    # candidatas (no van al estudio de acciones).
     counts = _counts_by_ticker(cur, canon_tickers)
     complete   = [t for t in canon_tickers if counts.get(t, 0) >= MIN_CANDLES]
     incomplete = {t: counts.get(t, 0) for t in canon_tickers if counts.get(t, 0) < MIN_CANDLES}
