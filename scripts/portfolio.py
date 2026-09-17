@@ -57,6 +57,9 @@ def _conn():
     return psycopg2.connect(os.getenv("DATABASE_URL"))
 
 
+from system_state import get_param_float  # noqa: E402  (path ya seteado arriba)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # §2 — DELTA NETO (matemática pura · sin red)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -182,11 +185,52 @@ def show_book(book="paper"):
     return 0
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# GATE DE DELTA NETO (asimétrico por régimen · determinista)
+# ══════════════════════════════════════════════════════════════════════════════
+# Tope direccional: cuánto puede estar el libro NET LARGO y cuánto NET CORTO, según
+# el régimen. Coherente con el dial (§4.2): en un régimen fuerte se tolera más carga
+# a favor del tape y menos en contra. Topes del owner en system_state.
+
+# Defaults por régimen (delta neto: max_long, max_short). Calibrables.
+_DELTA_DEFAULTS = {
+    "bullish": (500.0, 150.0),   # tolera cargar largo, limita corto
+    "bearish": (150.0, 500.0),   # espejo
+    "neutral": (300.0, 300.0),   # parejo y acotado
+}
+
+
+def _delta_limits(regime):
+    """(max_long, max_short) para el régimen, desde system_state (o defaults)."""
+    r = (regime or "NEUTRAL").lower()
+    dl, ds = _DELTA_DEFAULTS.get(r, (300.0, 300.0))
+    max_long  = get_param_float(f"delta_max_long_{r}",  dl)
+    max_short = get_param_float(f"delta_max_short_{r}", ds)
+    return max_long, max_short
+
+
+def delta_gate(current_net, candidate_delta, regime):
+    """
+    ¿Abrir la candidata deja el libro dentro de los topes direccionales del régimen?
+    max_long acota el delta neto positivo; max_short acota el negativo (|corto|).
+    Devuelve (allowed: bool, reason: str|None, resulting_net: float).
+    """
+    max_long, max_short = _delta_limits(regime)
+    resulting = round(current_net + candidate_delta, 2)
+    if resulting > max_long:
+        return (False, f"net delta {resulting:+.0f} > max long {max_long:.0f} ({regime})", resulting)
+    if resulting < -max_short:
+        return (False, f"net delta {resulting:+.0f} < max short -{max_short:.0f} ({regime})", resulting)
+    return (True, None, resulting)
+
+
 def main():
     p = argparse.ArgumentParser(description="Portfolio layer v2 (delta, sector, risk gates)")
     p.add_argument("--selftest", action="store_true", help="prueba la matemática del delta neto")
     p.add_argument("--book", choices=["paper", "live"],
                    help="delta neto real del libro (paper o live), con deltas frescos de TT")
+    p.add_argument("--delta-gate", dest="delta_gate", action="store_true",
+                   help="prueba el gate de delta neto con casos sintéticos")
     a = p.parse_args()
 
     if a.selftest:
@@ -211,6 +255,23 @@ def main():
             print(f"  missing DATABASE_URL (check {_ENV_PATH})")
             return 1
         return show_book(a.book)
+
+    if a.delta_gate:
+        cases = [
+            ("BULLISH · add long, ok",        400.0,   50.0, "BULLISH"),
+            ("BULLISH · add long, over",      480.0,   50.0, "BULLISH"),
+            ("BULLISH · add short, tight",   -100.0,  -60.0, "BULLISH"),
+            ("BEARISH · add short, ok",      -400.0,  -50.0, "BEARISH"),
+            ("NEUTRAL · within",              200.0,   50.0, "NEUTRAL"),
+            ("NEUTRAL · over",                280.0,   50.0, "NEUTRAL"),
+        ]
+        print("\n  DELTA GATE — asymmetric limits by regime")
+        for desc, cur_net, cand, regime in cases:
+            allowed, reason, resulting = delta_gate(cur_net, cand, regime)
+            tag = "PASS" if allowed else "BLOCK"
+            extra = "" if allowed else f"  ({reason})"
+            print(f"     {desc:<28} net {cur_net:+.0f} + {cand:+.0f} = {resulting:+.0f}  -> {tag}{extra}")
+        return 0
 
     print("  nothing to do — try --selftest")
     return 0
