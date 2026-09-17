@@ -70,6 +70,11 @@ QUIET_S          = 3.0
 RS_WINDOW        = 25
 SPY_SYMBOL       = "SPY"
 VIX_SYMBOL       = "VIX"
+# Frescura de las referencias de mercado: si la última vela de SPY/VIX es más vieja
+# que esto (días calendario), el refresco falló -> None honesto en vez de servir el
+# dato viejo con cara de fresco. 4 cubre un fin de semana largo; más que eso, algo
+# no se está refrescando.
+MARKET_STALENESS_DAYS = 4
 VIX_CALM         = 18
 VIX_ELEVATED     = 25
 VIX_FEAR         = 35
@@ -693,14 +698,32 @@ def _macro_next_high(events):
     return nxt["days_away"], nxt["event"]
 
 
+def _candle_age_days(last_date):
+    """Días calendario entre hoy y la fecha de la última vela (None si no se puede)."""
+    if last_date is None:
+        return None
+    try:
+        return (datetime.date.today() - last_date).days
+    except Exception:
+        return None
+
+
 def _vix_facts(cur):
     keys = {"vix_current": None, "vix_avg_5d": None, "vix_avg_10d": None,
-            "vix_trend": None, "vix_level": None}
-    cur.execute("SELECT close FROM candle_daily WHERE ticker = %s ORDER BY candle_date ASC",
+            "vix_trend": None, "vix_level": None, "vix_stale": None}
+    cur.execute("SELECT candle_date, close FROM candle_daily WHERE ticker = %s ORDER BY candle_date ASC",
                 (VIX_SYMBOL,))
-    closes = [float(r[0]) for r in cur.fetchall()]
+    rows = cur.fetchall()
+    closes = [float(r[1]) for r in rows]
     if len(closes) < 5:
         return keys
+    # Fix B — None honesto: si la última vela de VIX es vieja (no se refrescó), no
+    # servir el valor viejo. Se marca stale y los hechos quedan en None.
+    vix_age = _candle_age_days(rows[-1][0])
+    if vix_age is None or vix_age > MARKET_STALENESS_DAYS:
+        keys["vix_stale"] = True
+        return keys
+    keys["vix_stale"] = False
     current = closes[-1]
     avg_5d  = sum(closes[-5:]) / 5
     avg_10d = sum(closes[-10:]) / 10 if len(closes) >= 10 else None
@@ -763,6 +786,18 @@ def study_market(cur):
         "spy_pct_25d":      pct_25d,
         "regime":           regime,
     }
+
+    # Fix B — None honesto: si la última vela de SPY es vieja (el refresco no la
+    # actualizó), no servir el dato viejo con cara de fresco. spy_* y regime -> None.
+    spy_age   = _candle_age_days(df.index[-1])
+    spy_stale = (spy_age is None) or (spy_age > MARKET_STALENESS_DAYS)
+    facts["spy_stale"] = spy_stale
+    if spy_stale:
+        for k in ("spy_price", "spy_sma50", "spy_sma200", "spy_above_sma50",
+                  "spy_above_sma200", "spy_sma_status", "spy_sma50_dir",
+                  "spy_pct_25d", "regime"):
+            facts[k] = None
+
     facts.update(_vix_facts(cur))
     d_high, ev_high = _macro_next_high(get_macro_events())
     facts["macro_next_high_days"]  = d_high      # dias al proximo HIGH/VERY_HIGH, o None
