@@ -197,6 +197,22 @@ def show_operability():
 # (el caso "beta 2,25 en día de CPI/FOMC" que el diseño cita). Umbrales del owner
 # en system_state.
 
+def earnings_gate(f, block_days):
+    """
+    §3: bloquea si hay earnings CONOCIDO dentro de la ventana (0..block_days).
+    days_to_earnings None NO bloquea: suele ser ETF sin earnings o fecha no
+    confirmada; TT da fechas confiables para el S&P, así que None ~ sin earnings
+    inminente. Un earnings ya pasado (dte < 0) tampoco bloquea.
+    Devuelve (blocked: bool, reason: str|None).
+    """
+    dte = f.get("days_to_earnings")
+    if dte is None:
+        return (False, None)
+    if 0 <= dte <= block_days:
+        return (True, f"earnings in {dte}d (<= {block_days})")
+    return (False, None)
+
+
 def macro_beta_gate(f, macro_next_high_days, beta_threshold, days_threshold):
     """
     Devuelve (blocked: bool, reason: str|None).
@@ -746,6 +762,7 @@ def run_selection(dossier, market, regime):
     min_liquidity = get_param_int("op_min_liquidity_rating", 2)
     beta_th       = get_param_float("macro_gate_beta_threshold", 2.0)
     days_th       = get_param_int("macro_gate_days_threshold", 2)
+    earnings_days = get_param_int("earnings_block_days", 21)
     neutral_f     = get_param_float("neutral_size_factor", 0.5)
     mode          = get_param_str("dial_mode", "GATE")
     macro_days    = market.get("macro_next_high_days")
@@ -762,7 +779,12 @@ def run_selection(dossier, market, regime):
         if not op_ok:
             r["status"] = "not_operable"; results.append(r); continue
 
-        # §3 gate macro × beta
+        # §3a earnings inminente (evento de la acción)
+        e_blocked, _ = earnings_gate(f, earnings_days)
+        if e_blocked:
+            r["status"] = "earnings_blocked"; results.append(r); continue
+
+        # §3b gate macro × beta (evento global)
         blocked, _ = macro_beta_gate(f, macro_days, beta_th, days_th)
         r["macro_blocked"] = blocked
         if blocked:
@@ -829,7 +851,7 @@ def show_selection(commit):
     results = run_selection(dossier, market, regime)
 
     status_order = ["candidate", "blocked_counter_trend", "no_direction",
-                    "macro_blocked", "not_operable"]
+                    "macro_blocked", "earnings_blocked", "not_operable"]
     counts = Counter(r["status"] for r in results)
     total  = len(results)
     print(f"\n  SELECTION PIPELINE — regime={regime} · {total} stocks")
