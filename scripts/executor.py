@@ -45,9 +45,12 @@ class OpenIntent:
     """Intención de abrir, neutra respecto a paper/live."""
     ticker:       str
     strike_low:   float
-    strike_high:  float
+    strike_high:  Optional[float]   # None para longs de 1 pata; float para spreads
     expiration:   str          # 'YYYY-MM-DD' (ya resuelta a fecha real de cadena)
-    debit:        float        # >0 débito (BCS), <0 crédito (BPS)
+    debit:        float        # >0 débito, <0 crédito (el signo da débito/crédito)
+    strategy:     Optional[str] = None   # estructura EXPLÍCITA (bidi): "Bear Call Spread", etc.
+                                          # el debit ya no basta para distinguir las 4 spreads.
+    selection_id: Optional[int] = None   # candidata de selection_result que originó el trade
     rationale:    str = ""
     context_json: Optional[str] = None
 
@@ -291,15 +294,17 @@ class PaperExecutor(Executor):
     TABLE = "paper_positions"
 
     def open_position(self, intent: OpenIntent) -> bool:
-        # 1. Gates de cartera (stateless, fail-closed). Rechazo != error.
-        try:
-            _cartera_gates(self.TABLE, intent.ticker,
-                           intent.strike_low, intent.strike_high, intent.debit)
-        except CarteraRechazo as rej:
-            print(f"  [paper] {intent.ticker} NO abierta: {rej.motivo}")
+        # 1. Gates de cartera de v2 (sector + riesgo total + no-apilar + delta neto).
+        #    Miden el libro paper. Rechazo != error.
+        import portfolio
+        allowed, reason = portfolio.gates_for_open(
+            self.mode, intent.ticker, intent.strategy,
+            intent.strike_low, intent.strike_high, intent.debit, intent.expiration)
+        if not allowed:
+            print(f"  [paper] {intent.ticker} NO abierta: {reason}")
             return False
 
-        # 2. Fill + spot: copiar de LIVE si live abrio esta misma estructura este
+        # 2. Fill + spot: copiar de LIVE si live abrió esta misma estructura este
         #    run; si no (paper en solitario), simular premium (mid+1c) y consultar
         #    el spot actual a Tastytrade (real aunque desactualizado por minutos).
         copia = _fill_de_live(intent.ticker, intent.strike_low,
@@ -313,7 +318,7 @@ class PaperExecutor(Executor):
             origen = (f"simulado mid+{PAPER_SLIPPAGE}, spot consultado "
                       f"({price_at_open}) (paper en solitario)")
 
-        # 3. Registro. cmd_paper_buy no devuelve valor: si no lanza, registro.
+        # 3. Registro. cmd_paper_buy recibe la estructura EXPLÍCITA (bidi) + selection_id.
         import trade as trade_module
         try:
             trade_module.cmd_paper_buy(
@@ -325,10 +330,11 @@ class PaperExecutor(Executor):
                 context_json=intent.context_json,
                 rationale=intent.rationale,
                 price_at_open=price_at_open,
+                strategy=intent.strategy,
+                selection_id=intent.selection_id,
             )
-            print(f"  [paper] {intent.ticker} registrada · debit_mid={intent.debit} "
-                  f"-> fill={debit_fill} ({origen})")
-            _persistir_sector(self.TABLE, intent.ticker)
+            print(f"  [paper] {intent.ticker} registrada · {intent.strategy} · "
+                  f"debit_mid={intent.debit} -> fill={debit_fill} ({origen})")
             return True
         except Exception as e:
             print(f"  [paper] error abriendo {intent.ticker}: {e}")

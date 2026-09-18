@@ -305,7 +305,11 @@ def cartera_gates(book, ticker, strike_low, strike_high, debit):
     except Exception as e:
         return (False, f"no se pudieron leer los topes de riesgo: {e} — no se abre")
 
-    new_risk = position_max_loss(strike_low, strike_high, debit)
+    # Riesgo de la candidata. Long (strike_high None): la prima pagada (debit>0).
+    if strike_high is None:
+        new_risk = round(debit * 100, 2)
+    else:
+        new_risk = position_max_loss(strike_low, strike_high, debit)
 
     # 3. Riesgo total vs NLV
     if current_risk + new_risk > max_port:
@@ -321,6 +325,58 @@ def cartera_gates(book, ticker, strike_low, strike_high, debit):
         return (False, f"sector {cand_sector} ${sec_now:,.0f} + ${new_risk:,.0f} > "
                        f"${max_sect:,.0f} (tope sector)")
 
+    return (True, None)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GATE COMBINADO — todos los ejes de cartera para UNA apertura candidata
+# ══════════════════════════════════════════════════════════════════════════════
+
+def intent_delta(ticker, strategy, strike_low, strike_high, expiration, contracts=1):
+    """Delta de una posición candidata (aún no abierta), con deltas frescos de sus patas."""
+    import pricing
+    long_strike, short_strike, opt_type = _legs_of(strategy, strike_low, strike_high)
+    delta_long  = pricing.get_single_delta(ticker, long_strike, expiration, opt_type)
+    delta_short = 0.0 if short_strike is None else \
+                  pricing.get_single_delta(ticker, short_strike, expiration, opt_type)
+    return position_delta(delta_long, delta_short, contracts)
+
+
+def _current_regime(slot="scan"):
+    """Régimen del último scan (ticker_study.regime)."""
+    try:
+        conn = _conn(); cur = conn.cursor()
+        cur.execute("SELECT regime FROM ticker_study WHERE slot = %s ORDER BY scan_at DESC LIMIT 1",
+                    (slot,))
+        row = cur.fetchone(); cur.close(); conn.close()
+        return row[0] if row else None
+    except Exception:
+        return None
+
+
+def gates_for_open(book, ticker, strategy, strike_low, strike_high, debit, expiration, contracts=1):
+    """
+    Corre TODOS los gates de cartera para abrir `ticker` en `book`, en orden:
+      1. sector + riesgo total + no-apilar (cartera_gates) — barato (DB + CSV).
+      2. delta neto direccional (delta_gate) — trae deltas frescos.
+    Mide SU libro. Devuelve (allowed: bool, reason: str|None). Fail-closed.
+    """
+    ok, reason = cartera_gates(book, ticker, strike_low, strike_high, debit)
+    if not ok:
+        return (False, reason)
+
+    cand_delta = intent_delta(ticker, strategy, strike_low, strike_high, expiration, contracts)
+    if cand_delta is None:
+        return (False, "delta de la candidata no disponible — fail-closed")
+
+    current_net, _, incomplete = build_book(book)
+    if incomplete:
+        return (False, f"{len(incomplete)} posicion(es) del libro con delta faltante — fail-closed")
+
+    regime = _current_regime()
+    ok, reason, _ = delta_gate(current_net, cand_delta, regime)
+    if not ok:
+        return (False, reason)
     return (True, None)
 
 
