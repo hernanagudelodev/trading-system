@@ -509,6 +509,24 @@ def save_account_snapshot(balances):
     return snapshot_id
 
 
+def snapshot_now():
+    """
+    Obtiene los balances FRESCOS de Tastytrade, los guarda en account_snapshots y
+    devuelve el NLV. Lo llama el monitor (_maybe_snapshot_capital) para mantener la
+    equity curve del dashboard y el NLV real (get_account_nlv). None si falla.
+    """
+    import asyncio
+    try:
+        ensure_tables()
+        data = asyncio.run(_fetch_tastytrade_data())
+        balances = data["balances"]
+        save_account_snapshot(balances)
+        return balances["net_liquidating_value"]
+    except Exception as e:
+        print(f"  snapshot_now error: {e}")
+        return None
+
+
 def insert_spread(spread, account_number):
     conn = get_db_connection()
     cur  = conn.cursor()

@@ -503,7 +503,8 @@ def run_position_monitor(table, executor, mode_label):
     for pos in positions:
         ticker      = pos["ticker"]
         strike_low  = float(pos["strike_low"])
-        strike_high = float(pos["strike_high"])
+        raw_high    = pos["strike_high"]
+        strike_high = float(raw_high) if raw_high is not None else None   # long: None
         total_cost  = float(pos["total_cost"])
         premium     = float(pos["premium_paid"])
         expiration  = pos["expiration"]
@@ -554,7 +555,7 @@ def run_position_monitor(table, executor, mode_label):
                 print(f"sin datos reales — omitiendo")
                 print(f"\n  [--] {ticker} [{mode}] — {strategy} — SIN DATOS")
                 print(f"  {'─' * 50}")
-                print(f"  Strike(s):     ${strike_low} / ${strike_high}")
+                print(f"  Strike(s):     {'$'+str(strike_low) if strike_high is None else '$'+str(strike_low)+' / $'+str(strike_high)}")
                 print(f"  Expiracion:    {expiration} ({dte} dias)")
                 print(f"  No se pudo obtener precio real.")
                 print()
@@ -823,17 +824,15 @@ def healthcheck_ping():
 
 
 def scheduled_run():
-    # def · opcion B: DOS pasadas, live primero y paper despues. Cada una precia,
-    # evalua y cierra su propio libro. Una estructura en ambos libros se precia dos
-    # veces (una por pasada); es el precio de la simplicidad — sin agrupar por
-    # estructura en el unico componente que cierra plata real.
+    # v2: por ahora SOLO paper. La tabla `positions` (live) todavía no existe en la
+    # DB de v2; la pasada de live fallaría. Cuando se encienda el libro live, se
+    # agrega ("positions", LiveExecutor(), "live") a la lista.
     #
     # El cierre NO pasa por el interruptor de live (LIVE_TRADING_ENABLED): cerrar
-    # siempre esta permitido. El interruptor solo frena APERTURAS (en auto_run).
-    from executor import LiveExecutor, PaperExecutor
+    # siempre está permitido. El interruptor solo frena APERTURAS (en el opener).
+    from executor import PaperExecutor
 
     for table, ex, label in (
-        ("positions",       LiveExecutor(),  "live"),
         ("paper_positions", PaperExecutor(), "paper"),
     ):
         try:
@@ -841,10 +840,8 @@ def scheduled_run():
         except Exception as e:
             print(f"  monitor [{label}] error: {e}")
 
-    # Snapshot de capital: mantiene account_snapshots fresco entre runs del
-    # auto_run (antes el NLV solo se guardaba en run_sync, 2x al dia -> el
-    # dashboard mostraba capital viejo). snapshot_now() NUNCA lanza: si falla,
-    # el monitor ya hizo lo importante (priceo y cerro posiciones).
+    # Snapshot de capital: mantiene account_snapshots fresco para el dashboard
+    # (equity curve) y para get_account_nlv. snapshot_now() NUNCA lanza.
     _maybe_snapshot_capital()
 
 

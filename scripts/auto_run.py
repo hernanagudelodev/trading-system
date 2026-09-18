@@ -56,56 +56,124 @@ def run_step(n, total, name, cmd):
     return True
 
 
-def build_summary(run_started_at):
+def build_summary(run_started_at, slot="manual", run_time=0):
     """
-    Arma el resumen del run leyendo la DB: régimen, candidatas, lo que abrió el
-    opener en ESTE run (opened_at >= inicio), y el delta neto del libro paper.
+    Arma el resumen del run leyendo la DB. Texto PLANO (send_push escapa HTML, así
+    que nada de <b>): mercado, selección con reparto, aperturas de este run, y el
+    estado del libro (P&L abierto, delta neto, balance bidireccional).
     """
     import portfolio
-    lines = []
     conn = _conn(); cur = conn.cursor()
 
-    # régimen + candidatas del último scan
+    # Mercado: régimen + VIX del último scan
     cur.execute("SELECT regime FROM ticker_study WHERE slot='scan' ORDER BY scan_at DESC LIMIT 1")
-    row = cur.fetchone()
-    regime = row[0] if row else "?"
+    row = cur.fetchone(); regime = row[0] if row else "?"
+    cur.execute("""
+        SELECT f.criterion, f.value_num, f.value_text
+        FROM ticker_study s JOIN study_fact f ON f.study_id = s.id
+        WHERE s.ticker = '__MARKET__'
+          AND s.scan_at = (SELECT MAX(scan_at) FROM ticker_study WHERE slot='scan')
+          AND f.criterion IN ('vix_current', 'vix_level')
+    """)
+    mkt = {c: (n if n is not None else t) for c, n, t in cur.fetchall()}
+    vix = mkt.get("vix_current"); vix_level = mkt.get("vix_level")
 
+    # Selección: reparto de candidatas por dirección
     cur.execute("""
         WITH latest AS (SELECT MAX(scan_at) AS m FROM selection_result)
-        SELECT COUNT(*) FILTER (WHERE status='candidate')
-        FROM selection_result WHERE scan_at=(SELECT m FROM latest)
+        SELECT direction, COUNT(*) FROM selection_result
+        WHERE status='candidate' AND scan_at=(SELECT m FROM latest)
+        GROUP BY direction
     """)
-    n_cand = cur.fetchone()[0]
+    dc = dict(cur.fetchall())
+    n_up = dc.get("UPTREND", 0); n_down = dc.get("DOWNTREND", 0)
+    n_cand = n_up + n_down
 
-    # abiertas en ESTE run (paper)
+    # Aperturas de ESTE run
     cur.execute("""
         SELECT ticker, strategy FROM paper_positions
         WHERE status='OPEN' AND opened_at >= %s ORDER BY opened_at
     """, (run_started_at,))
     opened = cur.fetchall()
 
-    # tamaño total del libro paper
-    cur.execute("SELECT COUNT(*) FROM paper_positions WHERE status='OPEN'")
-    n_book = cur.fetchone()[0]
+    # Libro: posiciones, P&L abierto, balance bidireccional
+    cur.execute("SELECT strategy, gross_pnl FROM paper_positions WHERE status='OPEN'")
+    book = cur.fetchall()
+    n_book    = len(book)
+    pnl_total = sum(float(g or 0) for _, g in book)
+    bearish   = {"Bear Call Spread", "Bear Put Spread", "Long Put"}
+    n_bear    = sum(1 for s, _ in book if s in bearish)
+    n_bull    = n_book - n_bear
     cur.close(); conn.close()
 
-    lines.append(f"<b>auto_run v2</b> — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    lines.append(f"régimen: {regime} · candidatas: {n_cand}")
-    if opened:
-        lines.append(f"abiertas este run: {len(opened)}")
-        for tk, strat in opened:
-            lines.append(f"  • {tk} {strat}")
-    else:
-        lines.append("abiertas este run: 0")
-
+    net = None
     try:
         net, _, _ = portfolio.build_book("paper")
-        side = "net long" if net > 0 else "net short" if net < 0 else "neutral"
-        lines.append(f"libro paper: {n_book} posiciones · delta neto {net:+.1f} ({side})")
     except Exception:
-        lines.append(f"libro paper: {n_book} posiciones")
+        pass
 
-    return "\n".join(lines)
+    vix_str  = f"{vix:.1f}" if vix is not None else "?"
+    side     = "net long" if (net or 0) > 0 else "net short" if (net or 0) < 0 else "neutral"
+    net_str  = f"{net:+.0f} ({side})" if net is not None else "?"
+
+    lines = [
+        f"📊 AUTO_RUN · {slot}",
+        f"{datetime.now().strftime('%Y-%m-%d %H:%M')} · {run_time:.0f}s",
+        "",
+        f"📈 Mercado: {regime} · VIX {vix_str} ({vix_level or '?'})",
+        f"🎯 Candidatas: {n_cand}  ({n_up} alcistas / {n_down} bajistas)",
+        "",
+        f"🔓 Abiertas este run: {len(opened)}",
+    ]
+    for tk, strat in opened:
+        lines.append(f"   • {tk} · {strat}")
+    lines += [
+        "",
+        f"📁 Libro paper: {n_book} posiciones ({n_bull} alcistas / {n_bear} bajistas)",
+        f"   P&L abierto: {pnl_total:+.0f}",
+        f"   Delta neto: {net_str}",
+    ]
+
+    data = {"regime": regime, "n_cand": n_cand, "opened": opened,
+            "n_book": n_book, "net_delta": net}
+    return "\n".join(lines), data
+
+
+def _save_run_log(slot, data, run_time):
+    """Escribe el run en auto_run_logs (dedup del wrapper + historial para el dashboard)."""
+    try:
+        conn = _conn(); cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS auto_run_logs (
+                id           SERIAL PRIMARY KEY,
+                run_at       TIMESTAMP DEFAULT NOW(),
+                slot         VARCHAR(20),
+                regime       VARCHAR(10),
+                candidates   INTEGER,
+                opened       INTEGER DEFAULT 0,
+                errors       INTEGER DEFAULT 0,
+                net_delta    DECIMAL(10,2),
+                summary      TEXT,
+                run_time_sec INTEGER,
+                mode         VARCHAR(10) NOT NULL DEFAULT 'paper'
+            )
+        """)
+        cur.execute("""
+            INSERT INTO auto_run_logs
+                (slot, regime, candidates, opened, net_delta, summary, run_time_sec, mode)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, 'paper')
+            RETURNING id
+        """, (
+            slot, data["regime"], data["n_cand"], len(data["opened"]),
+            data["net_delta"],
+            "; ".join(f"{tk} {st}" for tk, st in data["opened"]),
+            int(run_time),
+        ))
+        log_id = cur.fetchone()[0]
+        conn.commit(); cur.close(); conn.close()
+        print(f"  log guardado (auto_run_logs id={log_id})")
+    except Exception as e:
+        print(f"  ⚠️  no se pudo guardar el log: {e}")
 
 
 def main():
@@ -117,6 +185,8 @@ def main():
                    help="usar la última selección (no re-selecciona) — pruebas")
     p.add_argument("--no-telegram", action="store_true", dest="no_telegram",
                    help="no manda el resumen por Telegram — pruebas")
+    p.add_argument("--slot", default="manual",
+                   help="nombre del slot (morning/midday/...) — lo pasa el wrapper para el log")
     a = p.parse_args()
 
     if not os.getenv("DATABASE_URL"):
@@ -147,14 +217,17 @@ def main():
 
     # [4/4] Resumen + Telegram
     print(f"\n{'═'*60}\n  [4/{total}] Resumen + Telegram\n{'═'*60}")
-    summary = build_summary(started_at)
-    print("\n" + summary.replace("<b>", "").replace("</b>", ""))
-    print(f"\n  tiempo total: {time.time()-t0:.0f}s")
+    run_time = time.time() - t0
+    summary, data = build_summary(started_at, a.slot, run_time)
+    print("\n" + summary)
+    print(f"\n  tiempo total: {run_time:.0f}s")
+
+    _save_run_log(a.slot, data, run_time)
 
     if not a.no_telegram:
         try:
             from notify import send_push
-            send_push(title="auto_run v2", message=summary)
+            send_push(title=f"AUTO_RUN · {a.slot}", message=summary)
             print("  ✅ resumen enviado a Telegram")
         except Exception as e:
             print(f"  ⚠️  no se pudo enviar a Telegram: {e}")
