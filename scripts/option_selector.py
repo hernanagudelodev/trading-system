@@ -62,8 +62,9 @@ MAX_SPREADS    = 4
 #   que esto elimina. La consulta es trivial (tabla chica, LIMIT 1).
 #   Fallback: si la tabla está vacía o la lectura falla, ACCOUNT_NLV env (14100).
 #
-# MAX_RISK_PCT: por env var, default 0.03 (3%), conservador a propósito. Valida
-#   el rango: un typo (0.3 = 30% por trade) se rechaza y cae al default.
+# max_risk_per_trade_pct: en system_state, default 0.03 (3%), conservador a
+#   propósito. Valida el rango: un typo (0.3 = 30% por trade) se rechaza y cae al
+#   default. Es el riesgo por POSICIÓN (el más granular); sector y total van en portfolio.
 _ACCOUNT_NLV_FALLBACK = float(os.getenv("ACCOUNT_NLV", "14100"))
 
 
@@ -103,25 +104,23 @@ def get_account_nlv():
 
 
 def _load_max_risk_pct():
-    raw = os.getenv("MAX_RISK_PCT", "0.03")
-    try:
-        pct = float(raw)
-    except ValueError:
-        print(f"  ⚠️  MAX_RISK_PCT='{raw}' no es número — usando 0.03 (3%).")
-        return 0.03
+    """
+    Riesgo MÁXIMO POR TRADE (fracción del capital), desde system_state
+    (max_risk_per_trade_pct). Default 0.03 (3%), conservador a propósito. Se lee
+    FRESCO en cada max_risk_dollars(), no a nivel de módulo, para (a) no tocar la DB
+    al importar y (b) reflejar cambios del owner sin redesplegar.
+    """
+    from system_state import get_param_float
+    pct = get_param_float("max_risk_per_trade_pct", 0.03)
     if not (0.0 < pct <= 0.20):
-        print(f"  ⚠️  MAX_RISK_PCT={pct} fuera de rango (0, 0.20] — "
-              f"¿un typo? usando 0.03 (3%).")
+        print(f"  ⚠️  max_risk_per_trade_pct={pct} fuera de rango (0, 0.20] — usando 0.03 (3%).")
         return 0.03
     return pct
 
 
-MAX_RISK_PCT = _load_max_risk_pct()           # fracción del capital por trade
-
-
 def max_risk_dollars():
-    """Pérdida máxima por trade en dólares = NLV real × MAX_RISK_PCT. Fresco."""
-    return get_account_nlv() * MAX_RISK_PCT
+    """Pérdida máxima por trade en dólares = NLV real × pct (fresco de system_state)."""
+    return get_account_nlv() * _load_max_risk_pct()
 
 
 MIN_RR_DEBIT     = 1.0                         # Bull Call Spread / Long Call: R/R mínimo
