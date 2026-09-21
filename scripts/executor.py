@@ -545,25 +545,23 @@ class LiveExecutor(Executor):
     TABLE = "positions"   # libro real — el gate de cartera mira esta tabla
 
     def open_position(self, intent: OpenIntent) -> bool:
+        # INTERRUPTOR PRIMERO: tres compuertas fail-safe ANTES de nada. Si live
+        # está deshabilitado (env) o frenado (kill-flag/DB), corta ya — sin gastar
+        # el fetch de deltas del gate en una orden que igual no se va a mandar.
+        allowed, motivo = live_trading_allowed()
+        if not allowed:
+            print(f"  [live] {intent.ticker} NO abierta — interruptor: {motivo}")
+            return False
+
         # GATES DE CARTERA de v2 — EL MISMO que paper (portfolio.gates_for_open):
         # sector + riesgo total + no-apilar + delta neto direccional. Miden el
-        # libro LIVE (self.mode="live" -> tabla positions). Va PRIMERO, antes del
-        # interruptor: si el gate rechaza (p.ej. el ticker ya está OPEN en live),
-        # ni evaluamos el interruptor. Rechazo != error.
+        # libro LIVE (self.mode="live" -> tabla positions). Rechazo != error.
         import portfolio
         allowed, reason = portfolio.gates_for_open(
             self.mode, intent.ticker, intent.strategy,
             intent.strike_low, intent.strike_high, intent.debit, intent.expiration)
         if not allowed:
             print(f"  [live] {intent.ticker} NO abierta: {reason}")
-            return False
-
-        # INTERRUPTOR: tres compuertas fail-safe ANTES de tocar el broker.
-        # Si el sistema no esta habilitado (env) o esta frenado (kill-flag/DB),
-        # NO se manda ninguna orden real. Loguea el motivo y devuelve False.
-        allowed, motivo = live_trading_allowed()
-        if not allowed:
-            print(f"  [live] {intent.ticker} NO abierta — interruptor: {motivo}")
             return False
 
         from broker_orders import open_spread
@@ -718,22 +716,38 @@ class LiveExecutor(Executor):
         print("  [live] sincronizando la DB con el broker...")
         trade_module.run_sync()
 
-        # Poblar el sector de las posiciones live OPEN que aun no lo tengan.
-        # run_sync ya creo/actualizo las filas; aca les ponemos el sector desde
-        # la fuente unica (criteria.get_sector). Solo las que estan en NULL, para
-        # no re-consultar yfinance de posiciones viejas ya pobladas.
+        # Reconectar selection_id: run_sync baja la posición del BROKER, que no
+        # conoce el selection_id (concepto interno de v2), así que insert_spread la
+        # graba con selection_id NULL. Acá se restablece la trazabilidad al dossier
+        # matcheando por ticker con la candidata del último scan. Es correcto porque
+        # el gate de no-apilar garantiza UNA posición por ticker, y el sync corre
+        # justo tras abrir, así que el último scan es el que originó la posición.
         try:
             import os, psycopg2
             conn = psycopg2.connect(os.getenv("DATABASE_URL"))
             cur  = conn.cursor()
-            cur.execute("SELECT DISTINCT UPPER(ticker) FROM positions "
-                        "WHERE UPPER(status)='OPEN' AND sector IS NULL")
-            pendientes = [r[0] for r in cur.fetchall()]
-            cur.close(); conn.close()
-            for tk in pendientes:
-                _persistir_sector("positions", tk)
+            cur.execute("""
+                UPDATE positions p
+                SET selection_id = sr.id
+                FROM selection_result sr
+                WHERE UPPER(p.ticker) = UPPER(sr.ticker)
+                  AND UPPER(p.status) = 'OPEN'
+                  AND p.selection_id IS NULL
+                  AND sr.status = 'candidate'
+                  AND sr.scan_at = (SELECT MAX(scan_at) FROM selection_result)
+            """)
+            n = cur.rowcount
+            conn.commit(); cur.close(); conn.close()
+            if n:
+                print(f"  [live] selection_id reconectado en {n} posición(es)")
         except Exception as e:
-            print(f"  [sector] no se pudo poblar sectores live ({e})")
+            print(f"  [live] no se pudo reconectar selection_id ({e}) — queda NULL")
+
+        # NOTA (v2): def poblaba aquí `positions.sector` consultando yfinance. En v2
+        # no aplica: el gate de riesgo por sector saca el sector del CSV
+        # (get_sp500_sectors), no de una columna en la fila, y `positions` (espejo de
+        # paper_positions) no tiene columna `sector`. Poblarla era código muerto que
+        # además reintroducía yfinance — se elimina.
 
         # Guardar el CONTEXTO/rationale de cada apertura. run_sync crea la fila
         # desde el broker (que NO conoce el rationale del LLM); aca lo enganchamos

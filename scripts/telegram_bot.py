@@ -54,7 +54,7 @@ LECTURA = {
 }
 
 # Acción pendiente de /confirm: {"kind", "args", "ts"}
-_pendiente = None
+_pending = None
 CONFIRM_WINDOW = 60   # segundos
 
 
@@ -62,21 +62,21 @@ def _token():
     return os.getenv("TELEGRAM_BOT_TOKEN", "")
 
 
-def _chat_autorizado(chat_id):
+def _chat_allowed(chat_id):
     return str(chat_id) == str(os.getenv("TELEGRAM_CHAT_ID", ""))
 
 
-def _api(metodo, **params):
-    url = f"{API_BASE}/bot{_token()}/{metodo}"
+def _api(method, **params):
+    url = f"{API_BASE}/bot{_token()}/{method}"
     try:
         r = requests.post(url, json=params, timeout=40)
         return r.json()
     except Exception as e:
-        print(f"  api error ({metodo}): {e}")
+        print(f"  api error ({method}): {e}")
         return {}
 
 
-def _correr(script, args=None, cwd=None, timeout=200):
+def _run(script, args=None, cwd=None, timeout=200):
     """Corre un script por subprocess y devuelve su stdout (o el error).
     Fuerza UTF-8 en el subprocess: PYTHONIOENCODING para que el hijo ESCRIBA utf-8
     y encoding="utf-8" para que el padre lo LEA — si no, en Windows el pipe usa
@@ -95,58 +95,69 @@ def _correr(script, args=None, cwd=None, timeout=200):
         return f"error corriendo {os.path.basename(script)}: {e}"
 
 
-def _ayuda():
+def _help_text():
     return ("🤖 Bot v2 — comandos\n\n"
-            "LECTURA (paper):\n"
+            "LECTURA (agregá 'live' para el book_label real):\n"
             "  /open · /book · /runs · /equity\n"
-            "  /closed · /health · /candidates\n\n"
+            "  /closed · /health · /candidates\n"
+            "  ej: /open live · /book live\n\n"
             "ACCIÓN (piden /confirm):\n"
-            "  /close TICKER — cierra una posición\n"
-            "  /auto_run — corre un ciclo (abre posiciones)\n"
+            "  /close TICKER — cierra en paper\n"
+            "  /close TICKER live — cierra REAL ⚠️\n"
+            "  /auto_run — corre un ciclo (abre en paper)\n"
             "  /confirm — ejecuta el pendiente\n\n"
             "  /help — esta ayuda")
 
 
-def _procesar(texto):
-    global _pendiente
-    partes = texto.strip().split()
-    if not partes:
+def _process(text):
+    global _pending
+    parts = text.strip().split()
+    if not parts:
         return None
-    cmd = partes[0].lower()
-    args = partes[1:]
+    cmd = parts[0].lower()
+    args = parts[1:]
+
+    # Sufijo de book_label: "/open live" -> live; sin sufijo -> paper (default).
+    book_flag = []
+    if args and args[-1].lower() == "live":
+        book_flag = ["--live"]
+        args = args[:-1]
 
     if cmd in ("/start", "/help"):
-        return _ayuda()
+        return _help_text()
 
-    # Lectura: correr la tool y devolver su salida
+    # Lectura: correr la tool (paper o live) y devolver su salida
     if cmd in LECTURA:
-        return _correr(str(_TOOLS / LECTURA[cmd]))
+        return _run(str(_TOOLS / LECTURA[cmd]), book_flag)
 
-    # /close TICKER -> dry-run + deja pendiente el cierre real
+    # /close TICKER [live] -> dry-run + deja pendiente el cierre real
     if cmd == "/close":
         if not args:
-            return "uso: /close TICKER"
+            return "uso: /close TICKER  (o  /close TICKER live)"
         ticker = args[0].upper()
-        dry = _correr(str(_TOOLS / "close.py"), [ticker])       # sin --confirm
-        _pendiente = {"kind": "close", "args": [ticker], "ts": time.time()}
-        return f"{dry}\n\n➡️ mandá /confirm para cerrar {ticker} ({CONFIRM_WINDOW}s)."
+        book_label  = "LIVE" if book_flag else "paper"
+        dry = _run(str(_TOOLS / "close.py"), [ticker] + book_flag)   # sin --confirm
+        _pending = {"kind": "close", "args": [ticker] + book_flag, "ts": time.time()}
+        warn = " ⚠️ POSICIÓN REAL" if book_flag else ""
+        return (f"{dry}\n\n➡️ mandá /confirm para cerrar {ticker} en {book_label}"
+                f"{warn} ({CONFIRM_WINDOW}s).")
 
-    # /auto_run -> deja pendiente el ciclo (abre posiciones)
+    # /auto_run -> deja pendiente el ciclo (abre posiciones EN PAPER)
     if cmd == "/auto_run":
-        _pendiente = {"kind": "auto_run", "args": [], "ts": time.time()}
+        _pending = {"kind": "auto_run", "args": [], "ts": time.time()}
         return ("⚠️ /auto_run corre un ciclo completo: escanea y ABRE posiciones en paper.\n"
                 f"➡️ mandá /confirm para ejecutar ({CONFIRM_WINDOW}s).")
 
     # /confirm -> ejecuta el pendiente si está dentro de la ventana
     if cmd == "/confirm":
-        if not _pendiente:
+        if not _pending:
             return "no hay nada pendiente."
-        if time.time() - _pendiente["ts"] > CONFIRM_WINDOW:
-            _pendiente = None
+        if time.time() - _pending["ts"] > CONFIRM_WINDOW:
+            _pending = None
             return "el pendiente expiró — volvé a mandar el comando."
-        p = _pendiente; _pendiente = None
+        p = _pending; _pending = None
         if p["kind"] == "close":
-            return _correr(str(_TOOLS / "close.py"), p["args"] + ["--confirm"])
+            return _run(str(_TOOLS / "close.py"), p["args"] + ["--confirm"])
         if p["kind"] == "auto_run":
             # BACKGROUND: auto_run tarda minutos y bloquearía el loop de getUpdates
             # (el bot dejaría de responder). Se lanza con Popen sin esperar; auto_run
@@ -178,14 +189,14 @@ def main():
                 offset = u["update_id"] + 1
                 msg = u.get("message") or u.get("edited_message") or {}
                 chat_id = (msg.get("chat") or {}).get("id")
-                texto   = msg.get("text", "")
-                if not texto:
+                text   = msg.get("text", "")
+                if not text:
                     continue
-                if not _chat_autorizado(chat_id):
+                if not _chat_allowed(chat_id):
                     continue                       # ignora chats no autorizados
-                respuesta = _procesar(texto)
-                if respuesta:
-                    _api("sendMessage", chat_id=chat_id, text=respuesta)
+                reply = _process(text)
+                if reply:
+                    _api("sendMessage", chat_id=chat_id, text=reply)
         except Exception as e:
             print(f"  loop error: {e}")
             time.sleep(5)

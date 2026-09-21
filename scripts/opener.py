@@ -183,12 +183,24 @@ def _quiet(fn):
         return fn()
 
 
-def _open_quiet(intent):
+def _open_quiet(intent, book="paper"):
     """
-    Corre los gates una vez (para el motivo) y, si pasan, registra directo con
-    cmd_paper_buy (sin re-correr gates -> sin duplicar el fetch de deltas).
-    Devuelve (ok, reason).
+    Registra la apertura en el libro `book`. Devuelve (ok, reason).
+
+    paper: corre los gates una vez y registra directo con cmd_paper_buy (sin
+    re-correr gates -> sin duplicar el fetch de deltas).
+    live:  delega en LiveExecutor.open_position, que corre los gates de v2, el
+    INTERRUPTOR (LIVE_TRADING_ENABLED + kill-flag) y manda la orden al broker.
+    En live NO se silencia: en la apertura real queremos ver el fill y los motivos.
     """
+    if book == "live":
+        from executor import LiveExecutor, OpenIntent  # noqa: F401
+        try:
+            ok = LiveExecutor().open_position(intent)   # imprime fill/motivo/interruptor
+            return (ok, None if ok else "no abierta en live (ver detalle arriba)")
+        except Exception as e:
+            return (False, f"live open failed: {e}")
+
     import portfolio
     allowed, reason = _quiet(lambda: portfolio.gates_for_open(
         "paper", intent.ticker, intent.strategy,
@@ -213,7 +225,7 @@ def _open_quiet(intent):
         return (False, f"open failed: {e}")
 
 
-def run_opener(commit, max_opens):
+def run_opener(commit, max_opens, book="paper"):
     conn = _conn(); cur = conn.cursor()
     candidates = load_candidates(cur)
     dossier    = load_dossier(cur, "scan")
@@ -259,7 +271,7 @@ def run_opener(commit, max_opens):
             print(f"     {tag}  → {label} {econ}  [would try]")
             continue
 
-        ok, reason = _open_quiet(intent)                  # gates + registra; (ok, motivo)
+        ok, reason = _open_quiet(intent, book)            # gates + registra; (ok, motivo)
         if ok:
             opened += 1
             print(f"     {tag}  → {label} {econ}  ✅ OPENED")
@@ -268,23 +280,35 @@ def run_opener(commit, max_opens):
 
     print(f"\n  evaluated {evaluated} · opened {opened}"
           f"{' (dry-run: nothing opened)' if not commit else ''}")
+
+    # LIVE: la orden quedó en el broker, no en `positions`. run_sync la baja para
+    # que el monitor la vigile. En paper no hace falta (cmd_paper_buy ya escribió).
+    if book == "live" and commit and opened > 0:
+        from executor import LiveExecutor
+        print("\n  [live] bajando del broker a positions (sync)...")
+        LiveExecutor().sync_after_opens()
+
     return 0
 
 
 def main():
     p = argparse.ArgumentParser(description="Autonomous opener (paso 3 del espejo de auto_run)")
     p.add_argument("--run", action="store_true", required=True, help="run the opener")
-    p.add_argument("--commit", action="store_true", help="actually open in paper (default: dry-run)")
+    p.add_argument("--commit", action="store_true", help="actually open (default: dry-run)")
     p.add_argument("--max", type=int, default=10, help="max positions to open this run")
+    p.add_argument("--live", action="store_true",
+                   help="abre en LIVE (usa LiveExecutor; el interruptor LIVE_TRADING_ENABLED "
+                        "sigue decidiendo si la orden llega al broker). Default: paper")
     a = p.parse_args()
+    book = "live" if a.live else "paper"
 
     print(f"\n{'═'*55}")
-    print(f"  OPENER (Etapa 6) — paper")
+    print(f"  OPENER (Etapa 6) — {book}")
     print(f"{'═'*55}")
     if not os.getenv("DATABASE_URL"):
         print(f"  missing DATABASE_URL (check {_ENV_PATH})")
         return 1
-    return run_opener(a.commit, a.max)
+    return run_opener(a.commit, a.max, book)
 
 
 if __name__ == "__main__":

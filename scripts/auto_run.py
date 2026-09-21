@@ -56,13 +56,14 @@ def run_step(n, total, name, cmd):
     return True
 
 
-def build_summary(run_started_at, slot="manual", run_time=0):
+def build_summary(run_started_at, slot="manual", run_time=0, book="paper"):
     """
     Arma el resumen del run leyendo la DB. Texto PLANO (send_push escapa HTML, así
     que nada de <b>): mercado, selección con reparto, aperturas de este run, y el
     estado del libro (P&L abierto, delta neto, balance bidireccional).
     """
     import portfolio
+    table = portfolio._BOOK_TABLE.get(book, "paper_positions")
     conn = _conn(); cur = conn.cursor()
 
     # Mercado: régimen + VIX del último scan
@@ -91,24 +92,24 @@ def build_summary(run_started_at, slot="manual", run_time=0):
 
     # Aperturas de ESTE run
     cur.execute("""
-        SELECT ticker, strategy FROM paper_positions
+        SELECT ticker, strategy FROM {t}
         WHERE status='OPEN' AND opened_at >= %s ORDER BY opened_at
-    """, (run_started_at,))
+    """.format(t=table), (run_started_at,))
     opened = cur.fetchall()
 
     # Libro: posiciones, P&L abierto, balance bidireccional
-    cur.execute("SELECT strategy, gross_pnl FROM paper_positions WHERE status='OPEN'")
-    book = cur.fetchall()
-    n_book    = len(book)
-    pnl_total = sum(float(g or 0) for _, g in book)
+    cur.execute(f"SELECT strategy, gross_pnl FROM {table} WHERE status='OPEN'")
+    book_rows = cur.fetchall()
+    n_book    = len(book_rows)
+    pnl_total = sum(float(g or 0) for _, g in book_rows)
     bearish   = {"Bear Call Spread", "Bear Put Spread", "Long Put"}
-    n_bear    = sum(1 for s, _ in book if s in bearish)
+    n_bear    = sum(1 for s, _ in book_rows if s in bearish)
     n_bull    = n_book - n_bear
     cur.close(); conn.close()
 
     net = None
     try:
-        net, _, _ = portfolio.build_book("paper")
+        net, _, _ = portfolio.build_book(book)
     except Exception:
         pass
 
@@ -129,7 +130,7 @@ def build_summary(run_started_at, slot="manual", run_time=0):
         lines.append(f"   • {tk} · {strat}")
     lines += [
         "",
-        f"📁 Libro paper: {n_book} posiciones ({n_bull} alcistas / {n_bear} bajistas)",
+        f"📁 Libro {book}: {n_book} posiciones ({n_bull} alcistas / {n_bear} bajistas)",
         f"   P&L abierto: {pnl_total:+.0f}",
         f"   Delta neto: {net_str}",
     ]
@@ -139,7 +140,7 @@ def build_summary(run_started_at, slot="manual", run_time=0):
     return "\n".join(lines), data
 
 
-def _save_run_log(slot, data, run_time):
+def _save_run_log(slot, data, run_time, book="paper"):
     """Escribe el run en auto_run_logs (dedup del wrapper + historial para el dashboard)."""
     try:
         conn = _conn(); cur = conn.cursor()
@@ -161,13 +162,13 @@ def _save_run_log(slot, data, run_time):
         cur.execute("""
             INSERT INTO auto_run_logs
                 (slot, regime, candidates, opened, net_delta, summary, run_time_sec, mode)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, 'paper')
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id
         """, (
             slot, data["regime"], data["n_cand"], len(data["opened"]),
             data["net_delta"],
             "; ".join(f"{tk} {st}" for tk, st in data["opened"]),
-            int(run_time),
+            int(run_time), book,
         ))
         log_id = cur.fetchone()[0]
         conn.commit(); cur.close(); conn.close()
@@ -187,7 +188,11 @@ def main():
                    help="no manda el resumen por Telegram — pruebas")
     p.add_argument("--slot", default="manual",
                    help="nombre del slot (morning/midday/...) — lo pasa el wrapper para el log")
+    p.add_argument("--live", action="store_true",
+                   help="abre en LIVE (el opener usa LiveExecutor; el interruptor "
+                        "LIVE_TRADING_ENABLED decide si llega al broker). Default: paper")
     a = p.parse_args()
+    book = "live" if a.live else "paper"
 
     if not os.getenv("DATABASE_URL"):
         print(f"  missing DATABASE_URL (check {_ENV_PATH})")
@@ -211,18 +216,20 @@ def main():
         return 1
 
     # [3/4] Opener
-    if not run_step(3, total, "Opener (autónomo)",
-                    ["opener.py", "--run", "--commit", "--max", str(a.max)]):
+    opener_cmd = ["opener.py", "--run", "--commit", "--max", str(a.max)]
+    if a.live:
+        opener_cmd.append("--live")
+    if not run_step(3, total, "Opener (autónomo)", opener_cmd):
         return 1
 
     # [4/4] Resumen + Telegram
     print(f"\n{'═'*60}\n  [4/{total}] Resumen + Telegram\n{'═'*60}")
     run_time = time.time() - t0
-    summary, data = build_summary(started_at, a.slot, run_time)
+    summary, data = build_summary(started_at, a.slot, run_time, book)
     print("\n" + summary)
     print(f"\n  tiempo total: {run_time:.0f}s")
 
-    _save_run_log(a.slot, data, run_time)
+    _save_run_log(a.slot, data, run_time, book)
 
     if not a.no_telegram:
         try:

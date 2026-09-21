@@ -425,6 +425,19 @@ def ensure_tables():
         CREATE TABLE IF NOT EXISTS positions (LIKE paper_positions INCLUDING ALL)
     """)
 
+    # OJO: `LIKE ... INCLUDING ALL` copia el TIPO de la columna id pero NO crea una
+    # secuencia propia ni el DEFAULT nextval(...). Sin esto, positions.id no
+    # autoincrementa y TODO INSERT falla (id nulo viola el PK). Le damos su
+    # secuencia propia, arrancada por encima del máximo actual, y la fijamos como
+    # default. Idempotente: solo actúa si la columna aún no tiene secuencia.
+    cur.execute("SELECT pg_get_serial_sequence('positions', 'id')")
+    if cur.fetchone()[0] is None:
+        cur.execute("CREATE SEQUENCE IF NOT EXISTS positions_id_seq OWNED BY positions.id")
+        cur.execute("SELECT COALESCE(MAX(id), 0) FROM positions")
+        _max_id = cur.fetchone()[0]
+        cur.execute("SELECT setval('positions_id_seq', %s, true)", (_max_id + 1,))
+        cur.execute("ALTER TABLE positions ALTER COLUMN id SET DEFAULT nextval('positions_id_seq')")
+
     # trade_context — snapshot of market conditions at entry
     cur.execute("""
         CREATE TABLE IF NOT EXISTS trade_context (
