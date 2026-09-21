@@ -306,40 +306,66 @@ async def _resolve_legs(session, intent):
                 return st
         return None
 
+    # El LADO (put/call) y la GEOMETRÍA (qué pata se compra) salen de la ESTRUCTURA
+    # (intent.strategy), no del signo del débito. El signo del débito solo da
+    # débito/crédito, que no distingue Bull Call de Bear Put ni Bull Put de Bear Call.
+    _PUT   = ("Bull Put Spread", "Bear Put Spread", "Long Put")
+    _LONG  = ("Long Call", "Long Put")
+    _BULL  = ("Bull Call Spread", "Bull Put Spread")   # long = strike bajo
+    strategy = intent.strategy
+    if not strategy:                                   # compat: sin strategy, alcista por signo
+        strategy = "Bull Put Spread" if float(intent.debit) < 0 else "Bull Call Spread"
+    is_put  = strategy in _PUT
+    is_long = strategy in _LONG
+    is_bull = strategy in _BULL
+    side    = "put" if is_put else "call"
+
     st_low = _buscar(intent.strike_low)
-    st_high = _buscar(intent.strike_high)
-    if st_low is None or st_high is None:
-        missing = intent.strike_low if st_low is None else intent.strike_high
+    if st_low is None:
         nearby = sorted(float(x.strike_price) for x in exp.strikes)
-        nearby = [x for x in nearby if abs(x - float(missing)) < 15][:10]
-        return None, (f"{intent.ticker}: el strike {missing} no existe en la "
+        nearby = [x for x in nearby if abs(x - float(intent.strike_low)) < 15][:10]
+        return None, (f"{intent.ticker}: el strike {intent.strike_low} no existe en la "
                       f"cadena ({target}). Cerca available: {nearby}")
 
-    # debit > 0 = Bull Call Spread (calls) · debit < 0 = Bull Put Spread (puts)
-    is_call = float(intent.debit) > 0
-    sym_low = st_low.call if is_call else st_low.put
-    sym_high = st_high.call if is_call else st_high.put
+    # ── LONG de 1 pata (Long Call / Long Put): comprar la opción en strike_low ──
+    if is_long:
+        sym = getattr(st_low, side)
+        if not sym:
+            return None, f"{intent.ticker}: missing el símbolo {side} para {intent.strike_low} en {target}"
+        try:
+            opt = await Option.get(session, sym)
+        except Exception as e:
+            return None, f"{intent.ticker}: no se pudo resolver el contrato: {e}"
+        return [opt.build_leg(Decimal(1), OrderAction.BUY_TO_OPEN)], None
+
+    # ── SPREAD de 2 patas ──────────────────────────────────────────────────────
+    st_high = _buscar(intent.strike_high)
+    if st_high is None:
+        nearby = sorted(float(x.strike_price) for x in exp.strikes)
+        nearby = [x for x in nearby if abs(x - float(intent.strike_high)) < 15][:10]
+        return None, (f"{intent.ticker}: el strike {intent.strike_high} no existe en la "
+                      f"cadena ({target}). Cerca available: {nearby}")
+
+    sym_low  = getattr(st_low, side)
+    sym_high = getattr(st_high, side)
     if not sym_low or not sym_high:
-        kind = "call" if is_call else "put"
-        return None, (f"{intent.ticker}: missing el símbolo {kind} para "
+        return None, (f"{intent.ticker}: missing el símbolo {side} para "
                       f"{intent.strike_low}/{intent.strike_high} en {target}")
 
-    # Option.get acepta UN símbolo, no una lista (verificado: una lista falla
-    # con \'list\' object has no attribute \'replace\').
+    # Option.get acepta UN símbolo, no una lista (verificado).
     try:
-        opt_low = await Option.get(session, sym_low)
+        opt_low  = await Option.get(session, sym_low)
         opt_high = await Option.get(session, sym_high)
     except Exception as e:
         return None, f"{intent.ticker}: no se pudo resolver el contrato: {e}"
 
-    if is_call:
-        # Bull Call Spread: compra el strike BAJO, vende el ALTO
+    # Geometría por estructura: alcista compra el strike BAJO; bajista compra el ALTO.
+    if is_bull:
         legs = [opt_low.build_leg(Decimal(1), OrderAction.BUY_TO_OPEN),
-                 opt_high.build_leg(Decimal(1), OrderAction.SELL_TO_OPEN)]
+                opt_high.build_leg(Decimal(1), OrderAction.SELL_TO_OPEN)]
     else:
-        # Bull Put Spread: vende el strike ALTO, compra el BAJO
-        legs = [opt_high.build_leg(Decimal(1), OrderAction.SELL_TO_OPEN),
-                 opt_low.build_leg(Decimal(1), OrderAction.BUY_TO_OPEN)]
+        legs = [opt_high.build_leg(Decimal(1), OrderAction.BUY_TO_OPEN),
+                opt_low.build_leg(Decimal(1), OrderAction.SELL_TO_OPEN)]
 
     return legs, None
 
@@ -698,9 +724,9 @@ async def _read_position(ticker):
 
     if not legs:
         return None, f"{ticker}: el broker no tiene ninguna pata abierta"
-    if len(legs) != 2:
+    if len(legs) not in (1, 2):
         detail = ", ".join(f"{p.symbol}({p.quantity_direction})" for p in legs)
-        return None, (f"{ticker}: el broker tiene {len(legs)} legs, no 2 — "
+        return None, (f"{ticker}: el broker tiene {len(legs)} legs, no 1 ni 2 — "
                       f"NO se cierra a ciegas. Son: {detail}")
 
     # El símbolo OCC no se parsea a mano: se le pregunta al broker qué es.
@@ -713,6 +739,25 @@ async def _read_position(ticker):
         contracts.append((p, opt))
 
     contracts.sort(key=lambda x: float(x[1].strike_price))
+
+    # ── LONG de 1 pata (Long Call / Long Put) ────────────────────────────────
+    if len(contracts) == 1:
+        pos, opt = contracts[0]
+        return {
+            "env":         env,
+            "is_call":     str(opt.option_type.value) == "C",
+            "is_single":   True,
+            "strike_low":  float(opt.strike_price),
+            "strike_high": None,
+            "expiration":  opt.expiration_date,
+            "sym_low":     str(pos.symbol),
+            "sym_high":    None,
+            "dir_low":     str(pos.quantity_direction),
+            "dir_high":    None,
+            "contracts":   int(abs(float(pos.quantity))),
+        }, None
+
+    # ── SPREAD de 2 patas ────────────────────────────────────────────────────
     (pos_low, opt_low), (pos_high, opt_high) = contracts
 
     types = {str(o.option_type.value) for _, o in contracts}
@@ -726,6 +771,7 @@ async def _read_position(ticker):
     return {
         "env":         env,
         "is_call":     types.pop() == "C",
+        "is_single":   False,
         "strike_low":  float(opt_low.strike_price),
         "strike_high": float(opt_high.strike_price),
         "expiration":  expirations.pop(),
@@ -775,23 +821,41 @@ async def _send_close(ticker, info, value, reason):
                                             f"contracts para cerrar: {e}")
 
     n = D(info["contracts"])
-    legs = [
-        opt_low.build_leg(n, _closing_action(info["dir_low"])),
-        opt_high.build_leg(n, _closing_action(info["dir_high"])),
-    ]
+    if info.get("is_single"):
+        # Long de 1 pata: se VENDE para cerrar -> cobrás -> crédito -> price > 0.
+        legs = [opt_low.build_leg(n, _closing_action(info["dir_low"]))]
+        is_debit_open = True   # un long siempre se abrió pagando (débito)
+    else:
+        legs = [
+            opt_low.build_leg(n, _closing_action(info["dir_low"])),
+            opt_high.build_leg(n, _closing_action(info["dir_high"])),
+        ]
+        # ¿Fue DÉBITO o CRÉDITO al abrir? Se deriva de las patas reales, NO de
+        # call/put: la pata Long marca la estructura.
+        #   call + Long en strike bajo  = Bull Call  -> débito
+        #   put  + Long en strike alto  = Bear Put   -> débito
+        #   el resto (Bull Put, Bear Call)           -> crédito
+        long_is_low  = "Long" in info["dir_low"]
+        long_strike  = info["strike_low"] if long_is_low else info["strike_high"]
+        short_strike = info["strike_high"] if long_is_low else info["strike_low"]
+        if info["is_call"]:
+            is_debit_open = long_strike < short_strike
+        else:
+            is_debit_open = long_strike > short_strike
 
-    # SIGNO DEL CIERRE — inverso al de la apertura.
-    #   Cerrar un Bull Call Spread: lo VENDÉS   -> cobrás -> crédito -> price > 0
-    #   Cerrar un Bull Put Spread : lo RECOMPRÁS -> pagás -> débito  -> price < 0
-    # `valor` viene siempre positivo de pricing.get_spread_value.
-    price  = D(str(value)) if info["is_call"] else D(str(-value))
+    # SIGNO DEL CIERRE — inverso al de la apertura, por débito/crédito REAL:
+    #   abrió DÉBITO  (compraste) -> al cerrar VENDÉS   -> crédito -> price > 0
+    #   abrió CRÉDITO (vendiste)  -> al cerrar RECOMPRÁS -> débito  -> price < 0
+    # `value` viene siempre positivo de pricing.
+    price  = D(str(value)) if is_debit_open else D(str(-value))
     initial = price
     step    = D(str(CIERRE_PASO))
     cap    = D(str(CIERRE_CESION_MAX))
 
     side = "crédito" if price > 0 else "débito"
-    print(f"    [{env}] CERRAR {ticker} "
-          f"${info['strike_low']:g}/${info['strike_high']:g} "
+    strikes_str = (f"${info['strike_low']:g}" if info.get("is_single")
+                   else f"${info['strike_low']:g}/${info['strike_high']:g}")
+    print(f"    [{env}] CERRAR {ticker} {strikes_str} "
           f"{info['expiration']} · {side} {abs(float(price)):.2f}")
     for p in legs:
         print(f"      {p.action.value:<15} {p.symbol}")
@@ -887,10 +951,13 @@ def close_spread(ticker, reason="") -> OrderResult:
         return OrderResult("error", detail=err)
 
     # ── 2 ─────────────────────────────────────────────────────────────────────
-    value = pricing.get_spread_value(
-        ticker, info["strike_low"], info["strike_high"], info["expiration"],
-        option_type="call" if info["is_call"] else "put",
-    )
+    otype = "call" if info["is_call"] else "put"
+    if info.get("is_single"):
+        value = pricing.get_single_value(
+            ticker, info["strike_low"], info["expiration"], otype)
+    else:
+        value = pricing.get_spread_value(
+            ticker, info["strike_low"], info["strike_high"], info["expiration"], otype)
     if value is None:
         # Sin precio real no se manda un límite inventado (§10). Devolver un
         # número falso acá manda una orden a un precio que no existe.

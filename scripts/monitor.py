@@ -495,7 +495,7 @@ def run_position_monitor(table, executor, mode_label):
     conn.close()
 
     if not positions:
-        print("  No hay paper positions abiertas.\n")
+        print(f"  No hay posiciones abiertas [{mode}].\n")
         return
 
     print(f"  Paper positions abiertas: {len(positions)}\n")
@@ -824,15 +824,17 @@ def healthcheck_ping():
 
 
 def scheduled_run():
-    # v2: por ahora SOLO paper. La tabla `positions` (live) todavía no existe en la
-    # DB de v2; la pasada de live fallaría. Cuando se encienda el libro live, se
-    # agrega ("positions", LiveExecutor(), "live") a la lista.
+    # v2: DOS pasadas — live primero (plata real, prioridad al cerrar), paper
+    # después. Cada una precia, evalúa stop/target/DTE y cierra (o alerta) su
+    # propio libro. Con positions vacía la pasada live no toca el broker.
     #
     # El cierre NO pasa por el interruptor de live (LIVE_TRADING_ENABLED): cerrar
     # siempre está permitido. El interruptor solo frena APERTURAS (en el opener).
-    from executor import PaperExecutor
+    # Y MONITOR_AUTO_CLOSE decide, por libro, si el monitor cierra o solo alerta.
+    from executor import LiveExecutor, PaperExecutor
 
     for table, ex, label in (
+        ("positions",       LiveExecutor(),  "live"),
         ("paper_positions", PaperExecutor(), "paper"),
     ):
         try:

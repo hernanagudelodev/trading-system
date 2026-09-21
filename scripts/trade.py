@@ -415,6 +415,16 @@ def ensure_tables():
         )
     """)
 
+    # positions — libro LIVE. Espejo EXACTO de paper_positions para que el
+    # monitor, las tools y portfolio (que operan por _BOOK_TABLE) lo traten
+    # idéntico, sin ramas especiales por libro. LIKE clona columnas, tipos,
+    # defaults, PK e índices; el FK a selection_result no lo copia LIKE, así que
+    # selection_id queda como columna suelta (igual que position_id en
+    # trade_context) — no rompe nada, solo no valida ese vínculo a nivel DB.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS positions (LIKE paper_positions INCLUDING ALL)
+    """)
+
     # trade_context — snapshot of market conditions at entry
     cur.execute("""
         CREATE TABLE IF NOT EXISTS trade_context (
@@ -531,7 +541,7 @@ def insert_spread(spread, account_number):
     conn = get_db_connection()
     cur  = conn.cursor()
     notes = (
-        f"Bull Call Spread ${spread['strike_low']}/${spread['strike_high']} "
+        f"{spread['type']} ${spread['strike_low']}/${spread['strike_high']} "
         f"exp {spread['expiration']}. "
         f"Long avg: ${spread['avg_open_long']:.2f} | "
         f"Short avg: ${spread['avg_open_short']:.2f} | "
@@ -539,17 +549,17 @@ def insert_spread(spread, account_number):
     )
     cur.execute("""
         INSERT INTO positions
-            (ticker, strategy, broker, is_paper,
+            (ticker, strategy, broker,
              strike_low, strike_high, contracts, expiration,
              premium_paid, total_cost,
              status, opened_at, price_at_open,
              tastytrade_symbol, tastytrade_symbol_short,
              option_type, notes)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s,
                 'OPEN', NOW(), %s, %s, %s, %s, %s)
         RETURNING id
     """, (
-        spread["ticker"], spread["type"], "tastytrade", False,
+        spread["ticker"], spread["type"], "tastytrade",
         spread["strike_low"], spread["strike_high"],
         spread["contracts"], spread["expiration"],
         spread["premium_paid"], spread["total_cost"],
@@ -557,7 +567,7 @@ def insert_spread(spread, account_number):
         # (llamador viejo), cae a 0.0 y lo completa el backfill — no rompe.
         float(spread.get("price_at_open") or 0.0),
         spread["tastytrade_symbol"], spread["tastytrade_symbol_short"],
-        "CALL", notes,
+        spread["option_type"], notes,
     ))
     pos_id = cur.fetchone()[0]
     conn.commit()
@@ -582,16 +592,16 @@ def insert_position(tt_pos, account_number):
     notes = f"Auto-imported from Tastytrade. Avg open: ${tt_pos['avg_open_price']:.2f}"
     cur.execute("""
         INSERT INTO positions
-            (ticker, strategy, broker, is_paper,
+            (ticker, strategy, broker,
              strike_low, strike_high, contracts, expiration,
              premium_paid, total_cost,
              status, opened_at, price_at_open,
              tastytrade_symbol, option_type, notes)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s,
                 'OPEN', NOW(), %s, %s, %s, %s)
         RETURNING id
     """, (
-        tt_pos["ticker"], strategy, "tastytrade", False,
+        tt_pos["ticker"], strategy, "tastytrade",
         tt_pos["strike"], tt_pos["strike"],
         abs(tt_pos["quantity"]), tt_pos["expiration"],
         tt_pos["avg_open_price"],
@@ -1476,7 +1486,7 @@ def run_sync():
             spread["price_at_open"] = spots.get(spread["ticker"].upper(), 0.0)
             pos_id = insert_spread(spread, account_number)
             print(f"\n  NEW spread imported:")
-            print(f"    {spread['ticker']} Bull Call Spread "
+            print(f"    {spread['ticker']} {spread['type']} "
                   f"${spread['strike_low']}/${spread['strike_high']} "
                   f"exp {spread['expiration']}")
             print(f"    Contracts: {spread['contracts']} | "
