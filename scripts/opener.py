@@ -81,15 +81,23 @@ def load_candidates(cur):
 # PASO 1 — RANKING POR SEÑAL (fuerza relativa en la dirección propia, del dossier)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def signal_strength(f, direction):
+def signal_strength(f, direction, rs_cap=None):
     """
     Fuerza de la señal EN LA DIRECCIÓN de la candidata (mayor = más fuerte).
     Primaria: rs_vs_sector (fuerza relativa vs el sector). En UPTREND, rs alto es
     fuerte; en DOWNTREND, rs bajo (más negativo) es fuerte bajista -> se invierte el
     signo para ordenar ambas direcciones en la misma escala.
+
+    Cap de outliers (rs_cap): un rs con magnitud desmesurada (p.ej. +143 cuando el
+    resto ronda +30) se TRUNCA al techo, para que un par de nombres extremos no
+    dominen el ranking y acaparen el presupuesto antes de que entren otras señales
+    fuertes. A partir de cierto punto "muy fuerte" es muy fuerte: distinguir +143 de
+    +60 no aporta y sí distorsiona. None = sin cap.
     """
     rs = f.get("rs_vs_sector")
     rs = 0.0 if rs is None else float(rs)
+    if rs_cap is not None and rs_cap > 0:
+        rs = max(-rs_cap, min(rs, rs_cap))
     return rs if direction == "UPTREND" else -rs
 
 
@@ -101,9 +109,11 @@ def _tiebreak(f):
 
 def rank_candidates(candidates, dossier):
     """Ordena por señal (primaria) + momentum (desempate), descendente."""
+    from system_state import get_param_float
+    rs_cap = get_param_float("rs_cap", 50.0)   # techo de fuerza relativa (cap de outliers)
     for c in candidates:
         f = dossier.get(c["ticker"], {})
-        c["_strength"] = signal_strength(f, c["direction"])
+        c["_strength"] = signal_strength(f, c["direction"], rs_cap)
         c["_tiebreak"] = _tiebreak(f)
     candidates.sort(key=lambda c: (c["_strength"], c["_tiebreak"]), reverse=True)
     return candidates
@@ -312,4 +322,4 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main())    
