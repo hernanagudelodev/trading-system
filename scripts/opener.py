@@ -120,6 +120,58 @@ def rank_candidates(candidates, dossier):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# PUERTAS DE CALIDAD (pass/fail) — se aplican ANTES del ranking, sobre cada
+# candidata. NO ponderan: cada una descarta o deja pasar. Son direccionales y
+# simétricas (alcista/bajista espejo). Umbrales en system_state, calibrables.
+# La primaria (signal_strength) sigue decidiendo el ORDEN de las que pasan.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def gate_reason(cand, dossier):
+    """
+    Devuelve None si la candidata pasa las 3 puertas, o un string con el motivo
+    del descarte. Direccional: 'up' = UPTREND (alcista), 'down' = DOWNTREND.
+    """
+    from system_state import get_param_float
+    f = dossier.get(cand["ticker"], {})
+    up = cand["direction"] == "UPTREND"
+
+    # Puerta A — Recorrido disponible (52w position_pct): no comprar fuerza que ya
+    # llegó al techo, ni shortear debilidad que ya tocó el piso.
+    pos_hi = get_param_float("gate_pos_pct_high", 90.0)
+    pos_lo = get_param_float("gate_pos_pct_low", 10.0)
+    pos = f.get("position_pct")
+    if pos is not None:
+        if up and pos > pos_hi:
+            return f"puerta A: pegada al máximo 52w ({pos:.0f}% > {pos_hi:.0f})"
+        if not up and pos < pos_lo:
+            return f"puerta A: pegada al mínimo 52w ({pos:.0f}% < {pos_lo:.0f})"
+
+    # Puerta B — RSI extremo: veta solo lo genuinamente tarde (no lo moderado).
+    rsi_hi = get_param_float("gate_rsi_high", 78.0)
+    rsi_lo = get_param_float("gate_rsi_low", 22.0)
+    rsi = f.get("rsi")
+    if rsi is not None:
+        if up and rsi > rsi_hi:
+            return f"puerta B: RSI sobrecompra ({rsi:.0f} > {rsi_hi:.0f})"
+        if not up and rsi < rsi_lo:
+            return f"puerta B: RSI sobreventa ({rsi:.0f} < {rsi_lo:.0f})"
+
+    # Puerta C — Fuerza relativa vs el MERCADO (rs_vs_spy): descartar el alcista
+    # más débil que el mercado, o el bajista más fuerte que el mercado. Umbral 0
+    # de arranque (a calibrar); distingue fuerte-en-todo de fuerte-solo-en-sector.
+    rs_mkt_up   = get_param_float("gate_rs_spy_up", 0.0)    # alcista: exige rs_vs_spy >= este
+    rs_mkt_down = get_param_float("gate_rs_spy_down", 0.0)  # bajista: exige rs_vs_spy <= este
+    rs_spy = f.get("rs_vs_spy")
+    if rs_spy is not None:
+        if up and rs_spy < rs_mkt_up:
+            return f"puerta C: más débil que el mercado (rs_vs_spy {rs_spy:.1f} < {rs_mkt_up:.1f})"
+        if not up and rs_spy > rs_mkt_down:
+            return f"puerta C: más fuerte que el mercado (rs_vs_spy {rs_spy:.1f} > {rs_mkt_down:.1f})"
+
+    return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # PASO 2 — COTIZAR (lazy) la mejor pierna y armar el OpenIntent
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -170,6 +222,7 @@ def build_intent(cand, price):
         ticker=cand["ticker"], strike_low=o["strike_low"], strike_high=o["strike_high"],
         expiration=str(o["expiration"]), debit=o["debit"],
         strategy=strategy, selection_id=cand["selection_id"],
+        price_at_open=float(price or 0.0),   # spot del subyacente al abrir (del scan)
     )
 
 
@@ -224,12 +277,14 @@ def _open_quiet(intent, book="paper"):
         if intent.strike_high is None:                    # long de 1 pata
             _quiet(lambda: trade_module.cmd_paper_buy_single(
                 intent.ticker, intent.strike_low, intent.expiration, intent.debit,
+                price_at_open=intent.price_at_open,
                 strategy=intent.strategy, selection_id=intent.selection_id))
         else:                                             # spread. Slippage simple: mid+1c.
             debit_fill = round(intent.debit + 0.01, 2)
             _quiet(lambda: trade_module.cmd_paper_buy(
                 intent.ticker, intent.strike_low, intent.strike_high, intent.expiration,
-                debit_fill, strategy=intent.strategy, selection_id=intent.selection_id))
+                debit_fill, price_at_open=intent.price_at_open,
+                strategy=intent.strategy, selection_id=intent.selection_id))
         return (True, None)
     except Exception as e:
         return (False, f"open failed: {e}")
@@ -244,6 +299,21 @@ def run_opener(commit, max_opens, book="paper"):
     if not candidates:
         print("  no candidates in selection_result. Run the pipeline first.")
         return 1
+
+    # PUERTAS DE CALIDAD (pass/fail) — filtran el conjunto ANTES del ranking.
+    kept, dropped = [], 0
+    for c in candidates:
+        reason = gate_reason(c, dossier)
+        if reason is None:
+            kept.append(c)
+        else:
+            dropped += 1
+    if dropped:
+        print(f"  puertas de calidad: {dropped} descartadas · {len(kept)} pasan")
+    candidates = kept
+    if not candidates:
+        print("  ninguna candidata pasó las puertas de calidad.")
+        return 0
 
     ranked = rank_candidates(candidates, dossier)
     print(f"\n  OPENER — {len(ranked)} candidates ranked by signal "
@@ -322,4 +392,4 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())    
+    sys.exit(main())

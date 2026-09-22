@@ -51,6 +51,7 @@ class OpenIntent:
     strategy:     Optional[str] = None   # estructura EXPLÍCITA (bidi): "Bear Call Spread", etc.
                                           # el debit ya no basta para distinguir las 4 spreads.
     selection_id: Optional[int] = None   # candidata de selection_result que originó el trade
+    price_at_open: float = 0.0           # spot del subyacente al armar el intent (del scan)
     rationale:    str = ""
     context_json: Optional[str] = None
 
