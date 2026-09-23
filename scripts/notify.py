@@ -120,7 +120,7 @@ def send_push(title, message, priority="default", tags=None, mono=False) -> bool
     prefijo = _PREFIX.get(priority, "")
     payload = {
         "chat_id":              chat,
-        "text":                 _build_text(f"{prefijo}{title}", message, mono),
+        "text":                 _build_text(f"{prefijo}{title} · v2", message, mono),
         "parse_mode":           "HTML",
         "disable_notification": priority in _SILENT,
         "link_preview_options": {"is_disabled": True},
