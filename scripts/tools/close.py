@@ -6,10 +6,15 @@ con --confirm ejecuta. Cerrar es irreversible, por eso el paso extra.
 
     python tools/close.py ABT             # dry-run: muestra la posición y su P&L
     python tools/close.py ABT --confirm   # ejecuta el cierre (paper)
-    python tools/close.py ABT --live      # libro live (no disponible aún)
+    python tools/close.py ABT --live            # dry-run sobre el libro LIVE
+    python tools/close.py ABT --live --confirm  # cierra REAL contra el broker
 """
 import os
 import sys
+try:
+    sys.stdout.reconfigure(encoding="utf-8")   # Windows: consola cp1252 no puede con emojis
+except Exception:
+    pass
 import argparse
 from pathlib import Path
 
@@ -45,14 +50,6 @@ def close_position(ticker, book="paper", confirm=False):
     table  = _BOOK_TABLE.get(book)
     if table is None:
         return f"libro desconocido: {book!r} (usar paper o live)"
-    if book == "live":
-        # DEUDA (cierre live): antes de mandar la orden de cierre al broker, hay que
-        # RECONCILIAR contra Tastytrade — que las patas existan, que las cantidades
-        # coincidan con la DB, que el spread esté como el sistema cree. En paper no
-        # aplica (no hay patas reales; la DB es la única fuente), pero en live cerrar
-        # a ciegas es peligroso. Traer esa validación cuando se construya LiveExecutor.
-        return "⚠️  cierre live no disponible aún (v2 corre solo paper)"
-
     conn = _conn(); cur = conn.cursor()
     if not _table_exists(cur, table):
         cur.close(); conn.close()
@@ -75,7 +72,19 @@ def close_position(ticker, book="paper", confirm=False):
                 f"  {ticker} {strat} {strikes} · P&L {pnl:+.0f} ({pct:+.1f}%)\n"
                 f"Repetí con --confirm para ejecutar el cierre (irreversible).")
 
-    # Ejecutar (cmd_paper_close busca precio real; cae al último valor si no hay)
+    if book == "live":
+        # LIVE: cierra contra el BROKER real vía LiveExecutor.close_position, que
+        # reconcilia las patas contra Tastytrade (_read_position aborta si no hay 1
+        # o 2 patas), cede precio hasta un piso, verifica que no quede ninguna pata,
+        # alerta por push si queda pata suelta, y registra el precio de salida en
+        # positions. NO pasa por LIVE_TRADING_ENABLED: cerrar siempre está permitido
+        # (el interruptor solo frena aperturas).
+        from executor import LiveExecutor
+        ok = LiveExecutor().close_position(ticker, "MANUAL")
+        return f"✅ {ticker} cerrado (LIVE, broker real)." if ok else \
+               f"❌ no se pudo cerrar {ticker} en live — revisar el detalle arriba y la cuenta en Tastytrade."
+
+    # PAPER: cmd_paper_close busca precio real; cae al último valor si no hay.
     import trade
     ok = trade.cmd_paper_close(ticker, close_reason="MANUAL",
                                close_rationale="cierre manual via tool close.py")
