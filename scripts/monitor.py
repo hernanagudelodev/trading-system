@@ -50,8 +50,16 @@ except ImportError:
         return None
 
 
-load_dotenv()
-
+# Carga el .env de v2 (ENV_FILE, default .env.v2) relativo a la raíz del repo —
+# igual que el resto de v2. Un load_dotenv() pelado encontraba el .env de DEF y
+# apuntaba a su DB cuando el módulo se corría directo. En Railway no hay archivo
+# (las vars vienen del servicio) y esto no hace nada. override=False: si el
+# caller ya cargó el entorno, no se pisa.
+from pathlib import Path as _Path
+_ENV_PATH = _Path(os.getenv("ENV_FILE", ".env.v2"))
+if not _ENV_PATH.is_absolute():
+    _ENV_PATH = _Path(__file__).resolve().parent.parent / _ENV_PATH
+load_dotenv(_ENV_PATH)
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════════════
@@ -832,6 +840,19 @@ def scheduled_run():
     # siempre está permitido. El interruptor solo frena APERTURAS (en el opener).
     # Y MONITOR_AUTO_CLOSE decide, por libro, si el monitor cierra o solo alerta.
     from executor import LiveExecutor, PaperExecutor
+
+    # RECONCILIACIÓN LIVE con el broker ANTES de pricear: el monitor solo mira la
+    # DB, así que una posición cerrada A MANO en Tastytrade quedaba OPEN para
+    # siempre (y el monitor la seguía priceando, y los gates contaban su riesgo).
+    # run_sync compara la DB contra las patas reales: marca CLOSED lo que ya no
+    # está en el broker (CLOSED_PRICE_UNKNOWN: el precio de salida no existe acá)
+    # e importa lo que esté en el broker y no en la DB. En def esto corría en el
+    # auto_run; en v2 va acá para detectar cierres externos en <= 1 ciclo.
+    try:
+        import trade
+        trade.run_sync()
+    except Exception as e:
+        print(f"  sync live error (se sigue con la DB tal cual): {e}")
 
     for table, ex, label in (
         ("positions",       LiveExecutor(),  "live"),

@@ -29,10 +29,19 @@ import os
 import sys
 import json
 import asyncio
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from dotenv import load_dotenv
 
-load_dotenv()
+# Carga el .env de v2 (ENV_FILE, default .env.v2) relativo a la raíz del repo —
+# igual que el resto de v2. Un load_dotenv() pelado encontraba el .env de DEF y
+# apuntaba a su DB cuando el módulo se corría directo. En Railway no hay archivo
+# (las vars vienen del servicio) y esto no hace nada. override=False: si el
+# caller ya cargó el entorno, no se pisa.
+from pathlib import Path as _Path
+_ENV_PATH = _Path(os.getenv("ENV_FILE", ".env.v2"))
+if not _ENV_PATH.is_absolute():
+    _ENV_PATH = _Path(__file__).resolve().parent.parent / _ENV_PATH
+load_dotenv(_ENV_PATH)
 sys.stdout.reconfigure(encoding="utf-8")
 
 
@@ -438,6 +447,13 @@ def ensure_tables():
         cur.execute("SELECT setval('positions_id_seq', %s, true)", (_max_id + 1,))
         cur.execute("ALTER TABLE positions ALTER COLUMN id SET DEFAULT nextval('positions_id_seq')")
 
+    # net_pnl: close_position_in_db (cierre live) lo escribe, pero paper_positions
+    # nunca lo tuvo y positions es su clon -> TODO cierre live reventaba al
+    # registrarse ('column net_pnl does not exist'), justo después del fill.
+    # Idempotente.
+    for _t in ("paper_positions", "positions"):
+        cur.execute(f"ALTER TABLE {_t} ADD COLUMN IF NOT EXISTS net_pnl DECIMAL(10,2)")
+
     # trade_context — snapshot of market conditions at entry
     cur.execute("""
         CREATE TABLE IF NOT EXISTS trade_context (
@@ -681,7 +697,7 @@ def _split_close_reason(close_reason, close_rationale):
 
 
 def close_position_in_db(db_pos_id, close_price, close_reason="Closed in Tastytrade",
-                         close_rationale=None):
+                         close_rationale=None, closed_at=None):
     """
     Marca una posición como cerrada en `positions`.
 
@@ -750,7 +766,7 @@ def close_position_in_db(db_pos_id, close_price, close_reason="Closed in Tastytr
         cur.execute("""
             UPDATE positions SET
                 status           = 'CLOSED',
-                closed_at        = NOW(),
+                closed_at        = COALESCE(%s, NOW()),
                 premium_received = NULL,
                 total_received   = NULL,
                 gross_pnl        = NULL,
@@ -759,7 +775,7 @@ def close_position_in_db(db_pos_id, close_price, close_reason="Closed in Tastytr
                 close_reason     = %s,
                 close_rationale  = %s
             WHERE id = %s
-        """, ("CLOSED_PRICE_UNKNOWN", rationale, db_pos_id))
+        """, (closed_at, "CLOSED_PRICE_UNKNOWN", rationale, db_pos_id))
         conn.commit()
         cur.close()
         conn.close()
@@ -773,7 +789,7 @@ def close_position_in_db(db_pos_id, close_price, close_reason="Closed in Tastytr
     cur.execute("""
         UPDATE positions SET
             status           = 'CLOSED',
-            closed_at        = NOW(),
+            closed_at        = COALESCE(%s, NOW()),
             premium_received = %s,
             total_received   = %s,
             gross_pnl        = %s,
@@ -782,7 +798,7 @@ def close_position_in_db(db_pos_id, close_price, close_reason="Closed in Tastytr
             close_reason     = %s,
             close_rationale  = %s
         WHERE id = %s
-    """, (close_price, total_received, gross_pnl, gross_pnl, pnl_pct,
+    """, (closed_at, close_price, total_received, gross_pnl, gross_pnl, pnl_pct,
           reason, rationale, db_pos_id))
     conn.commit()
     cur.close()
@@ -1444,6 +1460,60 @@ def cmd_paper_close(ticker, close_reason="MANUAL", close_rationale=None):
 # REAL TRADING — sync logic
 # ══════════════════════════════════════════════════════════════════════════════
 
+async def _fetch_close_fills_async(ticker, symbols, since):
+    from tastytrade import Session
+    from tastytrade.account import Account
+    session = Session(os.getenv("TASTYTRADE_CLIENT_SECRET"),
+                      os.getenv("TASTYTRADE_REFRESH_TOKEN"))
+    account = (await Account.get(session))[0]
+    return await account.get_history(session, underlying_symbol=ticker,
+                                     start_date=since)
+
+
+def fetch_close_fills(ticker, symbols, opened_at):
+    """
+    Precio de salida de una posición cerrada FUERA del sistema (a mano en
+    Tastytrade), leído del historial de transacciones de la cuenta.
+
+    Filtra por los símbolos OCC EXACTOS de la posición (la cuenta se comparte con
+    def: puede haber otros spreads del mismo ticker), acciones 'to Close' y
+    ejecutadas después de opened_at. `value` del historial ya viene con signo
+    (+ cobrado, - pagado).
+
+    Devuelve (prima_recibida_por_accion, contratos, executed_at) si encontró el
+    cierre de TODAS las patas, o None. Nunca lanza: si algo falla -> None y el
+    caller deja CLOSED_PRICE_UNKNOWN (no se inventa un número).
+    """
+    import asyncio
+    try:
+        since = (opened_at.date() if opened_at else date.today() - timedelta(days=60))
+        txs = asyncio.run(_fetch_close_fills_async(ticker, symbols, since))
+    except Exception as e:
+        print(f"    historial de Tastytrade no disponible ({e})")
+        return None
+
+    wanted = {s for s in symbols if s}
+    found, net, qty, last_at = set(), 0.0, None, None
+    for t in txs:
+        sym = str(getattr(t, "symbol", "") or "")
+        act = getattr(t, "action", None)
+        act = str(getattr(act, "value", act) or "")
+        at  = getattr(t, "executed_at", None)
+        if sym not in wanted or "to Close" not in act:
+            continue
+        if opened_at and at and at.replace(tzinfo=None) < opened_at.replace(tzinfo=None):
+            continue
+        net += float(getattr(t, "value", 0) or 0)
+        qty = abs(float(getattr(t, "quantity", 1) or 1))
+        found.add(sym)
+        if at and (last_at is None or at > last_at):
+            last_at = at
+
+    if found != wanted or not qty:
+        return None
+    return (round(net / (qty * 100), 4), int(qty), last_at)
+
+
 def run_sync():
     print(f"\n{'=' * 55}")
     print(f"  TRADE SYNC — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
@@ -1534,10 +1604,19 @@ def run_sync():
             both_gone = (sym_long not in tt_all_symbols and
                          sym_short not in tt_all_symbols)
             if both_gone:
-                # None a propósito: la posición ya no está en Tastytrade, así que
-                # el precio de salida no existe acá. Queda CLOSED_PRICE_UNKNOWN
-                # con P&L NULL. Antes esto registraba la pérdida máxima entera.
-                pnl = close_position_in_db(db_pos["id"], None, "Closed in Tastytrade")
+                # Cerrada fuera del sistema: el precio de salida se busca en el
+                # historial de transacciones de Tastytrade (fills 'to Close' de
+                # ESTAS patas). Si no aparece -> None -> CLOSED_PRICE_UNKNOWN con
+                # P&L NULL (nunca se inventa un número).
+                fills = fetch_close_fills(db_pos["ticker"], [sym_long, sym_short],
+                                          db_pos.get("opened_at"))
+                if fills:
+                    pnl = close_position_in_db(
+                        db_pos["id"], fills[0], "CLOSED_EXTERNAL",
+                        "cerrada fuera del sistema; precio de salida del historial de Tastytrade",
+                        closed_at=fills[2])
+                else:
+                    pnl = close_position_in_db(db_pos["id"], None, "Closed in Tastytrade")
                 print(f"\n  CLOSED spread: {db_pos['ticker']} (DB id={db_pos['id']})")
                 if pnl is None:
                     print(f"    P&L: SIN DATO — el precio de salida no lo sabe el sync.")
@@ -1547,7 +1626,15 @@ def run_sync():
                 closed_count += 1
         else:
             if sym_long and sym_long not in tt_all_symbols:
-                pnl = close_position_in_db(db_pos["id"], None, "Closed in Tastytrade")
+                fills = fetch_close_fills(db_pos["ticker"], [sym_long],
+                                          db_pos.get("opened_at"))
+                if fills:
+                    pnl = close_position_in_db(
+                        db_pos["id"], fills[0], "CLOSED_EXTERNAL",
+                        "cerrada fuera del sistema; precio de salida del historial de Tastytrade",
+                        closed_at=fills[2])
+                else:
+                    pnl = close_position_in_db(db_pos["id"], None, "Closed in Tastytrade")
                 print(f"\n  CLOSED position: {db_pos['ticker']} (DB id={db_pos['id']})")
                 if pnl is None:
                     print(f"    P&L: SIN DATO — marcada CLOSED_PRICE_UNKNOWN.")
