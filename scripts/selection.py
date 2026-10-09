@@ -805,7 +805,10 @@ def run_selection(dossier, market, regime):
 
         # §5 estrategia
         r["strategy"] = select_strategy(f, d)
-        r["status"]   = "candidate"
+        # Sin estructura (p.ej. sin iv_percentile) NO es candidata: fail-closed.
+        # Antes quedaba 'candidate' con strategy None y rompía el resumen (y
+        # llegaba al opener sin estructura).
+        r["status"]   = "candidate" if r["strategy"] else "no_strategy"
         results.append(r)
 
     return results
@@ -850,7 +853,7 @@ def show_selection(commit):
 
     results = run_selection(dossier, market, regime)
 
-    status_order = ["candidate", "blocked_counter_trend", "no_direction",
+    status_order = ["candidate", "no_strategy", "blocked_counter_trend", "no_direction",
                     "macro_blocked", "earnings_blocked", "not_operable"]
     counts = Counter(r["status"] for r in results)
     total  = len(results)
