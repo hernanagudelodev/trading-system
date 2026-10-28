@@ -104,9 +104,26 @@ def _help_text():
             "ACCIÓN (piden /confirm):\n"
             "  /close TICKER — cierra en paper\n"
             "  /close TICKER live — cierra REAL ⚠️\n"
+            "  (las alertas traen /close_TICKER_live para tocar)\n"
             "  /auto_run — corre un ciclo (abre en paper)\n"
             "  /confirm — ejecuta el pendiente\n\n"
             "  /help — esta ayuda")
+
+
+def _expand_shortcut(parts):
+    """
+    Convierte el atajo de las alertas del monitor en el comando normal:
+        /close_HOOD_live  ->  /close HOOD live
+        /close_HOOD       ->  /close HOOD
+    Telegram solo hace clickeable un comando de una sola palabra, por eso la
+    alerta lo manda con guiones bajos. También quita el sufijo @nombre_del_bot
+    que Telegram agrega a veces al tocar un comando.
+    """
+    first = parts[0].split("@", 1)[0]
+    if first.lower().startswith("/close_"):
+        pieces = [p for p in first[len("/close_"):].split("_") if p]
+        return ["/close"] + pieces + parts[1:]
+    return [first] + parts[1:]
 
 
 def _process(text):
@@ -114,6 +131,7 @@ def _process(text):
     parts = text.strip().split()
     if not parts:
         return None
+    parts = _expand_shortcut(parts)
     cmd = parts[0].lower()
     args = parts[1:]
 

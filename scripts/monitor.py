@@ -358,6 +358,21 @@ def _paper_alerts_enabled() -> bool:
     return True
 
 
+def _close_command(ticker, mode):
+    """
+    Comando de cierre listo para tocar en Telegram. Telegram solo vuelve
+    clickeable un comando si es una sola palabra de [A-Za-z0-9_], por eso va
+    con guiones bajos: /close_HOOD_live. Al tocarlo, el bot lo recibe, hace el
+    dry-run y pide /confirm (el cierre sigue siendo en dos pasos).
+    Tickers con '.' o '-' (BRK.B) no caben en ese formato: se muestra el
+    comando con espacios para copiarlo a mano.
+    """
+    suffix = " live" if mode == "live" else ""
+    if ticker.isalnum():
+        return f"/close_{ticker}{suffix.replace(' ', '_')}"
+    return f"/close {ticker}{suffix}"
+
+
 def send_alert_notification(position, pnl_data, alert_level, reasons, mode="paper"):
     # Filtro de alertas paper: si system_state['paper_alerts']=='off', las alertas
     # de nivel de PAPER (WATCH/ACTION/URGENT/take-profit) se silencian. Las de LIVE
@@ -385,7 +400,8 @@ def send_alert_notification(position, pnl_data, alert_level, reasons, mode="pape
     message     = (
         f"{strategy} | ${ticker}\n"
         f"P&L: ${pnl:+.0f} ({pct:.0f}% del max) | {dte}d\n"
-        f"{reason_text}"
+        f"{reason_text}\n\n"
+        f"Cerrar: {_close_command(ticker, mode)}"
     )
 
     send_push(title, message, priority=priorities.get(alert_level, "default"))
@@ -461,8 +477,6 @@ def run_position_monitor(table, executor, mode_label):
         como cierre.
     """
     import psycopg2
-    from dotenv import load_dotenv
-    load_dotenv()
 
     _validate_env()                     # dies loudly if anything is missing
     mode       = mode_label             # 'live' | 'paper', lo pasa scheduled_run
@@ -779,6 +793,28 @@ def run_position_monitor(table, executor, mode_label):
         conn2.commit()
         cur2.close()
         conn2.close()
+
+        # ── HISTORIAL (position_snapshots) ────────────────────────────────────
+        # Una fila por posición por ciclo, solo con mercado abierto y precio
+        # fresco (de noche el valor no cambia y un precio viejo no es historia).
+        # Va DESPUÉS del commit del P&L y en su propio try: si esto falla, la
+        # actualización de la posición ya quedó guardada.
+        if price_fresh and market_status == "open":
+            try:
+                conn3 = psycopg2.connect(os.getenv("DATABASE_URL"))
+                cur3  = conn3.cursor()
+                cur3.execute("""
+                    INSERT INTO position_snapshots
+                        (book, position_id, ticker, mark, current_value,
+                         gross_pnl, pnl_pct, profit_pct_of_max, dte, alert_level)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """, (mode, pos["id"], ticker, precio, current_value,
+                      gross_pnl, pnl_pct, profit_pct_max, dte, alert_level))
+                conn3.commit()
+                cur3.close()
+                conn3.close()
+            except Exception as e:
+                print(f"  [historial] no se pudo guardar el snapshot de {ticker}: {e}")
 
     print(f"{'=' * 60}")
     print(f"  Monitor [{mode}] completado — {timestamp}\n")

@@ -454,6 +454,32 @@ def ensure_tables():
     for _t in ("paper_positions", "positions"):
         cur.execute(f"ALTER TABLE {_t} ADD COLUMN IF NOT EXISTS net_pnl DECIMAL(10,2)")
 
+    # position_snapshots — historial del valor de cada posición abierta. El
+    # monitor SOBRESCRIBE el P&L en paper_positions/positions en cada ciclo; esta
+    # tabla guarda una fila por posición por ciclo (mercado abierto, precio
+    # fresco), para poder ver cómo evolucionó mientras estuvo abierta.
+    # book = 'paper' | 'live' (position_id apunta a la tabla de ese libro).
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS position_snapshots (
+            id                  SERIAL PRIMARY KEY,
+            book                VARCHAR(10)   NOT NULL,
+            position_id         INTEGER       NOT NULL,
+            ticker              VARCHAR(20)   NOT NULL,
+            snapshot_at         TIMESTAMP     NOT NULL DEFAULT NOW(),
+            mark                DECIMAL(10,4),
+            current_value       DECIMAL(10,2),
+            gross_pnl           DECIMAL(10,2),
+            pnl_pct             DECIMAL(10,4),
+            profit_pct_of_max   DECIMAL(10,4),
+            dte                 INTEGER,
+            alert_level         VARCHAR(10)
+        )
+    """)
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_position_snapshots_pos
+        ON position_snapshots (book, position_id, snapshot_at)
+    """)
+
     # trade_context — snapshot of market conditions at entry
     cur.execute("""
         CREATE TABLE IF NOT EXISTS trade_context (
